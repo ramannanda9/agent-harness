@@ -5,25 +5,35 @@ Eviction strategy: when token budget is hit, summarize the oldest
 50% of messages via LLM into a single compressed message, then drop
 the originals. Summarization cost is always cheaper than what it replaces.
 
-Token counting: uses a word-based estimate by default.
-Swap count_tokens() for tiktoken in production for exact counts.
+Token counting: uses a chars-per-4 heuristic by default — stable across
+content types (code, JSON, English, non-English) within ~10–20% of real
+tokenizer counts, with zero dependencies. For exact counts, pass a custom
+`token_counter` callable to WorkingMemory:
+
+    import tiktoken
+    enc = tiktoken.get_encoding("cl100k_base")
+    wm = WorkingMemory(llm=..., token_counter=lambda s: len(enc.encode(s)))
+
+Anthropic users can wrap their `count_tokens` API call similarly; just
+be aware that remote calls in the eviction hot path add latency.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any, Protocol
 
 # ── Token counting ────────────────────────────────────────────────────────────
 
+
 def count_tokens(text: str) -> int:
     """
-    Fast approximation: ~1.3 tokens per word.
-    Replace with tiktoken for production accuracy:
-        import tiktoken
-        enc = tiktoken.get_encoding("cl100k_base")
-        return len(enc.encode(text))
+    Chars-per-4 heuristic — the standard "~4 characters per token" rule.
+    Stable across JSON, code, English, and most non-English text within
+    ~10–20% of real BPE counts. Override via WorkingMemory(token_counter=…)
+    for exact counts.
     """
-    return int(len(text.split()) * 1.3)
+    return max(1, len(text) // 4) if text else 0
 
 
 # ── LLM Protocol — injected, not imported ─────────────────────────────────────
@@ -52,11 +62,8 @@ Output ONLY the summary paragraph — no preamble, no labels.
 class Message:
     role: str         # system | user | assistant
     content: str
-    token_count: int = field(init=False)
+    token_count: int = 0   # set by WorkingMemory.append using its configured counter
     pinned: bool = False   # pinned messages are never evicted (e.g. system prompt)
-
-    def __post_init__(self) -> None:
-        self.token_count = count_tokens(self.content)
 
 
 class WorkingMemory:
@@ -76,12 +83,14 @@ class WorkingMemory:
     def __init__(
         self,
         llm: LLMClient,
-        max_tokens: int = 2000,
+        max_tokens: int = 8000,
         summarize_ratio: float = 0.5,   # summarize oldest 50% when evicting
+        token_counter: Callable[[str], int] | None = None,
     ) -> None:
         self._llm = llm
         self.max_tokens = max_tokens
         self.summarize_ratio = summarize_ratio
+        self._count = token_counter or count_tokens
         self._messages: list[Message] = []
         self._token_total: int = 0
         self._summarization_count: int = 0
@@ -89,7 +98,9 @@ class WorkingMemory:
     # ── Public API ────────────────────────────────────────────────────────────
 
     async def append(self, role: str, content: str, pinned: bool = False) -> None:
-        msg = Message(role=role, content=content, pinned=pinned)
+        msg = Message(
+            role=role, content=content, pinned=pinned, token_count=self._count(content),
+        )
         self._messages.append(msg)
         self._token_total += msg.token_count
 
@@ -122,7 +133,10 @@ class WorkingMemory:
         to_summarize = evictable[:cutoff]
 
         summary_text = await self._summarize(to_summarize)
-        summary_msg = Message(role="user", content=f"[Memory summary]: {summary_text}")
+        summary_content = f"[Memory summary]: {summary_text}"
+        summary_msg = Message(
+            role="user", content=summary_content, token_count=self._count(summary_content),
+        )
 
         # remove summarized messages, insert summary in their place
         summarized_set = set(id(m) for m in to_summarize)

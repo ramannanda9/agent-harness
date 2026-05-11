@@ -34,12 +34,13 @@ logger = logging.getLogger(__name__)
 @dataclass
 class AgentConfig:
     agent_id: str
-    role: str                          # plain English — used by planner for agent selection
+    role: str                              # plain English — used by planner for agent selection
     system_prompt: str
-    allowed_tools: list[str]           # tool names from ToolRegistry
+    allowed_tools: list[str]               # tool names from ToolRegistry
     max_steps: int = 10
     memory_context_enabled: bool = True
-    confidence_from_llm: bool = True   # if False, confidence=1.0 on success
+    confidence_from_llm: bool = True       # if False, confidence=1.0 on success
+    working_memory_max_tokens: int = 8000  # WorkingMemory eviction threshold; tune per agent
 
 
 # ── ReAct Response Schema ─────────────────────────────────────────────────────
@@ -109,7 +110,7 @@ class BaseAgent:
         run_id = run_id or str(uuid.uuid4())
         self._working_memory = WorkingMemory(
             llm=self._llm,
-            max_tokens=2000,
+            max_tokens=self.config.working_memory_max_tokens,
         )
 
         # build system prompt: base + memory context + react format

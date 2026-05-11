@@ -85,12 +85,16 @@ class StreamingWorkingMemory:
     def __init__(
         self,
         llm,
-        max_tokens: int = 2000,
+        max_tokens: int = 8000,
         summarize_ratio: float = 0.5,
+        token_counter=None,
     ) -> None:
+        from memory.working import count_tokens
+
         self._llm = llm
         self.max_tokens = max_tokens
         self._summarize_ratio = summarize_ratio
+        self._count_fn = token_counter or count_tokens
         self._messages: list[dict] = []
         self._token_total: int = 0
         self._pending_summary: asyncio.Task | None = None
@@ -98,7 +102,7 @@ class StreamingWorkingMemory:
         self._summarization_count: int = 0
 
     def _count(self, text: str) -> int:
-        return int(len(text.split()) * 1.3)
+        return self._count_fn(text)
 
     async def append(self, role: str, content: str, pinned: bool = False) -> None:
         self._messages.append({"role": role, "content": content, "pinned": pinned})
@@ -231,7 +235,10 @@ class StreamingAgent:
         Stream tokens as they arrive from LLM.
         Yields BusEvent(TOKEN) for each token, BusEvent(DONE) at completion.
         """
-        wm = StreamingWorkingMemory(llm=self._llm, max_tokens=2000)
+        wm = StreamingWorkingMemory(
+            llm=self._llm,
+            max_tokens=self.config.working_memory_max_tokens,
+        )
 
         # build system prompt with memory context
         system = await self._build_system(task, wm)
