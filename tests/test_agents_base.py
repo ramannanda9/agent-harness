@@ -1,0 +1,171 @@
+"""ReAct loop smoke tests for BaseAgent."""
+from __future__ import annotations
+
+from agents.base import AgentConfig
+from tests.conftest import EchoTool, FailingTool, ScriptedLLM
+
+
+async def test_finish_on_first_step_returns_answer(agent_factory, llm: ScriptedLLM):
+    config = AgentConfig(
+        agent_id="a1",
+        role="finishes immediately",
+        system_prompt="finish.",
+        allowed_tools=[],
+    )
+    agent = agent_factory(config)
+
+    result = await agent.run("what is 2+2?")
+
+    assert result["agent_id"] == "a1"
+    assert result["confidence"] == 0.9
+    assert result["steps"] == 1
+    assert "error" not in result
+    assert "done:" in result["answer"]
+
+
+async def test_tool_call_then_finish(agent_factory, llm: ScriptedLLM):
+    """Two-step: call echo tool, then finish using the observation."""
+    step = {"n": 0}
+
+    def react(system, messages, kwargs):
+        step["n"] += 1
+        if step["n"] == 1:
+            return {
+                "thought": "call echo",
+                "action": "echo",
+                "args": {"message": "hello"},
+            }
+        return {
+            "thought": "I have the observation",
+            "action": "finish",
+            "answer": "echoed hello",
+            "confidence": 0.8,
+        }
+
+    # ScriptedLLM default routes don't catch agent ReAct (no system match), so we
+    # override the default by routing on the BaseAgent system prompt's "ReAct" marker.
+    llm.routes = {"react": react}
+
+    config = AgentConfig(
+        agent_id="a2",
+        role="uses echo",
+        system_prompt="You may use the echo tool. Follow the ReAct format.",
+        allowed_tools=["echo"],
+        max_steps=5,
+    )
+    agent = agent_factory(config, tools={"echo": EchoTool()})
+
+    result = await agent.run("say hello")
+
+    assert result["steps"] == 2
+    assert result["answer"] == "echoed hello"
+    assert step["n"] == 2
+
+
+async def test_unknown_tool_returns_error_observation(agent_factory, llm: ScriptedLLM):
+    """Unknown tool name should not crash — returns error string as observation."""
+    step = {"n": 0}
+
+    def react(system, messages, kwargs):
+        step["n"] += 1
+        if step["n"] == 1:
+            return {"thought": "try", "action": "nope", "args": {}}
+        # second step: should see the error in the observation
+        last = messages[-1]["content"]
+        assert "Error: tool 'nope' not available" in last
+        return {
+            "thought": "give up",
+            "action": "finish",
+            "answer": "no such tool",
+            "confidence": 0.5,
+        }
+
+    llm.routes = {"react": react}
+
+    config = AgentConfig(
+        agent_id="a3",
+        role="tries unknown tool",
+        system_prompt="ReAct format please.",
+        allowed_tools=[],
+        max_steps=5,
+    )
+    agent = agent_factory(config)
+
+    result = await agent.run("do something")
+
+    assert result["steps"] == 2
+    assert result["answer"] == "no such tool"
+
+
+async def test_failing_tool_does_not_crash_loop(agent_factory, llm: ScriptedLLM):
+    """A tool that raises should produce an error observation, not propagate."""
+    step = {"n": 0}
+
+    def react(system, messages, kwargs):
+        step["n"] += 1
+        if step["n"] == 1:
+            return {"thought": "try", "action": "fail", "args": {}}
+        last = messages[-1]["content"]
+        assert "Tool error (fail)" in last
+        return {"action": "finish", "answer": "handled", "confidence": 0.7, "thought": ""}
+
+    llm.routes = {"react": react}
+
+    config = AgentConfig(
+        agent_id="a4",
+        role="uses failing tool",
+        system_prompt="ReAct.",
+        allowed_tools=["fail"],
+    )
+    agent = agent_factory(config, tools={"fail": FailingTool()})
+
+    result = await agent.run("trigger failure")
+
+    assert result["answer"] == "handled"
+
+
+async def test_max_steps_returns_error_result(agent_factory, llm: ScriptedLLM):
+    """Agent that never finishes should hit max_steps and return error."""
+
+    def react(system, messages, kwargs):
+        # always call echo, never finish
+        return {"thought": "loop", "action": "echo", "args": {"message": "x"}}
+
+    llm.routes = {"react": react}
+
+    config = AgentConfig(
+        agent_id="a5",
+        role="loops",
+        system_prompt="ReAct.",
+        allowed_tools=["echo"],
+        max_steps=3,
+    )
+    agent = agent_factory(config, tools={"echo": EchoTool()})
+
+    result = await agent.run("loop forever")
+
+    assert result["steps"] == 3
+    assert result["confidence"] == 0.0
+    assert "Max steps" in result["error"]
+
+
+async def test_unparseable_llm_response_returns_error(agent_factory, llm: ScriptedLLM):
+    """If the LLM returns garbage, the agent should error gracefully."""
+
+    def react(system, messages, kwargs):
+        return "this is not json at all"
+
+    llm.routes = {"react": react}
+
+    config = AgentConfig(
+        agent_id="a6",
+        role="parser test",
+        system_prompt="ReAct.",
+        allowed_tools=[],
+    )
+    agent = agent_factory(config)
+
+    result = await agent.run("anything")
+
+    assert result["confidence"] == 0.0
+    assert "unparseable" in result["error"]

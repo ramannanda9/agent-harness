@@ -321,7 +321,7 @@ class Orchestrator:
                 return_exceptions=True,
             )
 
-            for task, result in zip(ready, batch_results):
+            for task, result in zip(ready, batch_results, strict=True):
                 pending.remove(task)
 
                 # handle asyncio exceptions

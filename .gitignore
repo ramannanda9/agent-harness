@@ -1,6 +1,8 @@
 __pycache__/
 *.pyc
 *.pyo
+.DS_Store
+.pytest_cache/
 .env
 .venv/
 venv/
@@ -13,3 +15,4 @@ lance_episodic/
 /tmp/
 executor/target/
 .python-version
+.claude/
