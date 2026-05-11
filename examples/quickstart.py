@@ -14,17 +14,11 @@ from __future__ import annotations
 
 import asyncio
 import json
-import sys
-import os
-
-# make harness importable from examples/
-sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from agents.base import AgentConfig
-from harness.runtime import AgentRuntime, AgentRegistry, ToolRegistry, GuardrailConfig
+from harness.runtime import AgentRegistry, AgentRuntime, GuardrailConfig, ToolRegistry
 from memory.manager import MemoryManager
-from memory.stores import InMemorySemanticStore, InMemoryEpisodicStore
-
+from memory.stores import InMemoryEpisodicStore, InMemorySemanticStore
 
 # ── Mock LLM ─────────────────────────────────────────────────────────────────
 # Replace with real LLM client:
@@ -220,7 +214,6 @@ async def main() -> None:
 
     print()
     print("Trace (Run 1):")
-    from harness.runtime import Tracer
     for event in result["trace"]:
         payload_str = json.dumps(event["payload"], default=str)
         if len(payload_str) > 120:

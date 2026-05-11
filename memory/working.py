@@ -120,7 +120,6 @@ class WorkingMemory:
         # take oldest summarize_ratio of evictable messages
         cutoff = max(1, int(len(evictable) * self.summarize_ratio))
         to_summarize = evictable[:cutoff]
-        tokens_before = sum(m.token_count for m in to_summarize)
 
         summary_text = await self._summarize(to_summarize)
         summary_msg = Message(role="user", content=f"[Memory summary]: {summary_text}")

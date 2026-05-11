@@ -20,11 +20,11 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
-from memory.working import WorkingMemory
 from memory.manager import MemoryManager
+from memory.working import WorkingMemory
 
 logger = logging.getLogger(__name__)
 
@@ -225,7 +225,7 @@ class BaseAgent:
             if start >= 0 and end > start:
                 return json.loads(text[start:end])
             return json.loads(text)
-        except (json.JSONDecodeError, Exception) as e:
+        except Exception as e:
             logger.error("Agent %s think failed: %s", self.config.agent_id, e)
             return None
 
