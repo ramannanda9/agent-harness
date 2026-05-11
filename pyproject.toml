@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "agent-harness"
+version = "0.1.0"
+description = "Generic multi-agent orchestration harness with LanceDB memory"
+requires-python = ">=3.10"
+dependencies = [
+    "lancedb>=0.6",
+    "pyarrow>=14",
+    "anthropic>=0.25",
+    "openai>=1.0",
+    "redis>=5.0",
+    "sentence-transformers>=2.7",
+    "kubernetes>=29",
+    "datadog-api-client>=2.0",
+    "slack-sdk>=3.27",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio", "ruff", "mypy"]
+rust = []  # build executor/ separately with cargo
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
