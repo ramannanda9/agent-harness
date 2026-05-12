@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -29,6 +30,33 @@ Return JSON only:
 {{
   "agent_id": "<agent_id from the list above>",
   "rationale": "<one sentence explaining why>"
+}}
+"""
+
+# ── Complexity classifier prompt ───────────────────────────────────────────────
+# One cheap LLM call. Decides whether the goal needs sub-task decomposition.
+
+_CLASSIFIER_SYSTEM = """
+You are a task complexity classifier.
+
+Available agents:
+{agent_descriptions}
+
+Classify the goal as "simple" or "complex":
+
+  simple  — one agent can handle the goal end-to-end in a single focused run.
+            It may call multiple tools, but the steps are naturally sequential
+            and don't benefit from splitting into separate subtasks.
+
+  complex — the goal benefits from decomposition: either it needs multiple
+            specialist agents working in parallel, or it has distinct phases
+            where later steps depend on the structured output of earlier ones
+            (e.g. discover → analyse → report).
+
+Return JSON only:
+{{
+  "complexity": "simple" | "complex",
+  "rationale": "<one sentence>"
 }}
 """
 
@@ -245,6 +273,38 @@ class AgentRuntime:
         self._guardrail_config = guardrail_config or GuardrailConfig()
         self._enable_otel = enable_otel
 
+    def _make_tracer(self) -> Tracer:
+        """Create a fresh Tracer, attaching the OTEL hook when enabled."""
+        tracer = Tracer()
+        if self._enable_otel:
+            from harness.otel import OTELHook
+
+            tracer.add_hook(OTELHook())
+        return tracer
+
+    async def _run_agent_with_tracer(self, agent_id: str, task: str, tracer: Tracer, run_id: str):
+        """
+        Internal: run a single agent using a pre-built tracer.
+        The caller is responsible for tracer.start_run() / tracer.end_run().
+        """
+        from agents.base import BaseAgent
+
+        guard = BudgetGuard(self._guardrail_config)
+        if hasattr(self._llm, "set_budget"):
+            self._llm.set_budget(guard)
+
+        config = self._agent_registry.get(agent_id)
+        agent = BaseAgent(
+            config=config,
+            tools=self._tool_registry.get_subset(config.allowed_tools),
+            memory=self._memory,
+            tracer=tracer,
+            guard=guard,
+            llm=self._llm,
+        )
+        async for event in agent.run_stream(task, run_id=run_id):
+            yield event
+
     def _build_orchestrator(self):
         """Construct fresh tracer, guard, agents, and orchestrator for one run."""
         from agents.base import BaseAgent
@@ -292,6 +352,86 @@ class AgentRuntime:
         )
         return orchestrator, tracer, guard
 
+    async def _classify(self, goal: str) -> str:
+        """
+        Classify goal complexity with one cheap LLM call.
+        Returns "simple" or "complex".
+        Fast-path: single agent registered → always "simple" (nothing to decompose across).
+        """
+        if len(self._agent_registry.all_ids()) == 1:
+            return "simple"
+
+        agent_descriptions = "\n".join(
+            f"  {aid}: {self._agent_registry.get(aid).role}"
+            for aid in self._agent_registry.all_ids()
+        )
+        response = await self._llm.complete(
+            system=_CLASSIFIER_SYSTEM.format(agent_descriptions=agent_descriptions),
+            messages=[{"role": "user", "content": f"Goal: {goal}"}],
+            response_format={"type": "json_object"},
+        )
+        data = _parse_json_response(response)
+        complexity = data.get("complexity", "simple")
+        rationale = data.get("rationale", "")
+        logger.info("Classifier → %s (%s)", complexity, rationale)
+        return complexity if complexity in ("simple", "complex") else "simple"
+
+    async def dispatch_stream(self, goal: str):
+        """
+        Single entry point for any goal. Classifies complexity then delegates:
+          simple  → router picks agent, one ReAct loop (OTEL-traced)
+          complex → run_stream (planner decomposes into sub-tasks, has its own trace)
+
+        Emits a DISPATCH event first so callers can see which path was chosen.
+        """
+        from harness.events import BusEvent, EventType
+
+        complexity = await self._classify(goal)
+        path = "routed" if complexity == "simple" else "orchestrated"
+        yield BusEvent(
+            type=EventType.DISPATCH,
+            agent_id="orchestrator",
+            payload={"complexity": complexity, "path": path},
+        )
+
+        if complexity == "simple":
+            # Own the full OTEL lifecycle for the simple path so dispatch + route
+            # events appear in the same trace as the agent work.
+            tracer = self._make_tracer()
+            run_id = str(uuid.uuid4())
+            tracer.start_run(run_id, goal)
+            try:
+                tracer.log("dispatch", "orchestrator", {"complexity": complexity, "path": path})
+                agent_id, rationale = await self.route(goal)
+                logger.info("Router → %s (%s)", agent_id, rationale)
+                tracer.log("route", agent_id, {"agent_id": agent_id, "rationale": rationale})
+                yield BusEvent(
+                    type=EventType.ROUTE,
+                    agent_id=agent_id,
+                    payload={"agent_id": agent_id, "rationale": rationale},
+                )
+                async for event in self._run_agent_with_tracer(agent_id, goal, tracer, run_id):
+                    yield event
+            finally:
+                tracer.end_run()
+        else:
+            # Orchestrated path owns its own trace via _build_orchestrator.
+            async for event in self.run_stream(goal):
+                yield event
+
+    async def dispatch(self, goal: str) -> dict:
+        """Blocking dispatch. Returns TASK_DONE payload for simple goals,
+        DONE payload for complex (orchestrated) goals."""
+        from harness.events import EventType
+
+        result: dict = {}
+        async for event in self.dispatch_stream(goal):
+            if event.type in (EventType.TASK_DONE, EventType.DONE):
+                result = event.payload
+            elif event.type == EventType.ERROR:
+                result = {"answer": "", "confidence": 0.0, "error": event.error}
+        return result
+
     async def route(self, goal: str) -> tuple[str, str]:
         """
         Pick the best agent for a goal without decomposing into subtasks.
@@ -338,15 +478,22 @@ class AgentRuntime:
         """
         from harness.events import BusEvent, EventType
 
-        agent_id, rationale = await self.route(goal)
-        logger.info("Router → %s (%s)", agent_id, rationale)
-        yield BusEvent(
-            type=EventType.ROUTE,
-            agent_id=agent_id,
-            payload={"agent_id": agent_id, "rationale": rationale},
-        )
-        async for event in self.run_agent_stream(agent_id, goal):
-            yield event
+        tracer = self._make_tracer()
+        run_id = str(uuid.uuid4())
+        tracer.start_run(run_id, goal)
+        try:
+            agent_id, rationale = await self.route(goal)
+            logger.info("Router → %s (%s)", agent_id, rationale)
+            tracer.log("route", agent_id, {"agent_id": agent_id, "rationale": rationale})
+            yield BusEvent(
+                type=EventType.ROUTE,
+                agent_id=agent_id,
+                payload={"agent_id": agent_id, "rationale": rationale},
+            )
+            async for event in self._run_agent_with_tracer(agent_id, goal, tracer, run_id):
+                yield event
+        finally:
+            tracer.end_run()
 
     async def run_routed(self, goal: str) -> dict:
         """Blocking routed run. Returns the TASK_DONE payload dict."""
@@ -371,24 +518,14 @@ class AgentRuntime:
         async for event in runtime.run_agent_stream("researcher", "what is 2+2?"):
             ...
         """
-        from agents.base import BaseAgent
-
-        tracer = Tracer()
-        guard = BudgetGuard(self._guardrail_config)
-        if hasattr(self._llm, "set_budget"):
-            self._llm.set_budget(guard)
-
-        config = self._agent_registry.get(agent_id)
-        agent = BaseAgent(
-            config=config,
-            tools=self._tool_registry.get_subset(config.allowed_tools),
-            memory=self._memory,
-            tracer=tracer,
-            guard=guard,
-            llm=self._llm,
-        )
-        async for event in agent.run_stream(task):
-            yield event
+        tracer = self._make_tracer()
+        run_id = str(uuid.uuid4())
+        tracer.start_run(run_id, task)
+        try:
+            async for event in self._run_agent_with_tracer(agent_id, task, tracer, run_id):
+                yield event
+        finally:
+            tracer.end_run()
 
     async def run_agent(self, agent_id: str, task: str) -> dict:
         """Blocking single-agent run. Returns the TASK_DONE payload dict."""

@@ -23,8 +23,10 @@ Token management:
   - count_tokens defaults to chars/4; pass a custom counter to WorkingMemory
     if you need exact (e.g. tiktoken) counts.
 """
+
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import uuid
@@ -41,15 +43,16 @@ logger = logging.getLogger(__name__)
 
 # ── Agent Config ──────────────────────────────────────────────────────────────
 
+
 @dataclass
 class AgentConfig:
     agent_id: str
-    role: str                              # plain English — used by planner for agent selection
+    role: str  # plain English — used by planner for agent selection
     system_prompt: str
-    allowed_tools: list[str]               # tool names from ToolRegistry
+    allowed_tools: list[str]  # tool names from ToolRegistry
     max_steps: int = 10
     memory_context_enabled: bool = True
-    confidence_from_llm: bool = True       # if False, confidence=1.0 on success
+    confidence_from_llm: bool = True  # if False, confidence=1.0 on success
     working_memory_max_tokens: int = 8000  # WorkingMemory eviction threshold; tune per agent
 
 
@@ -57,13 +60,23 @@ class AgentConfig:
 
 # Injected into every agent's system prompt so LLM knows the expected format.
 REACT_FORMAT = """
-At each step, respond with a JSON object in one of two forms:
+At each step, respond with a JSON object in one of three forms:
 
-To use a tool:
+To use a single tool:
 {
   "thought": "<reasoning about what to do next>",
   "action": "<tool_name>",
   "args": { "<arg>": "<value>", ... }
+}
+
+To use multiple independent tools at once (they run in parallel — use this when \
+the calls don't depend on each other):
+{
+  "thought": "<reasoning>",
+  "actions": [
+    {"tool": "<tool_name>", "args": { "<arg>": "<value>", ... }},
+    {"tool": "<tool_name_2>", "args": { "<arg>": "<value>", ... }}
+  ]
 }
 
 To finish:
@@ -80,6 +93,7 @@ Return JSON only — no markdown, no preamble.
 
 
 # ── Base Agent ────────────────────────────────────────────────────────────────
+
 
 class BaseAgent:
     """
@@ -99,14 +113,14 @@ class BaseAgent:
     def __init__(
         self,
         config: AgentConfig,
-        tools: dict[str, Any],         # name → Tool instance
+        tools: dict[str, Any],  # name → Tool instance
         memory: MemoryManager,
         tracer,
         guard,
         llm,
     ) -> None:
         self.config = config
-        self.role = config.role        # exposed for orchestrator planner prompt
+        self.role = config.role  # exposed for orchestrator planner prompt
         self._tools = tools
         self._memory = memory
         self._tracer = tracer
@@ -117,7 +131,9 @@ class BaseAgent:
     # ── Streaming entry point (canonical) ─────────────────────────────────────
 
     async def run_stream(
-        self, task: str, run_id: str | None = None,
+        self,
+        task: str,
+        run_id: str | None = None,
     ) -> AsyncGenerator[BusEvent, None]:
         run_id = run_id or str(uuid.uuid4())
         self._working_memory = WorkingMemory(
@@ -196,9 +212,13 @@ class BaseAgent:
                 return
 
             self._tracer.log(
-                "thought", self.config.agent_id,
-                {"step": step, "thought": response.get("thought", ""),
-                 "action": response.get("action")},
+                "thought",
+                self.config.agent_id,
+                {
+                    "step": step,
+                    "thought": response.get("thought", ""),
+                    "action": response.get("action"),
+                },
             )
 
             # Finish?
@@ -207,8 +227,7 @@ class BaseAgent:
                     "agent_id": self.config.agent_id,
                     "answer": response.get("answer", ""),
                     "confidence": (
-                        response.get("confidence", 1.0)
-                        if self.config.confidence_from_llm else 1.0
+                        response.get("confidence", 1.0) if self.config.confidence_from_llm else 1.0
                     ),
                     "steps": step + 1,
                     "metadata": {
@@ -217,7 +236,9 @@ class BaseAgent:
                 }
                 logger.info(
                     "Agent %s completed: steps=%d confidence=%.2f summarizations=%d",
-                    self.config.agent_id, result["steps"], result["confidence"],
+                    self.config.agent_id,
+                    result["steps"],
+                    result["confidence"],
                     self._working_memory.summarization_count,
                 )
                 yield BusEvent(
@@ -227,45 +248,109 @@ class BaseAgent:
                 )
                 return
 
-            # Act
-            tool_name = response.get("action", "")
-            tool_args = response.get("args", {})
-            yield BusEvent(
-                type=EventType.ACTION,
-                agent_id=self.config.agent_id,
-                payload={"step": step, "tool": tool_name, "args": tool_args},
-            )
+            # Act — parallel or single
+            parallel_actions = response.get("actions")
+            if parallel_actions and isinstance(parallel_actions, list):
+                # Emit ACTION events first so callers see what's being launched.
+                for act in parallel_actions:
+                    yield BusEvent(
+                        type=EventType.ACTION,
+                        agent_id=self.config.agent_id,
+                        payload={
+                            "step": step,
+                            "tool": act.get("tool", ""),
+                            "args": act.get("args", {}),
+                        },
+                    )
 
-            observation = await self._execute_tool(tool_name, tool_args)
-
-            self._tracer.log(
-                "action", self.config.agent_id,
-                {"step": step, "tool": tool_name, "args": tool_args,
-                 "observation": str(observation)[:500]},
-            )
-            yield BusEvent(
-                type=EventType.OBSERVATION,
-                agent_id=self.config.agent_id,
-                payload={"step": step, "tool": tool_name,
-                         "observation": str(observation)[:500]},
-            )
-
-            # Working-fact write — lightweight, no LLM, namespaced.
-            # Only write if observation is a non-trivial structured result.
-            if observation and not isinstance(observation, str):
-                await self._memory.write_working_fact(
-                    run_id=run_id,
-                    agent_id=self.config.agent_id,
-                    key=f"step_{step}_{tool_name}",
-                    value=observation,
+                # Fan out all tool calls concurrently.
+                observations = await asyncio.gather(
+                    *[
+                        self._execute_tool(act.get("tool", ""), act.get("args", {}))
+                        for act in parallel_actions
+                    ]
                 )
 
-            obs_text = (
-                json.dumps(observation, default=str)
-                if not isinstance(observation, str) else observation
-            )
-            await self._working_memory.append("assistant", json.dumps(response))
-            await self._working_memory.append("user", f"Observation: {obs_text}")
+                combined: list[dict] = []
+                for i, (act, obs) in enumerate(zip(parallel_actions, observations, strict=False)):
+                    tool_name = act.get("tool", "")
+                    tool_args = act.get("args", {})
+                    self._tracer.log(
+                        "action",
+                        self.config.agent_id,
+                        {
+                            "step": step,
+                            "tool": tool_name,
+                            "args": tool_args,
+                            "observation": str(obs)[:500],
+                        },
+                    )
+                    yield BusEvent(
+                        type=EventType.OBSERVATION,
+                        agent_id=self.config.agent_id,
+                        payload={"step": step, "tool": tool_name, "observation": str(obs)[:500]},
+                    )
+                    combined.append({"tool": tool_name, "result": obs})
+                    if obs and not isinstance(obs, str):
+                        await self._memory.write_working_fact(
+                            run_id=run_id,
+                            agent_id=self.config.agent_id,
+                            key=f"step_{step}_{i}_{tool_name}",
+                            value=obs,
+                        )
+
+                await self._working_memory.append("assistant", json.dumps(response))
+                await self._working_memory.append(
+                    "user",
+                    f"Observations:\n{json.dumps(combined, default=str)}",
+                )
+            else:
+                # Single action path.
+                tool_name = response.get("action", "")
+                tool_args = response.get("args", {})
+                yield BusEvent(
+                    type=EventType.ACTION,
+                    agent_id=self.config.agent_id,
+                    payload={"step": step, "tool": tool_name, "args": tool_args},
+                )
+
+                observation = await self._execute_tool(tool_name, tool_args)
+
+                self._tracer.log(
+                    "action",
+                    self.config.agent_id,
+                    {
+                        "step": step,
+                        "tool": tool_name,
+                        "args": tool_args,
+                        "observation": str(observation)[:500],
+                    },
+                )
+                yield BusEvent(
+                    type=EventType.OBSERVATION,
+                    agent_id=self.config.agent_id,
+                    payload={
+                        "step": step,
+                        "tool": tool_name,
+                        "observation": str(observation)[:500],
+                    },
+                )
+
+                if observation and not isinstance(observation, str):
+                    await self._memory.write_working_fact(
+                        run_id=run_id,
+                        agent_id=self.config.agent_id,
+                        key=f"step_{step}_{tool_name}",
+                        value=observation,
+                    )
+
+                obs_text = (
+                    json.dumps(observation, default=str)
+                    if not isinstance(observation, str)
+                    else observation
+                )
+                await self._working_memory.append("assistant", json.dumps(response))
+                await self._working_memory.append("user", f"Observation: {obs_text}")
 
         # Max steps exhausted.
         yield BusEvent(
@@ -290,7 +375,8 @@ class BaseAgent:
         try:
             if hasattr(self._llm, "stream_complete"):
                 async for token in self._llm.stream_complete(
-                    system=None, messages=messages,
+                    system=None,
+                    messages=messages,
                 ):
                     accumulated += token
                     yield BusEvent(
@@ -301,7 +387,8 @@ class BaseAgent:
                 response = _parse_action_json(accumulated)
             else:
                 raw = await self._llm.complete(
-                    system=None, messages=messages,
+                    system=None,
+                    messages=messages,
                     response_format={"type": "json_object"},
                 )
                 response = _normalize_response(raw)
@@ -324,8 +411,7 @@ class BaseAgent:
     async def _execute_tool(self, name: str, args: dict) -> Any:
         if name not in self._tools:
             return (
-                f"Error: tool '{name}' not available. "
-                f"Available tools: {list(self._tools.keys())}"
+                f"Error: tool '{name}' not available. Available tools: {list(self._tools.keys())}"
             )
         try:
             return await self._tools[name].execute(**args)
@@ -350,7 +436,7 @@ class BaseAgent:
 
 
 def _normalize_response(response: Any) -> dict | None:
-    if isinstance(response, dict) and "action" in response:
+    if isinstance(response, dict) and ("action" in response or "actions" in response):
         return response
     if isinstance(response, dict) and "text" in response:
         text = response["text"].strip()

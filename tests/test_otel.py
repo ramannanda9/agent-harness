@@ -3,6 +3,7 @@ Tests for harness/otel.py — OTEL hook, span creation, and Tracer integration.
 
 Uses the OTEL InMemorySpanExporter so no collector is needed.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -37,6 +38,7 @@ class InMemorySpanExporter(SpanExporter):
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
 
 @pytest.fixture()
 def otel_env():
@@ -77,6 +79,7 @@ def get_span(exporter, name: str):
 
 # ── OTELHook unit tests ──────────────────────────────────────────────────────
 
+
 class TestOTELHookLifecycle:
     def test_start_and_end_run_creates_root_span(self, otel_env):
         hook, exporter = otel_env
@@ -95,14 +98,18 @@ class TestOTELHookLifecycle:
         hook, exporter = otel_env
 
         hook.on_start_run("run-1", "goal")
-        hook.on_event("plan", "orchestrator", {
-            "plan": {
-                "rationale": "simple plan",
-                "tasks": [
-                    {"id": "t1", "agent_id": "researcher", "instruction": "do stuff"},
-                ],
+        hook.on_event(
+            "plan",
+            "orchestrator",
+            {
+                "plan": {
+                    "rationale": "simple plan",
+                    "tasks": [
+                        {"id": "t1", "agent_id": "researcher", "instruction": "do stuff"},
+                    ],
+                },
             },
-        })
+        )
         hook.on_end_run()
 
         plan = get_span(exporter, "plan")
@@ -114,9 +121,15 @@ class TestOTELHookLifecycle:
 
         hook.on_start_run("run-1", "goal")
         hook.on_event("thought", "agent-a", {"step": 0, "thought": "thinking...", "action": "tool"})
-        hook.on_event("task_result", "agent-a", {
-            "task_id": "t1", "success": True, "confidence": 0.9,
-        })
+        hook.on_event(
+            "task_result",
+            "agent-a",
+            {
+                "task_id": "t1",
+                "success": True,
+                "confidence": 0.9,
+            },
+        )
         hook.on_end_run()
 
         task = get_span(exporter, "task:agent-a")
@@ -134,13 +147,25 @@ class TestOTELHookLifecycle:
 
         hook.on_start_run("run-1", "goal")
         hook.on_event("thought", "agent-a", {"step": 0, "thought": "let me fetch"})
-        hook.on_event("action", "agent-a", {
-            "step": 0, "tool": "http_fetch", "args": {"url": "http://example.com"},
-            "observation": "200 OK",
-        })
-        hook.on_event("task_result", "agent-a", {
-            "task_id": "t1", "success": True, "confidence": 1.0,
-        })
+        hook.on_event(
+            "action",
+            "agent-a",
+            {
+                "step": 0,
+                "tool": "http_fetch",
+                "args": {"url": "http://example.com"},
+                "observation": "200 OK",
+            },
+        )
+        hook.on_event(
+            "task_result",
+            "agent-a",
+            {
+                "task_id": "t1",
+                "success": True,
+                "confidence": 1.0,
+            },
+        )
         hook.on_end_run()
 
         task = get_span(exporter, "task:agent-a")
@@ -152,9 +177,15 @@ class TestOTELHookLifecycle:
         hook, exporter = otel_env
 
         hook.on_start_run("run-1", "goal")
-        hook.on_event("synthesis", "orchestrator", {
-            "confidence": 0.95, "conflicts": [], "unknowns": [],
-        })
+        hook.on_event(
+            "synthesis",
+            "orchestrator",
+            {
+                "confidence": 0.95,
+                "conflicts": [],
+                "unknowns": [],
+            },
+        )
         hook.on_end_run()
 
         synth = get_span(exporter, "synthesis")
@@ -164,9 +195,15 @@ class TestOTELHookLifecycle:
         hook, exporter = otel_env
 
         hook.on_start_run("run-1", "goal")
-        hook.on_event("replan", "orchestrator", {
-            "replan_count": 1, "trigger_task": "t1", "new_task_count": 2,
-        })
+        hook.on_event(
+            "replan",
+            "orchestrator",
+            {
+                "replan_count": 1,
+                "trigger_task": "t1",
+                "new_task_count": 2,
+            },
+        )
         hook.on_end_run()
 
         root = get_span(exporter, "run")
@@ -181,14 +218,26 @@ class TestOTELHookLifecycle:
         hook.on_start_run("run-1", "goal")
         # Task 1
         hook.on_event("thought", "agent-a", {"step": 0, "thought": "task 1"})
-        hook.on_event("task_result", "agent-a", {
-            "task_id": "t1", "success": True, "confidence": 1.0,
-        })
+        hook.on_event(
+            "task_result",
+            "agent-a",
+            {
+                "task_id": "t1",
+                "success": True,
+                "confidence": 1.0,
+            },
+        )
         # Task 2 (same agent)
         hook.on_event("thought", "agent-a", {"step": 0, "thought": "task 2"})
-        hook.on_event("task_result", "agent-a", {
-            "task_id": "t2", "success": True, "confidence": 0.8,
-        })
+        hook.on_event(
+            "task_result",
+            "agent-a",
+            {
+                "task_id": "t2",
+                "success": True,
+                "confidence": 0.8,
+            },
+        )
         hook.on_end_run()
 
         task_spans = [s for s in exporter.get_finished_spans() if s.name == "task:agent-a"]
@@ -212,6 +261,7 @@ class TestOTELHookLifecycle:
 
 # ── Tracer + OTELHook integration ─────────────────────────────────────────────
 
+
 class TestTracerHookIntegration:
     def test_tracer_hook_receives_events(self, otel_env):
         hook, exporter = otel_env
@@ -220,13 +270,23 @@ class TestTracerHookIntegration:
         tracer.add_hook(hook)
 
         tracer.start_run("run-99", "integration test")
-        tracer.log("plan", "orchestrator", {
-            "plan": {"rationale": "test", "tasks": []},
-        })
+        tracer.log(
+            "plan",
+            "orchestrator",
+            {
+                "plan": {"rationale": "test", "tasks": []},
+            },
+        )
         tracer.log("thought", "agent-x", {"step": 0, "thought": "hi"})
-        tracer.log("task_result", "agent-x", {
-            "task_id": "t1", "success": True, "confidence": 1.0,
-        })
+        tracer.log(
+            "task_result",
+            "agent-x",
+            {
+                "task_id": "t1",
+                "success": True,
+                "confidence": 1.0,
+            },
+        )
         tracer.log("synthesis", "orchestrator", {"confidence": 0.9})
         tracer.end_run()
 
@@ -259,3 +319,64 @@ class TestTracerHookIntegration:
         tracer.end_run()  # no-op
 
         assert len(tracer.dump()) == 1
+
+    def test_dispatch_recorded_on_root_span(self, otel_env):
+        """dispatch event appears as a span event on the root run span."""
+        hook, exporter = otel_env
+
+        tracer = Tracer()
+        tracer.add_hook(hook)
+
+        tracer.start_run("run-d", "dispatch test")
+        tracer.log("dispatch", "orchestrator", {"complexity": "simple", "path": "routed"})
+        tracer.end_run()
+
+        root = get_span(exporter, "run")
+        dispatch_events = [e for e in root.events if e.name == "dispatch"]
+        assert len(dispatch_events) == 1
+        assert dispatch_events[0].attributes["complexity"] == "simple"
+        assert dispatch_events[0].attributes["path"] == "routed"
+
+    def test_route_recorded_on_root_span(self, otel_env):
+        """route event appears as a span event on the root run span."""
+        hook, exporter = otel_env
+
+        tracer = Tracer()
+        tracer.add_hook(hook)
+
+        tracer.start_run("run-r", "route test")
+        tracer.log("route", "researcher", {"agent_id": "researcher", "rationale": "best fit"})
+        tracer.end_run()
+
+        root = get_span(exporter, "run")
+        route_events = [e for e in root.events if e.name == "route"]
+        assert len(route_events) == 1
+        assert route_events[0].attributes["agent_id"] == "researcher"
+        assert route_events[0].attributes["rationale"] == "best fit"
+
+    def test_dispatch_and_route_before_agent_work(self, otel_env):
+        """dispatch → route → thought all land in the same trace."""
+        hook, exporter = otel_env
+
+        tracer = Tracer()
+        tracer.add_hook(hook)
+
+        tracer.start_run("run-full", "full routed run")
+        tracer.log("dispatch", "orchestrator", {"complexity": "simple", "path": "routed"})
+        tracer.log("route", "researcher", {"agent_id": "researcher", "rationale": "only agent"})
+        tracer.log(
+            "thought", "researcher", {"step": 0, "thought": "let me fetch", "action": "http_fetch"}
+        )
+        tracer.log(
+            "task_result", "researcher", {"task_id": "t1", "success": True, "confidence": 0.9}
+        )
+        tracer.end_run()
+
+        names = span_names(exporter)
+        assert "run" in names
+        assert "task:researcher" in names
+
+        root = get_span(exporter, "run")
+        root_event_names = [e.name for e in root.events]
+        assert "dispatch" in root_event_names
+        assert "route" in root_event_names

@@ -49,10 +49,14 @@ tools/builtin/http_fetch.py HTTPFetch — minimal read-only GET tool
 tools/mcp/adapter.py        MCP tool adapter — connect any MCP server
 ```
 
-Execution is **streaming-primary**: every run flows through `run_stream()`,
-which yields `BusEvent`s for plan, thoughts, tool calls, observations, task
-completions, replans, and synthesis. The blocking `run()` is a thin drain
-over the same stream.
+Execution is **streaming-primary**: every path yields `BusEvent`s for
+dispatch, routing, plan, thoughts, tool calls, observations, task completions,
+replans, and synthesis. The blocking variants drain the same stream.
+
+`dispatch_stream(goal)` is the recommended entry point — it classifies
+complexity with one cheap LLM call and delegates automatically to the routed
+or orchestrated path. Use the lower-level paths directly only when you need
+explicit control.
 
 ## Examples
 
@@ -79,7 +83,7 @@ agents.register(AgentConfig(
 ))
 
 # 3. Run
-result = await runtime.run("my goal")
+result = await runtime.dispatch("my goal")
 ```
 
 ## LLM clients
@@ -147,7 +151,39 @@ protocols in `memory/manager.py`.
 
 ## Execution paths
 
-Three paths, same event vocabulary — pick the one that matches your task:
+### Recommended: `dispatch` / `dispatch_stream`
+
+One call. The harness classifies the goal, picks the right path, and runs it.
+
+```python
+from harness.events import EventType
+
+async for event in runtime.dispatch_stream("investigate the GPU spike on worker-07"):
+    if event.type == EventType.DISPATCH:
+        print(f"complexity={event.payload['complexity']} path={event.payload['path']}")
+    elif event.type == EventType.ROUTE:
+        print(f"→ {event.payload['agent_id']}: {event.payload['rationale']}")
+    elif event.type == EventType.ACTION:
+        print(f"  tool: {event.payload['tool']}")
+    elif event.type == EventType.DONE:
+        print(event.payload["answer"])
+    elif event.type == EventType.TASK_DONE:
+        print(event.payload["answer"])   # routed path ends here, no DONE
+
+result = await runtime.dispatch("what is the capital of France?")  # blocking
+```
+
+**Classification logic:**
+- 1 agent registered → always `"simple"`, no LLM call made.
+- Multiple agents → one cheap LLM call classifies `"simple"` (one agent handles
+  it end-to-end) or `"complex"` (benefits from task decomposition and specialist
+  routing). Unknown response defaults to `"simple"`.
+- `"simple"` path: LLM router picks the best agent → `run_routed_stream`.
+- `"complex"` path: planner decomposes into a DAG → `run_stream`.
+
+---
+
+Four lower-level paths are available when you need explicit control:
 
 ### 1. Routed — `run_routed` / `run_routed_stream`
 
@@ -199,13 +235,14 @@ async for event in runtime.run_stream("investigate GPU spike on worker-07"):
 
 Event types by path:
 
-| Event | Routed | Direct | Orchestrated |
-|---|---|---|---|
-| `ROUTE` | ✓ | — | — |
-| `THOUGHT` / `TOKEN` / `ACTION` / `OBSERVATION` | ✓ | ✓ | ✓ |
-| `TASK_DONE` | ✓ | ✓ | ✓ |
-| `PLAN` / `REPLAN` / `SYNTHESIS` / `DONE` | — | — | ✓ |
-| `ERROR` | ✓ | ✓ | ✓ |
+| Event | Dispatch | Routed | Direct | Orchestrated |
+|---|---|---|---|---|
+| `DISPATCH` | ✓ | — | — | — |
+| `ROUTE` | ✓ (simple) | ✓ | — | — |
+| `THOUGHT` / `TOKEN` / `ACTION` / `OBSERVATION` | ✓ | ✓ | ✓ | ✓ |
+| `TASK_DONE` | ✓ | ✓ | ✓ | ✓ |
+| `PLAN` / `REPLAN` / `SYNTHESIS` / `DONE` | ✓ (complex) | — | — | ✓ |
+| `ERROR` | ✓ | ✓ | ✓ | ✓ |
 
 `TOKEN` events fire only when your LLM client exposes
 `async def stream_complete(system, messages) -> AsyncGenerator[str, None]`.
@@ -267,7 +304,7 @@ doesn't support it). When `max_total_cost_usd` is exceeded, the next
 payload carries `cost_usd` and `elapsed_seconds` at the top level:
 
 ```python
-async for event in runtime.run_stream(goal):
+async for event in runtime.dispatch_stream(goal):
     if event.type == EventType.DONE:
         print(f"${event.payload['cost_usd']:.4f} in {event.payload['elapsed_seconds']:.1f}s")
 ```

@@ -1,4 +1,5 @@
 """Orchestrator + AgentRuntime end-to-end smoke tests."""
+
 from __future__ import annotations
 
 from agents.base import AgentConfig
@@ -19,23 +20,17 @@ from tests.conftest import EchoTool, ScriptedLLM
 
 
 def test_should_replan_low_confidence():
-    r = TaskResult(
-        task_id="t", agent_id="a", answer="x", confidence=0.3, steps=1, success=True
-    )
+    r = TaskResult(task_id="t", agent_id="a", answer="x", confidence=0.3, steps=1, success=True)
     assert should_replan(r, EvalConfig(confidence_threshold=0.6))
 
 
 def test_should_replan_failed():
-    r = TaskResult(
-        task_id="t", agent_id="a", answer="", confidence=1.0, steps=0, success=False
-    )
+    r = TaskResult(task_id="t", agent_id="a", answer="", confidence=1.0, steps=0, success=False)
     assert should_replan(r, EvalConfig(confidence_threshold=0.6))
 
 
 def test_should_not_replan_when_confident_and_successful():
-    r = TaskResult(
-        task_id="t", agent_id="a", answer="ok", confidence=0.9, steps=1, success=True
-    )
+    r = TaskResult(task_id="t", agent_id="a", answer="ok", confidence=0.9, steps=1, success=True)
     assert not should_replan(r, EvalConfig(confidence_threshold=0.6))
 
 
@@ -117,9 +112,7 @@ def _routes_for_runtime() -> dict:
     """Routes that produce a 2-task DAG, finish on each agent, simple synthesis."""
 
     def planner(system, messages, kwargs):
-        last_user = next(
-            (m["content"] for m in reversed(messages) if m["role"] == "user"), ""
-        )
+        last_user = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
         return {
             "tasks": [
                 {
@@ -191,8 +184,10 @@ async def test_route_single_agent_skips_llm():
     tools = ToolRegistry().register(EchoTool())
     agents = AgentRegistry().register(
         AgentConfig(
-            agent_id="analyst", role="analyses",
-            system_prompt="You analyse.", allowed_tools=["echo"],
+            agent_id="analyst",
+            role="analyses",
+            system_prompt="You analyse.",
+            allowed_tools=["echo"],
         )
     )
     memory = MemoryManager(
@@ -206,7 +201,7 @@ async def test_route_single_agent_skips_llm():
 
     assert agent_id == "analyst"
     assert rationale == "only one agent registered"
-    assert llm.calls == []   # no LLM call made
+    assert llm.calls == []  # no LLM call made
 
 
 async def test_route_multi_agent_calls_llm():
@@ -270,6 +265,122 @@ async def test_run_routed_stream_emits_route_event():
     # no PLAN or SYNTHESIS — those belong to the orchestrated path
     assert EventType.PLAN not in types
     assert EventType.SYNTHESIS not in types
+
+
+# ── Dispatch tests ────────────────────────────────────────────────────────────
+
+
+async def test_dispatch_single_agent_skips_classifier():
+    """Single agent → always simple, no classifier LLM call."""
+    from harness.events import EventType
+
+    llm = ScriptedLLM()
+    tools = ToolRegistry().register(EchoTool())
+    agents = AgentRegistry().register(
+        AgentConfig(
+            agent_id="analyst",
+            role="analyses",
+            system_prompt="You analyse.",
+            allowed_tools=["echo"],
+        )
+    )
+    memory = MemoryManager(
+        semantic_store=InMemorySemanticStore(),
+        episodic_store=InMemoryEpisodicStore(),
+        llm=llm,
+    )
+    runtime = AgentRuntime(agent_registry=agents, tool_registry=tools, memory=memory, llm=llm)
+
+    events = []
+    async for event in runtime.dispatch_stream("do something"):
+        events.append(event)
+
+    types = [e.type for e in events]
+    assert types[0] == EventType.DISPATCH
+    assert events[0].payload["complexity"] == "simple"
+    assert events[0].payload["path"] == "routed"
+    assert EventType.TASK_DONE in types
+    # no classifier call — only default finish call
+    classifier_calls = [
+        c for c in llm.calls if "complexity classifier" in (c["system"] or "").lower()
+    ]
+    assert classifier_calls == []
+
+
+async def test_dispatch_simple_goal_takes_routed_path():
+    """Multi-agent, classifier returns simple → ROUTE event emitted, no PLAN."""
+    from harness.events import EventType
+
+    def classifier(system, messages, kwargs):
+        return {"complexity": "simple", "rationale": "one agent suffices"}
+
+    def router(system, messages, kwargs):
+        return {"agent_id": "analyst", "rationale": "best fit"}
+
+    llm = ScriptedLLM(
+        routes={
+            "complexity classifier": classifier,
+            "routing agent": router,
+        }
+    )
+    runtime, _ = _build_runtime(llm)
+
+    events = []
+    async for event in runtime.dispatch_stream("quick question"):
+        events.append(event)
+
+    types = [e.type for e in events]
+    assert types[0] == EventType.DISPATCH
+    assert events[0].payload["path"] == "routed"
+    assert EventType.ROUTE in types
+    assert EventType.PLAN not in types
+
+
+async def test_dispatch_complex_goal_takes_orchestrated_path():
+    """Multi-agent, classifier returns complex → PLAN emitted, no ROUTE."""
+    from harness.events import EventType
+
+    def classifier(system, messages, kwargs):
+        return {"complexity": "complex", "rationale": "needs decomposition"}
+
+    routes = _routes_for_runtime()
+    routes["complexity classifier"] = classifier
+    llm = ScriptedLLM(routes=routes)
+    runtime, _ = _build_runtime(llm)
+
+    events = []
+    async for event in runtime.dispatch_stream("complex multi-step goal"):
+        events.append(event)
+
+    types = [e.type for e in events]
+    assert types[0] == EventType.DISPATCH
+    assert events[0].payload["path"] == "orchestrated"
+    assert EventType.PLAN in types
+    assert EventType.ROUTE not in types
+
+
+async def test_dispatch_unknown_complexity_defaults_to_simple():
+    """Classifier returns unrecognised value → treated as simple (safe fallback)."""
+
+    def classifier(system, messages, kwargs):
+        return {"complexity": "maybe", "rationale": "unsure"}
+
+    def router(system, messages, kwargs):
+        return {"agent_id": "analyst", "rationale": "default"}
+
+    llm = ScriptedLLM(
+        routes={
+            "complexity classifier": classifier,
+            "routing agent": router,
+        }
+    )
+    runtime, _ = _build_runtime(llm)
+
+    events = []
+    async for event in runtime.dispatch_stream("ambiguous goal"):
+        events.append(event)
+
+    assert events[0].payload["path"] == "routed"
 
 
 async def test_runtime_handles_unknown_agent_in_plan():
