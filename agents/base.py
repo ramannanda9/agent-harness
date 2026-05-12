@@ -127,6 +127,7 @@ class BaseAgent:
         self._guard = guard
         self._llm = llm
         self._working_memory: WorkingMemory | None = None
+        self._last_think_error: str | None = None
 
     # ── Streaming entry point (canonical) ─────────────────────────────────────
 
@@ -204,10 +205,11 @@ class BaseAgent:
                     yield thought_event
 
             if response is None:
+                reason = self._last_think_error or "LLM returned unparseable response"
                 yield BusEvent(
                     type=EventType.ERROR,
                     agent_id=self.config.agent_id,
-                    error="LLM returned unparseable response",
+                    error=reason,
                 )
                 return
 
@@ -395,6 +397,9 @@ class BaseAgent:
         except Exception as e:
             logger.error("Agent %s think failed: %s", self.config.agent_id, e)
             response = None
+            self._last_think_error = str(e)
+        else:
+            self._last_think_error = None
 
         yield BusEvent(
             type=EventType.THOUGHT,
