@@ -261,14 +261,14 @@ environment (only `PATH` is forwarded). Does **not** provide syscall filtering,
 filesystem namespacing, or network isolation.
 
 ```bash
-cd executor && cargo build --release
+cargo install --path executor   # installs ah-executor to ~/.cargo/bin
 ```
 
 ```python
 from harness.executor_bridge import ExecutorBridge, ExecutorConfig, ExecutorTool
 
+# binary_path auto-discovered from PATH via shutil.which("ah-executor")
 bridge = ExecutorBridge(ExecutorConfig(
-    binary_path="executor/target/release/executor",
     allowed_tools=("kubectl", "curl"),   # "shell" is opt-in only
 ))
 

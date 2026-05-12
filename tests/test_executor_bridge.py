@@ -20,6 +20,7 @@ from harness.executor_bridge import (
     ExecutorConfig,
     ExecutorError,
     ExecutorTool,
+    find_executor,
 )
 
 # ── Test scaffolding ──────────────────────────────────────────────────────────
@@ -67,7 +68,7 @@ def _patch_subprocess(proc: FakeProc):
 
 
 def test_missing_binary_raises(tmp_path: Path):
-    with pytest.raises(ExecutorError, match="executor binary not found"):
+    with pytest.raises(ExecutorError, match="ah-executor binary not found"):
         ExecutorBridge(ExecutorConfig(
             allowed_tools=("kubectl",),
             binary_path=str(tmp_path / "does-not-exist"),
@@ -302,21 +303,19 @@ async def test_executor_tool_arg_key_unwraps(fake_binary: Path):
     assert sent["args"] == ["get", "pods", "-A"]
 
 
-# ── Integration: real Rust binary ────────────────────────────────────────────
+# ── Integration: real ah-executor binary ─────────────────────────────────────
 
-_BINARY = Path(__file__).parent.parent / "executor" / "target" / "release" / "executor"
+_BINARY = find_executor()
 
 
 @pytest.mark.skipif(
-    not _BINARY.exists(),
-    reason="rust executor not built; run: cd executor && cargo build --release",
+    not _BINARY,
+    reason="ah-executor not on PATH; run: cargo install --path executor",
 )
 async def test_integration_native_runs_echo():
     if not shutil.which("sh"):
         pytest.skip("sh not on PATH")
-    bridge = ExecutorBridge(ExecutorConfig(
-        binary_path=str(_BINARY), allowed_tools=("shell",)
-    ))
+    bridge = ExecutorBridge(ExecutorConfig(allowed_tools=("shell",)))
     tool = ExecutorTool("shell", "shell", bridge)
     result = await tool.execute(cmd="printf 'hi'")
     assert result["success"] is True
@@ -325,13 +324,11 @@ async def test_integration_native_runs_echo():
 
 
 @pytest.mark.skipif(
-    not _BINARY.exists(),
-    reason="rust executor not built",
+    not _BINARY,
+    reason="ah-executor not on PATH",
 )
 async def test_integration_native_rejects_disallowed_tool():
-    bridge = ExecutorBridge(ExecutorConfig(
-        binary_path=str(_BINARY), allowed_tools=("kubectl",)
-    ))
+    bridge = ExecutorBridge(ExecutorConfig(allowed_tools=("kubectl",)))
     result = await bridge.execute("shell", args={"cmd": "rm -rf /"})
     assert result["success"] is False
     assert "not in executor allowlist" in result["error"]

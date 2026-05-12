@@ -4,24 +4,23 @@ Controlled subprocess execution for agent tools.
 Two backends are supported:
 
   backend="none"  (default)
-    Spawns the compiled Rust executor binary (executor/src/main.rs) as a
-    one-shot subprocess per tool call. Enforces an allowlist, wall-clock
-    timeout, and output size cap. Provides process-level isolation only —
-    no syscall filtering, no filesystem or network namespacing.
-    Build first: cd executor && cargo build --release
+    Spawns the `ah-executor` binary as a one-shot subprocess per tool call.
+    Enforces an allowlist, wall-clock timeout, and output size cap. Provides
+    process-level isolation only — no syscall filtering, no filesystem or
+    network namespacing.
+
+    Install:  cargo install --path executor
+    The binary is then on PATH as `ah-executor` and auto-discovered.
 
   backend="docker"
     Runs each tool call inside a fresh Docker container with configurable
     memory, CPU, network, and read-only filesystem constraints. This is
     real OS-level isolation. Requires Docker daemon on the host.
-    The Rust binary is not used in this mode.
+    The `ah-executor` binary is not used in this mode.
 
-Wire-up example (native):
-    bridge = ExecutorBridge(ExecutorConfig(
-        binary_path="executor/target/release/executor",
-        allowed_tools=("kubectl", "curl"),
-    ))
-    tools = {"kubectl": ExecutorTool("kubectl", "kubectl", bridge, arg_key="args")}
+Wire-up example (native — binary auto-discovered from PATH):
+    bridge = ExecutorBridge(ExecutorConfig(allowed_tools=("shell", "curl")))
+    tools = {"shell": ExecutorTool("shell", "shell", bridge)}
 
 Wire-up example (docker):
     bridge = ExecutorBridge(ExecutorConfig(
@@ -38,11 +37,19 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import time
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
 logger = logging.getLogger(__name__)
+
+EXECUTOR_BINARY = "ah-executor"
+
+
+def find_executor() -> str:
+    """Return the path to the ah-executor binary, or empty string if not found."""
+    return shutil.which(EXECUTOR_BINARY) or ""
 
 
 class ExecutorError(RuntimeError):
@@ -53,7 +60,9 @@ class ExecutorError(RuntimeError):
 class ExecutorConfig:
     allowed_tools: tuple[str, ...]
     # --- native backend ---
-    binary_path: str = ""               # required when backend="none"
+    # Defaults to auto-discovery via shutil.which("ah-executor").
+    # Override only when the binary is not on PATH.
+    binary_path: str = field(default_factory=find_executor)
     max_output_bytes: int = 1_000_000
     default_timeout_ms: int = 30_000
     # Python-side guard against the binary hanging past its own tokio timeout.
@@ -80,8 +89,8 @@ class ExecutorBridge:
         if config.backend == "none":
             if not os.path.isfile(config.binary_path):
                 raise ExecutorError(
-                    f"executor binary not found at {config.binary_path}. "
-                    "Build it: cd executor && cargo build --release"
+                    f"ah-executor binary not found (looked at: {config.binary_path!r}). "
+                    "Install it: cargo install --path executor"
                 )
         self._config = config
 

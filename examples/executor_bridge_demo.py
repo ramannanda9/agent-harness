@@ -4,26 +4,25 @@ examples/executor_bridge_demo.py
 Demonstrates ExecutorBridge — the controlled subprocess launcher for agent tools.
 
 Two backends are shown:
-  backend="none"   — routes calls through the Rust executor binary (process
-                     isolation, allowlist, timeout). Skipped if binary not built.
+  backend="none"   — routes calls through ah-executor (process isolation,
+                     allowlist, timeout). Skipped if binary not installed.
   backend="docker" — runs each call in a fresh Docker container (real network/fs
                      isolation, memory + CPU limits). Skipped if Docker not found.
 
 Run:
     python examples/executor_bridge_demo.py
 
-Build the Rust binary first (optional, for native backend):
-    cd executor && cargo build --release
+Install ah-executor first (enables native backend):
+    cargo install --path executor
 """
 from __future__ import annotations
 
 import asyncio
 import shutil
-from pathlib import Path
 
-from harness.executor_bridge import ExecutorBridge, ExecutorConfig, ExecutorTool
+from harness.executor_bridge import ExecutorBridge, ExecutorConfig, ExecutorTool, find_executor
 
-_BINARY = Path(__file__).parent.parent / "executor" / "target" / "release" / "executor"
+_BINARY = find_executor()
 _DOCKER = shutil.which("docker")
 
 SEP = "─" * 56
@@ -77,19 +76,18 @@ async def demo_allowlist() -> None:
 
 async def demo_native() -> None:
     """
-    backend="none": calls route through the Rust executor binary.
+    backend="none": calls route through ah-executor (auto-discovered from PATH).
     Provides process isolation and a scrubbed environment.
     Does not provide fs/network namespacing — for that, use backend="docker".
     """
-    _header("Native backend (Rust executor)")
+    _header("Native backend (ah-executor)")
 
-    if not _BINARY.exists():
-        print("  (skipped — binary not built)")
-        print(f"  Build: cd executor && cargo build --release")
+    if not _BINARY:
+        print("  (skipped — ah-executor not on PATH)")
+        print("  Install: cargo install --path executor")
         return
 
     bridge = ExecutorBridge(ExecutorConfig(
-        binary_path=str(_BINARY),
         allowed_tools=("shell",),
         default_timeout_ms=5_000,
     ))

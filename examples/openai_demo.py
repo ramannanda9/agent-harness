@@ -1,16 +1,23 @@
 """
-examples/openai_demo.py — end-to-end against OpenAI + a real HTTP tool.
+examples/openai_demo.py — end-to-end against OpenAI + HTTP tool + ah-executor.
 
 Wires up:
   - OpenAILLM (reads OPENAI_API_KEY from env; override with OPENAI_MODEL)
   - HTTPFetch builtin tool
-  - A single-agent registry that uses http_fetch
+  - shell tool via ah-executor (native backend) — skipped gracefully if not installed
+  - A single-agent registry that uses both tools
   - In-memory semantic + episodic stores
 
-Streams the run live to stdout so you can watch plan → action → observation →
-synthesis as it happens.
+The agent fetches a remote URL and runs a shell command in the same run,
+demonstrating the LLM orchestrating two heterogeneous tool types without
+any glue code.
+
+Streams live to stdout: plan → action → observation → synthesis.
 
     OPENAI_API_KEY=sk-... python examples/openai_demo.py
+
+Install ah-executor to enable the shell tool (optional):
+    cargo install --path executor
 """
 from __future__ import annotations
 
@@ -21,13 +28,21 @@ import sys
 
 from agents.base import AgentConfig
 from harness.events import EventType
+from harness.executor_bridge import ExecutorBridge, ExecutorConfig, ExecutorTool, find_executor
 from harness.llm.openai import OpenAILLM
 from harness.runtime import AgentRegistry, AgentRuntime, GuardrailConfig, ToolRegistry
 from memory.manager import MemoryManager
 from memory.stores import InMemoryEpisodicStore, InMemorySemanticStore
 from tools.builtin.http_fetch import HTTPFetch
 
+_EXECUTOR = find_executor()
+
 GOAL = (
+    "Do two things and report both: "
+    "(1) Use the shell tool to get the OS name and kernel version. "
+    "(2) Fetch https://httpbin.org/uuid and extract the UUID. "
+    "Present both results clearly."
+    if _EXECUTOR else
     "Fetch https://httpbin.org/json and report the slideshow title and author "
     "from the JSON response."
 )
@@ -63,19 +78,29 @@ async def main() -> None:
     llm = OpenAILLM(model=model, cost_fn=cost_fn)
 
     tools = ToolRegistry().register(HTTPFetch())
+    allowed_tools = ["http_fetch"]
+
+    if _EXECUTOR:
+        bridge = ExecutorBridge(ExecutorConfig(allowed_tools=("shell",)))
+        tools.register(ExecutorTool("shell", "shell", bridge))
+        allowed_tools.append("shell")
+        print(f"ah-executor: {_EXECUTOR} (shell tool enabled)")
+    else:
+        print("ah-executor: not found — shell tool disabled (cargo install --path executor to enable)")
 
     agents = AgentRegistry().register(
         AgentConfig(
             agent_id="researcher",
-            role="fetches a URL and reasons about its contents",
+            role="fetches URLs and runs shell commands to answer questions",
             system_prompt=(
-                "You are a research assistant. You have one tool, `http_fetch`, "
-                "which takes a `url` and returns the body. Fetch the URL the user "
-                "asks about, then answer based on the actual response. "
+                "You are a research assistant. "
+                "Use `http_fetch` (takes `url`) to retrieve remote content. "
+                "Use `shell` (takes `cmd`) to run shell commands on the local machine. "
+                "Answer based on actual tool output — never guess. "
                 "Always use the ReAct JSON format below — never reply in plain prose."
             ),
-            allowed_tools=["http_fetch"],
-            max_steps=4,
+            allowed_tools=allowed_tools,
+            max_steps=6,
             working_memory_max_tokens=8000,
         ),
     )
