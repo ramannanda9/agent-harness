@@ -5,6 +5,7 @@ harness/tracer.py   — Tracer: records every event in the run.
 harness/guardrails.py — BudgetGuard: cost, depth, time limits.
 harness/registry.py — AgentRegistry + ToolRegistry.
 """
+
 from __future__ import annotations
 
 import json
@@ -35,9 +36,10 @@ Return JSON only:
 # Tracer
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 @dataclass
 class TraceEvent:
-    event_type: str      # thought | action | task_result | plan | replan | synthesis
+    event_type: str  # thought | action | task_result | plan | replan | synthesis
     agent_id: str
     payload: Any
     timestamp: float = field(default_factory=time.time)
@@ -51,6 +53,7 @@ class Tracer:
     Each hook must implement on_event(event_type, agent_id, payload)
     and optionally on_start_run(run_id, goal) / on_end_run().
     """
+
     def __init__(self) -> None:
         self._events: list[TraceEvent] = []
         self._hooks: list = []
@@ -79,12 +82,14 @@ class Tracer:
     def dump(self) -> list[dict]:
         result = []
         for e in self._events:
-            result.append({
-                "event_type": e.event_type,
-                "agent_id": e.agent_id,
-                "payload": e.payload,
-                "timestamp": e.timestamp,
-            })
+            result.append(
+                {
+                    "event_type": e.event_type,
+                    "agent_id": e.agent_id,
+                    "payload": e.payload,
+                    "timestamp": e.timestamp,
+                }
+            )
         return result
 
     def get_agent_trace(self, agent_id: str) -> list[dict]:
@@ -96,6 +101,7 @@ class Tracer:
 
     def print_trace(self, truncate: int = 300) -> None:
         import json
+
         for e in self._events:
             payload_str = json.dumps(e.payload, default=str)
             if len(payload_str) > truncate:
@@ -107,11 +113,12 @@ class Tracer:
 # Guardrails
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 @dataclass
 class GuardrailConfig:
     max_total_cost_usd: float = 2.0
     max_wall_time_seconds: int = 180
-    max_replan_count: int = 2          # forwarded to EvalConfig
+    max_replan_count: int = 2  # forwarded to EvalConfig
     confidence_threshold: float = 0.6  # forwarded to EvalConfig
 
 
@@ -120,6 +127,7 @@ class BudgetGuard:
     Hard budget limits enforced on every check() call.
     Call check() at the start of each ReAct step and each orchestration loop.
     """
+
     def __init__(self, config: GuardrailConfig) -> None:
         self.config = config
         self._cost: float = 0.0
@@ -152,6 +160,7 @@ class BudgetGuard:
 # Registry
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 class ToolRegistry:
     def __init__(self) -> None:
         self._tools: dict[str, Any] = {}
@@ -175,6 +184,7 @@ class ToolRegistry:
 class AgentRegistry:
     def __init__(self) -> None:
         from agents.base import AgentConfig
+
         self._configs: dict[str, AgentConfig] = {}
 
     def register(self, config: Any) -> AgentRegistry:
@@ -193,6 +203,7 @@ class AgentRegistry:
 # ══════════════════════════════════════════════════════════════════════════════
 # AgentRuntime — single entry point
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 class AgentRuntime:
     """
@@ -222,7 +233,7 @@ class AgentRuntime:
         self,
         agent_registry: AgentRegistry,
         tool_registry: ToolRegistry,
-        memory: Any,                      # MemoryManager
+        memory: Any,  # MemoryManager
         llm: Any,
         guardrail_config: GuardrailConfig | None = None,
         enable_otel: bool = False,
@@ -243,6 +254,7 @@ class AgentRuntime:
 
         if self._enable_otel:
             from harness.otel import OTELHook
+
             tracer.add_hook(OTELHook())
         guard = BudgetGuard(self._guardrail_config)
 
@@ -295,8 +307,7 @@ class AgentRuntime:
             return all_ids[0], "only one agent registered"
 
         agent_descriptions = "\n".join(
-            f"  {aid}: {self._agent_registry.get(aid).role}"
-            for aid in all_ids
+            f"  {aid}: {self._agent_registry.get(aid).role}" for aid in all_ids
         )
         response = await self._llm.complete(
             system=_ROUTER_SYSTEM.format(agent_descriptions=agent_descriptions),
@@ -311,7 +322,8 @@ class AgentRuntime:
         if agent_id not in all_ids:
             logger.warning(
                 "Router returned unknown agent_id %r — falling back to %r",
-                agent_id, all_ids[0],
+                agent_id,
+                all_ids[0],
             )
             agent_id = all_ids[0]
 
@@ -360,7 +372,6 @@ class AgentRuntime:
             ...
         """
         from agents.base import BaseAgent
-        from harness.events import EventType
 
         tracer = Tracer()
         guard = BudgetGuard(self._guardrail_config)
@@ -419,6 +430,7 @@ class AgentRuntime:
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
 
 def _parse_json_response(response: Any) -> dict:
     """Unwrap LLM adapter response (dict with 'text', raw str, or dict)."""

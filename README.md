@@ -59,7 +59,8 @@ over the same stream.
 | Script | What it shows | Requires |
 |---|---|---|
 | `examples/quickstart.py` | End-to-end against `MockLLM` + `EchoTool` — reference wiring. | nothing |
-| `examples/openai_demo.py` | Real OpenAI run + `HTTPFetch` tool, live event stream, token + cost reporting. | `OPENAI_API_KEY`, `[openai,http]` |
+| `examples/openai_demo.py` | Real OpenAI + `HTTPFetch` + `shell` (via `ah-executor`), routed single-agent run, live event stream, cost reporting. | `OPENAI_API_KEY`, `[openai,http]` |
+| `examples/executor_bridge_demo.py` | `ExecutorBridge` backends side-by-side: allowlist, env scrubbing, Docker network/fs isolation, timeout, positional-arg tools. | `ah-executor` and/or Docker |
 | `examples/durable_memory_demo.py` | Redis (semantic) + LanceDB (episodic) memory persistence across two related goals. | `OPENAI_API_KEY`, `[openai,redis,lance]`, Redis reachable |
 | `examples/mcp_demo.py` | Connects to an MCP filesystem server and gives the agent its tools. | `OPENAI_API_KEY`, `[openai,mcp]`, `npx` |
 
@@ -144,33 +145,67 @@ memory = MemoryManager(semantic_store=semantic, episodic_store=episodic, llm=llm
 Or write your own backend conforming to the `SemanticStore` / `EpisodicStore`
 protocols in `memory/manager.py`.
 
-## Streaming and blocking — same execution path
+## Execution paths
 
-Both calls drive the same orchestrator; `run()` is just `.collect()` over
-`run_stream()`.
+Three paths, same event vocabulary — pick the one that matches your task:
+
+### 1. Routed — `run_routed` / `run_routed_stream`
+
+One lightweight LLM call picks the best agent, then that agent runs its
+ReAct loop directly. No task decomposition, no synthesis step. Use this
+for single-turn goals where one agent handles everything end-to-end.
 
 ```python
 from harness.events import EventType
 
-# Blocking — returns the final result dict
-result = await runtime.run("investigate worker-07")
-
-# Streaming — yields events live; display or drain however you want
-async for event in runtime.run_stream("investigate worker-07"):
-    if event.type == EventType.TOKEN:                # only if LLM streams tokens
-        print(event.token, end="", flush=True)
+async for event in runtime.run_routed_stream("what is the current disk usage?"):
+    if event.type == EventType.ROUTE:
+        print(f"→ {event.payload['agent_id']}: {event.payload['rationale']}")
     elif event.type == EventType.ACTION:
-        print(f"\n→ {event.payload['tool']}({event.payload['args']})")
-    elif event.type == EventType.OBSERVATION:
-        print(f"  ← {event.payload['observation']}")
-    elif event.type == EventType.REPLAN:
-        print(f"\n[replan #{event.payload['replan_count']}]")
-    elif event.type == EventType.DONE:
-        print(f"\n{event.payload['answer']}")
+        print(f"  tool: {event.payload['tool']}")
+    elif event.type == EventType.TASK_DONE:
+        print(event.payload["answer"])
 ```
 
-Event types: `PLAN`, `THOUGHT`, `TOKEN`, `ACTION`, `OBSERVATION`, `TASK_DONE`,
-`REPLAN`, `SYNTHESIS`, `DONE`, `ERROR` (see `harness/events.py`).
+Fast-path: if only one agent is registered, `route()` returns it immediately
+without an LLM call.
+
+### 2. Direct — `run_agent` / `run_agent_stream`
+
+You name the agent; it runs its ReAct loop directly. Use when you already
+know which agent to call and want to skip routing entirely.
+
+```python
+result = await runtime.run_agent("researcher", "summarise this document")
+```
+
+### 3. Orchestrated — `run` / `run_stream`
+
+The planner decomposes the goal into a task DAG, assigns tasks to specialist
+agents, runs them (in parallel where dependencies allow), and synthesises a
+final answer. Use for multi-agent goals where different specialists handle
+different parts of the work.
+
+```python
+async for event in runtime.run_stream("investigate GPU spike on worker-07"):
+    if event.type == EventType.PLAN:
+        for t in event.payload["plan"]["tasks"]:
+            print(f"  {t['id']}@{t['agent_id']}: {t['instruction']}")
+    elif event.type == EventType.REPLAN:
+        print(f"[replan #{event.payload['replan_count']}]")
+    elif event.type == EventType.DONE:
+        print(event.payload["answer"])
+```
+
+Event types by path:
+
+| Event | Routed | Direct | Orchestrated |
+|---|---|---|---|
+| `ROUTE` | ✓ | — | — |
+| `THOUGHT` / `TOKEN` / `ACTION` / `OBSERVATION` | ✓ | ✓ | ✓ |
+| `TASK_DONE` | ✓ | ✓ | ✓ |
+| `PLAN` / `REPLAN` / `SYNTHESIS` / `DONE` | — | — | ✓ |
+| `ERROR` | ✓ | ✓ | ✓ |
 
 `TOKEN` events fire only when your LLM client exposes
 `async def stream_complete(system, messages) -> AsyncGenerator[str, None]`.
