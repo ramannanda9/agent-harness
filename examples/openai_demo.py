@@ -123,43 +123,29 @@ async def main() -> None:
         ),
     )
 
+    # Single-agent run: bypass the orchestrator/planner so the agent calls
+    # shell + http_fetch sequentially in one ReAct loop without decomposition.
     final: dict = {}
-    async for event in runtime.run_stream(GOAL):
-        if event.type == EventType.PLAN:
-            for t in event.payload["plan"].get("tasks", []):
-                print(f"[plan]      {t['id']}@{t['agent_id']}: {_truncate(t['instruction'])}")
-        elif event.type == EventType.THOUGHT:
+    async for event in runtime.run_agent_stream("researcher", GOAL):
+        if event.type == EventType.THOUGHT:
             thought = event.payload.get("thought", "")
             if thought:
-                print(f"[thought]   {event.agent_id}: {_truncate(thought)}")
+                print(f"[thought]   {_truncate(thought)}")
         elif event.type == EventType.ACTION:
             args = json.dumps(event.payload["args"], default=str)
-            print(f"[action]    {event.agent_id}: {event.payload['tool']}({_truncate(args)})")
+            print(f"[action]    {event.payload['tool']}({_truncate(args)})")
         elif event.type == EventType.OBSERVATION:
             obs = event.payload.get("observation", "")
-            print(f"[observe]   {event.agent_id}: {_truncate(obs)}")
+            print(f"[observe]   {_truncate(obs)}")
         elif event.type == EventType.TASK_DONE:
-            print(
-                f"[task_done] {event.agent_id} "
-                f"success={event.payload['success']} "
-                f"confidence={event.payload['confidence']}"
-            )
-        elif event.type == EventType.REPLAN:
-            print(f"[replan]    #{event.payload['replan_count']}")
-        elif event.type == EventType.SYNTHESIS:
-            print(f"[synthesis] confidence={event.payload.get('confidence')}")
-        elif event.type == EventType.DONE:
             final = event.payload
         elif event.type == EventType.ERROR:
-            print(f"[error]     {event.agent_id}: {event.error}", file=sys.stderr)
+            print(f"[error]     {event.error}", file=sys.stderr)
 
     print("─" * 60)
     print(f"Final answer:\n{final.get('answer', '(no answer)')}")
     print(f"Confidence:  {final.get('confidence')}")
-    print(f"Replans:     {final.get('replan_count')}")
-    print(f"Elapsed:     {final.get('elapsed_seconds', 0):.2f}s")
-    print(f"Cost:        ${final.get('cost_usd', 0):.6f}  "
-          f"(computed via local cost_fn; route through a gateway for authoritative cost)")
+    print(f"Steps:       {final.get('steps')}")
 
 
 if __name__ == "__main__":

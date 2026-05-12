@@ -260,6 +260,49 @@ class AgentRuntime:
         )
         return orchestrator, tracer, guard
 
+    async def run_agent_stream(self, agent_id: str, task: str):
+        """
+        Run a single named agent directly, bypassing orchestrator planning.
+
+        Use this when you know exactly which agent should handle the task and
+        don't need multi-agent decomposition. The agent runs its ReAct loop and
+        yields BusEvents (THOUGHT, TOKEN, ACTION, OBSERVATION, TASK_DONE, ERROR).
+
+        async for event in runtime.run_agent_stream("researcher", "what is 2+2?"):
+            ...
+        """
+        from agents.base import BaseAgent
+        from harness.events import EventType
+
+        tracer = Tracer()
+        guard = BudgetGuard(self._guardrail_config)
+        if hasattr(self._llm, "set_budget"):
+            self._llm.set_budget(guard)
+
+        config = self._agent_registry.get(agent_id)
+        agent = BaseAgent(
+            config=config,
+            tools=self._tool_registry.get_subset(config.allowed_tools),
+            memory=self._memory,
+            tracer=tracer,
+            guard=guard,
+            llm=self._llm,
+        )
+        async for event in agent.run_stream(task):
+            yield event
+
+    async def run_agent(self, agent_id: str, task: str) -> dict:
+        """Blocking single-agent run. Returns the TASK_DONE payload dict."""
+        from harness.events import EventType
+
+        result: dict = {}
+        async for event in self.run_agent_stream(agent_id, task):
+            if event.type == EventType.TASK_DONE:
+                result = event.payload
+            elif event.type == EventType.ERROR:
+                result = {"answer": "", "confidence": 0.0, "error": event.error}
+        return result
+
     async def run(self, goal: str) -> dict:
         from harness.events import EventType
 
