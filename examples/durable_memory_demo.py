@@ -27,6 +27,7 @@ Note: this demo writes to Redis under the key prefix `agent-harness-demo:` and
 writes a Lance table at LANCE_PATH. Both persist after the script ends —
 re-running picks up where the previous run left off, which is the point.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -65,7 +66,7 @@ def _build_episodic(lance_path: str):
     try:
         from memory.episodic_lance import LanceDBEpisodicStore, LocalEmbedder, MockEmbedder
     except ImportError as e:
-        print(f'ERROR: lancedb not installed: {e}', file=sys.stderr)
+        print(f"ERROR: lancedb not installed: {e}", file=sys.stderr)
         print('  Run: pip install -e ".[lance]"', file=sys.stderr)
         sys.exit(2)
 
@@ -100,13 +101,14 @@ async def main() -> None:
 
     redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
     lance_path = os.environ.get("LANCE_PATH", "./lance_episodic")
-    model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+    model = os.environ.get("OPENAI_MODEL", "gpt-5.4-mini")
 
     redis_client = await _check_or_die_redis(redis_url)
     episodic, embedder_kind = _build_episodic(lance_path)
     await episodic.initialize()
 
     from memory.redis_store import RedisSemanticStore
+
     semantic = RedisSemanticStore(redis_client, key_prefix="agent-harness-demo:")
 
     print(f"Redis:    {redis_url}")
@@ -117,18 +119,20 @@ async def main() -> None:
     llm = OpenAILLM(model=model)
     memory = MemoryManager(semantic_store=semantic, episodic_store=episodic, llm=llm)
 
-    agents = AgentRegistry().register(AgentConfig(
-        agent_id="explainer",
-        role="briefly explains Python standard-library modules",
-        system_prompt=(
-            "You are a concise Python expert. Answer the user's question in 2-3 sentences. "
-            "Always use the ReAct JSON format. You have no tools — answer from knowledge "
-            "and finish on the first step."
-        ),
-        allowed_tools=[],
-        max_steps=2,
-        working_memory_max_tokens=4000,
-    ))
+    agents = AgentRegistry().register(
+        AgentConfig(
+            agent_id="explainer",
+            role="briefly explains Python standard-library modules",
+            system_prompt=(
+                "You are a concise Python expert. Answer the user's question in 2-3 sentences. "
+                "Always use the ReAct JSON format. You have no tools — answer from knowledge "
+                "and finish on the first step."
+            ),
+            allowed_tools=[],
+            max_steps=2,
+            working_memory_max_tokens=4000,
+        )
+    )
 
     runtime = AgentRuntime(
         agent_registry=agents,
@@ -136,8 +140,10 @@ async def main() -> None:
         memory=memory,
         llm=llm,
         guardrail_config=GuardrailConfig(
-            max_total_cost_usd=1.0, max_wall_time_seconds=60,
-            confidence_threshold=0.5, max_replan_count=0,
+            max_total_cost_usd=1.0,
+            max_wall_time_seconds=60,
+            confidence_threshold=0.5,
+            max_replan_count=0,
         ),
     )
 
@@ -175,10 +181,14 @@ async def main() -> None:
     print(f"confidence: {result['confidence']}")
     await _dump_memory_state(semantic, episodic, query=goal2)
 
-    print("\nBoth backends are durable — re-running this script picks up these "
-          "episodes / keys from disk. Wipe with:")
-    print(f"  redis-cli --no-auth-warning -u {redis_url} KEYS 'agent-harness-demo:*' "
-          f"| xargs -r redis-cli --no-auth-warning -u {redis_url} DEL")
+    print(
+        "\nBoth backends are durable — re-running this script picks up these "
+        "episodes / keys from disk. Wipe with:"
+    )
+    print(
+        f"  redis-cli --no-auth-warning -u {redis_url} KEYS 'agent-harness-demo:*' "
+        f"| xargs -r redis-cli --no-auth-warning -u {redis_url} DEL"
+    )
     print(f"  rm -rf {lance_path}")
 
     await redis_client.aclose()

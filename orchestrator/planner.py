@@ -342,6 +342,11 @@ class Orchestrator:
                 "conflicts": synthesis.get("conflicts", []),
                 "unknowns": synthesis.get("unknowns", []),
                 "replan_count": replan_count,
+                # Budget surface — populated by adapters that report usage/cost.
+                # cost_usd may be 0.0 if no cost source is wired up (still useful
+                # to know zero was billed; tokens flow via TASK_DONE/OTEL).
+                "cost_usd": self._guard.cost,
+                "elapsed_seconds": self._guard.elapsed,
                 "task_results": [
                     {"task_id": r.task_id, "agent_id": r.agent_id,
                      "success": r.success, "confidence": r.confidence}

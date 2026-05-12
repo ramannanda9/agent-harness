@@ -45,7 +45,22 @@ async def main() -> None:
     model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
     print(f"Model: {model}\nGoal:  {GOAL}\n" + "─" * 60)
 
-    llm = OpenAILLM(model=model)
+    # Demo cost_fn — these are gpt-4o-mini per-token rates as of mid-2026.
+    # Users would point at a gateway via base_url=... in production for
+    # gateway-reported authoritative cost; this is the no-gateway fallback.
+    PRICING_PER_TOKEN = {
+        "gpt-4o-mini": (0.15e-6, 0.60e-6),   # (input, output) USD / token
+    }
+
+    def cost_fn(usage: dict) -> float:
+        # match dated variants by prefix: "gpt-4o-mini-2024-07-18" → "gpt-4o-mini"
+        served = usage.get("model", "")
+        for prefix, (in_rate, out_rate) in PRICING_PER_TOKEN.items():
+            if served.startswith(prefix):
+                return usage["tokens_in"] * in_rate + usage["tokens_out"] * out_rate
+        return 0.0
+
+    llm = OpenAILLM(model=model, cost_fn=cost_fn)
 
     tools = ToolRegistry().register(HTTPFetch())
 
@@ -118,6 +133,9 @@ async def main() -> None:
     print(f"Final answer:\n{final.get('answer', '(no answer)')}")
     print(f"Confidence:  {final.get('confidence')}")
     print(f"Replans:     {final.get('replan_count')}")
+    print(f"Elapsed:     {final.get('elapsed_seconds', 0):.2f}s")
+    print(f"Cost:        ${final.get('cost_usd', 0):.6f}  "
+          f"(computed via local cost_fn; route through a gateway for authoritative cost)")
 
 
 if __name__ == "__main__":

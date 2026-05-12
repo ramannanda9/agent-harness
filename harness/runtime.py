@@ -226,6 +226,12 @@ class AgentRuntime:
             tracer.add_hook(OTELHook())
         guard = BudgetGuard(self._guardrail_config)
 
+        # Adapters that implement set_budget(guard) (e.g. OpenAILLM) get the
+        # fresh per-run guard so they can call add_cost() on every completion.
+        # Duck-typed so users can plug in any LLM client that doesn't.
+        if hasattr(self._llm, "set_budget"):
+            self._llm.set_budget(guard)
+
         # state lives in memory, not agents — instantiate fresh per run
         agents = {
             agent_id: BaseAgent(
