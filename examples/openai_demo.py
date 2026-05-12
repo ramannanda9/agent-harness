@@ -123,11 +123,13 @@ async def main() -> None:
         ),
     )
 
-    # Single-agent run: bypass the orchestrator/planner so the agent calls
-    # shell + http_fetch sequentially in one ReAct loop without decomposition.
+    # Routed run: router picks the best agent in one LLM call, then the agent
+    # runs its ReAct loop directly — no task decomposition, no synthesis step.
     final: dict = {}
-    async for event in runtime.run_agent_stream("researcher", GOAL):
-        if event.type == EventType.THOUGHT:
+    async for event in runtime.run_routed_stream(GOAL):
+        if event.type == EventType.ROUTE:
+            print(f"[route]     → {event.payload['agent_id']}: {event.payload['rationale']}")
+        elif event.type == EventType.THOUGHT:
             thought = event.payload.get("thought", "")
             if thought:
                 print(f"[thought]   {_truncate(thought)}")

@@ -7,9 +7,29 @@ harness/registry.py — AgentRegistry + ToolRegistry.
 """
 from __future__ import annotations
 
+import json
+import logging
 import time
 from dataclasses import dataclass, field
 from typing import Any
+
+logger = logging.getLogger(__name__)
+
+# ── Router prompt ─────────────────────────────────────────────────────────────
+# Deliberately minimal — one cheap LLM call, no decomposition.
+
+_ROUTER_SYSTEM = """
+You are a routing agent. Select the single best agent to handle the goal.
+
+Available agents:
+{agent_descriptions}
+
+Return JSON only:
+{{
+  "agent_id": "<agent_id from the list above>",
+  "rationale": "<one sentence explaining why>"
+}}
+"""
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Tracer
@@ -260,6 +280,74 @@ class AgentRuntime:
         )
         return orchestrator, tracer, guard
 
+    async def route(self, goal: str) -> tuple[str, str]:
+        """
+        Pick the best agent for a goal without decomposing into subtasks.
+
+        Fast-path: if only one agent is registered, return it immediately
+        without an LLM call.
+
+        Returns (agent_id, rationale).
+        """
+        all_ids = self._agent_registry.all_ids()
+
+        if len(all_ids) == 1:
+            return all_ids[0], "only one agent registered"
+
+        agent_descriptions = "\n".join(
+            f"  {aid}: {self._agent_registry.get(aid).role}"
+            for aid in all_ids
+        )
+        response = await self._llm.complete(
+            system=_ROUTER_SYSTEM.format(agent_descriptions=agent_descriptions),
+            messages=[{"role": "user", "content": f"Goal: {goal}"}],
+            response_format={"type": "json_object"},
+        )
+
+        data = _parse_json_response(response)
+        agent_id = data.get("agent_id", "")
+        rationale = data.get("rationale", "")
+
+        if agent_id not in all_ids:
+            logger.warning(
+                "Router returned unknown agent_id %r — falling back to %r",
+                agent_id, all_ids[0],
+            )
+            agent_id = all_ids[0]
+
+        return agent_id, rationale
+
+    async def run_routed_stream(self, goal: str):
+        """
+        Route to the best agent then run its ReAct loop directly.
+        Yields a ROUTE event first, then all agent events.
+        Use this instead of run_stream when you have a single-turn goal
+        that one agent can handle end-to-end — no task decomposition.
+        """
+        from harness.events import BusEvent, EventType
+
+        agent_id, rationale = await self.route(goal)
+        logger.info("Router → %s (%s)", agent_id, rationale)
+        yield BusEvent(
+            type=EventType.ROUTE,
+            agent_id=agent_id,
+            payload={"agent_id": agent_id, "rationale": rationale},
+        )
+        async for event in self.run_agent_stream(agent_id, goal):
+            yield event
+
+    async def run_routed(self, goal: str) -> dict:
+        """Blocking routed run. Returns the TASK_DONE payload dict."""
+        from harness.events import EventType
+
+        result: dict = {}
+        async for event in self.run_routed_stream(goal):
+            if event.type == EventType.TASK_DONE:
+                result = event.payload
+            elif event.type == EventType.ERROR:
+                result = {"answer": "", "confidence": 0.0, "error": event.error}
+        return result
+
     async def run_agent_stream(self, agent_id: str, task: str):
         """
         Run a single named agent directly, bypassing orchestrator planning.
@@ -328,3 +416,16 @@ class AgentRuntime:
         orchestrator, _tracer, _guard = self._build_orchestrator()
         async for event in orchestrator.run_stream(goal):
             yield event
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _parse_json_response(response: Any) -> dict:
+    """Unwrap LLM adapter response (dict with 'text', raw str, or dict)."""
+    if isinstance(response, dict) and "text" in response:
+        return json.loads(response["text"])
+    if isinstance(response, str):
+        return json.loads(response)
+    if isinstance(response, dict):
+        return response
+    return {}
