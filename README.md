@@ -10,10 +10,12 @@ Config-driven — register tools and agents, run any goal. No subclassing.
 ```bash
 pip install -e ".[dev]"                   # core + tests + lint
 pip install -e ".[lance,redis,dev]"       # also install LanceDB + Redis stores
+pip install -e ".[mcp]"                   # MCP tool adapter
+pip install -e ".[otel]"                  # OpenTelemetry tracing
 ```
 
 The core package has no runtime dependencies. The `lance`, `redis`,
-`anthropic`, and `openai` extras pull in heavier libs only if you opt in.
+`anthropic`, `openai`, `mcp`, and `otel` extras pull in heavier libs only if you opt in.
 
 ## Quickstart
 
@@ -29,6 +31,7 @@ Swap `MockLLM` for an Anthropic or OpenAI client to run against a real model.
 ```
 harness/runtime.py          AgentRuntime — single entry point, wire once run anything
 harness/events.py           BusEvent + EventType — canonical event vocabulary
+harness/otel.py             OTELHook — OpenTelemetry span exporter (opt-in)
 harness/sandbox.py          Sandbox + SandboxedTool — Rust-executor adapter
 orchestrator/planner.py     Hybrid DAG orchestrator — plan, replan, synthesize
 agents/base.py              Generic BaseAgent — ReAct loop, no subclassing needed
@@ -37,6 +40,8 @@ memory/working.py           WorkingMemory — LLM summarization eviction
 memory/episodic_lance.py    LanceDB episodic store — IVF_PQ ANN, batch writes
 memory/redis_store.py       Redis semantic store — durable KV with TTL
 memory/stores.py            InMemory stores — local dev default, no deps
+tools/builtin/http_fetch.py HTTPFetch — minimal read-only GET tool
+tools/mcp/adapter.py        MCP tool adapter — connect any MCP server
 ```
 
 Execution is **streaming-primary**: every run flows through `run_stream()`,
@@ -180,3 +185,89 @@ tools.register(SandboxedTool(
 ```bash
 pytest
 ```
+
+## MCP Tools
+
+Connect any [MCP](https://modelcontextprotocol.io)-compatible server and its
+tools become available to agents — no wrapper code needed.
+
+```bash
+pip install -e ".[mcp]"
+```
+
+```python
+from mcp import StdioServerParameters
+from tools.mcp import MCPServerConnection
+
+params = StdioServerParameters(
+    command="npx",
+    args=["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+)
+
+async with MCPServerConnection(params, server_name="filesystem") as conn:
+    conn.register_tools(tool_registry)          # bulk-register all discovered tools
+    agents.register(AgentConfig(
+        agent_id="explorer",
+        role="explores the filesystem",
+        system_prompt="...",
+        allowed_tools=conn.tool_names,           # auto-populated from MCP server
+    ))
+    result = await runtime.run("list files in /tmp")
+```
+
+Supports **stdio** and **SSE** transports. The `MCPServerConnection` context
+manager handles the full lifecycle — connect, discover, and cleanup.
+
+See `examples/mcp_demo.py` for a runnable example.
+
+## OpenTelemetry Tracing
+
+Visualize agent runs in Jaeger, Datadog, or any OTEL-compatible backend.
+
+```bash
+pip install -e ".[otel]"
+```
+
+One flag enables tracing:
+
+```python
+runtime = AgentRuntime(
+    agent_registry=agents,
+    tool_registry=tools,
+    memory=memory,
+    llm=llm,
+    enable_otel=True,           # ← that's it
+)
+```
+
+Span hierarchy:
+
+```
+[run]  goal="Fetch httpbin.org/json..."
+  ├── [plan]         task_count=2
+  ├── [task]         agent=researcher, task_id=t1
+  │     ├── thought  "I need to fetch..."
+  │     ├── action   tool=http_fetch
+  │     └── thought  "Got the response..."
+  ├── [task]         agent=researcher, task_id=t2
+  │     └── thought  "Extracting title..."
+  └── [synthesis]    confidence=0.95
+```
+
+Local Jaeger setup:
+
+```bash
+# Start Jaeger (OTLP on :4318, UI on :16686)
+docker run -d --name jaeger \
+  -p 16686:16686 -p 4318:4318 \
+  jaegertracing/all-in-one:latest
+
+# Run your agent
+OPENAI_API_KEY=sk-... python examples/openai_demo.py
+
+# View traces at http://localhost:16686
+```
+
+The OTEL hook is a side-channel on the existing `Tracer` — the in-memory trace
+is always available via `result["trace"]` regardless of whether OTEL is enabled.
+Zero overhead and zero imports when `enable_otel=False`.

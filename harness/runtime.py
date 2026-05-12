@@ -26,13 +26,35 @@ class TraceEvent:
 class Tracer:
     """
     Records every event during a run.
-    In production: emit to OTEL collector, LangSmith, or Arize.
+
+    Hooks: attach side-channel exporters (e.g. OTEL) via add_hook().
+    Each hook must implement on_event(event_type, agent_id, payload)
+    and optionally on_start_run(run_id, goal) / on_end_run().
     """
     def __init__(self) -> None:
         self._events: list[TraceEvent] = []
+        self._hooks: list = []
+
+    def add_hook(self, hook) -> None:
+        """Attach an exporter hook (e.g. OTELHook)."""
+        self._hooks.append(hook)
 
     def log(self, event_type: str, agent_id: str, payload: Any) -> None:
         self._events.append(TraceEvent(event_type, agent_id, payload))
+        for hook in self._hooks:
+            hook.on_event(event_type, agent_id, payload)
+
+    def start_run(self, run_id: str, goal: str) -> None:
+        """Signal run start to hooks (e.g. for OTEL root span)."""
+        for hook in self._hooks:
+            if hasattr(hook, "on_start_run"):
+                hook.on_start_run(run_id, goal)
+
+    def end_run(self) -> None:
+        """Signal run end to hooks (e.g. to close OTEL root span)."""
+        for hook in self._hooks:
+            if hasattr(hook, "on_end_run"):
+                hook.on_end_run()
 
     def dump(self) -> list[dict]:
         result = []
@@ -183,12 +205,14 @@ class AgentRuntime:
         memory: Any,                      # MemoryManager
         llm: Any,
         guardrail_config: GuardrailConfig | None = None,
+        enable_otel: bool = False,
     ) -> None:
         self._agent_registry = agent_registry
         self._tool_registry = tool_registry
         self._memory = memory
         self._llm = llm
         self._guardrail_config = guardrail_config or GuardrailConfig()
+        self._enable_otel = enable_otel
 
     def _build_orchestrator(self):
         """Construct fresh tracer, guard, agents, and orchestrator for one run."""
@@ -196,6 +220,10 @@ class AgentRuntime:
         from orchestrator.planner import EvalConfig, Orchestrator
 
         tracer = Tracer()
+
+        if self._enable_otel:
+            from harness.otel import OTELHook
+            tracer.add_hook(OTELHook())
         guard = BudgetGuard(self._guardrail_config)
 
         # state lives in memory, not agents — instantiate fresh per run

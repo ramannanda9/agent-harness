@@ -200,6 +200,7 @@ class Orchestrator:
 
     async def run_stream(self, goal: str) -> AsyncGenerator[BusEvent, None]:
         logger.info("Orchestrator run_id=%s goal=%r", self._run_id, goal[:80])
+        self._tracer.start_run(self._run_id, goal)
 
         # ── 1. Plan ────────────────────────────────────────────────────────────
         plan = await self._plan(goal)
@@ -230,7 +231,7 @@ class Orchestrator:
                 break
 
             batch_results: dict[str, TaskResult] = {}
-            async for event in self._run_batch(ready, batch_results):
+            async for event in self._run_batch(ready, batch_results, completed):
                 yield event
 
             for t in ready:
@@ -330,6 +331,7 @@ class Orchestrator:
         )
 
         # ── 5. Final DONE ──────────────────────────────────────────────────────
+        self._tracer.end_run()
         yield BusEvent(
             type=EventType.DONE, agent_id="orchestrator",
             payload={
@@ -421,11 +423,15 @@ class Orchestrator:
         self,
         ready: list[Task],
         results_out: dict[str, TaskResult],
+        completed_results: dict[str, TaskResult] | None = None,
     ) -> AsyncGenerator[BusEvent, None]:
         """
         Run a batch of ready tasks in parallel, forwarding each agent's events
         upstream. When all tasks finish, results_out is populated with one
         TaskResult per task id.
+
+        completed_results is used to inject upstream dependency outputs into
+        each task's instruction so the agent has the context it needs.
         """
         bus: asyncio.Queue = asyncio.Queue()
         DRIVER_DONE = object()
@@ -441,11 +447,30 @@ class Orchestrator:
                 await bus.put((task, DRIVER_DONE))
                 return
 
+            # Inject upstream dependency results into the instruction
+            instruction = task.instruction
+            if completed_results and task.depends_on:
+                dep_parts = []
+                for dep_id in task.depends_on:
+                    dep_result = completed_results.get(dep_id)
+                    if dep_result is not None and dep_result.answer:
+                        dep_parts.append(
+                            f"[Result from task {dep_id} "
+                            f"(agent: {dep_result.agent_id})]:\n"
+                            f"{dep_result.answer}"
+                        )
+                if dep_parts:
+                    instruction = (
+                        f"{task.instruction}\n\n"
+                        f"--- Context from completed upstream tasks ---\n"
+                        + "\n\n".join(dep_parts)
+                    )
+
             last_done: dict | None = None
             last_error: str | None = None
             try:
                 async for event in agent.run_stream(
-                    task=task.instruction, run_id=self._run_id,
+                    task=instruction, run_id=self._run_id,
                 ):
                     if event.type == EventType.TASK_DONE:
                         last_done = event.payload
@@ -519,6 +544,9 @@ class Orchestrator:
                 }],
                 response_format={"type": "json_object"},
             )
+            # Unwrap: LLM adapters may return {"text": "<json>"} or a raw str.
+            if isinstance(response, dict) and "text" in response:
+                return json.loads(response["text"])
             if isinstance(response, str):
                 return json.loads(response)
             return response
