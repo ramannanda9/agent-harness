@@ -1,6 +1,8 @@
 """Shared fixtures: scriptable mock LLM and basic tool."""
+
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from typing import Any
 
@@ -25,24 +27,18 @@ class ScriptedLLM:
         self.calls: list[dict] = []
         self.routes = routes or {}
 
-    async def complete(
-        self, system: str | None, messages: list[dict], **kwargs: Any
-    ) -> Any:
+    async def complete(self, system: str | None, messages: list[dict], **kwargs: Any) -> Any:
         self.calls.append({"system": system, "messages": messages, "kwargs": kwargs})
         # BaseAgent._think calls with system=None and puts the agent system prompt
         # in the messages list. Fall back to the first system-role message so routes
         # can match agent ReAct prompts as well as orchestrator/memory prompts.
-        routing_text = system or next(
-            (m["content"] for m in messages if m["role"] == "system"), ""
-        )
+        routing_text = system or next((m["content"] for m in messages if m["role"] == "system"), "")
         routing_text = routing_text.lower()
         for needle, handler in self.routes.items():
             if needle.lower() in routing_text:
                 return handler(system, messages, kwargs)
         # default: agent ReAct — finish on first step
-        last_user = next(
-            (m["content"] for m in reversed(messages) if m["role"] == "user"), ""
-        )
+        last_user = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
         return {
             "thought": "default finish",
             "action": "finish",
@@ -63,6 +59,25 @@ class FailingTool:
 
     async def execute(self, **_: Any) -> Any:
         raise RuntimeError("boom")
+
+
+class SlowTool:
+    """Records start/end times to verify concurrent execution."""
+
+    name = "slow"
+
+    def __init__(self, delay: float = 0.05) -> None:
+        self.delay = delay
+        self.starts: list[float] = []
+        self.ends: list[float] = []
+
+    async def execute(self, label: str = "") -> dict:
+        import time
+
+        self.starts.append(time.monotonic())
+        await asyncio.sleep(self.delay)
+        self.ends.append(time.monotonic())
+        return {"label": label}
 
 
 @pytest.fixture
