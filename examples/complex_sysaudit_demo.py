@@ -67,9 +67,8 @@ version drift between pyproject.toml and PyPI, uncommitted changes, high
 memory pressure, or files changed recently."""
 
 FOLLOWUP_GOAL = (
-    "Based on the project audit you just completed, give me a prioritised action list: "
-    "what needs attention first and why? Focus on version drift, uncommitted changes, "
-    "and any memory or process concerns."
+    "Synthesise the recent project audit findings into a prioritised action list. "
+    "No new data collection needed — reason from what is already known."
 )
 
 
@@ -187,6 +186,20 @@ async def main() -> None:
                     ),
                     allowed_tools=["http_fetch"],
                     max_steps=4,
+                )
+            )
+            .register(
+                AgentConfig(
+                    agent_id="analyst_agent",
+                    role="synthesises findings and prioritises actions from memory — no tool calls needed",
+                    system_prompt=(
+                        "You are a technical analyst. You have no tools. "
+                        "Reason over the facts and past experience already in your context "
+                        "and produce a clear, prioritised answer. "
+                        "Use the ReAct JSON format — finish in one step."
+                    ),
+                    allowed_tools=[],
+                    max_steps=2,
                 )
             )
         )
