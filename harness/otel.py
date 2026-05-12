@@ -32,6 +32,7 @@ Configuration (standard OTEL env vars):
     OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318   (default)
     OTEL_SERVICE_NAME=agent-harness                      (default)
 """
+
 from __future__ import annotations
 
 import json
@@ -66,8 +67,7 @@ class OTELHook:
             )
         except ImportError as e:
             raise ImportError(
-                "opentelemetry packages not installed. "
-                "Run: pip install -e \".[otel]\""
+                'opentelemetry packages not installed. Run: pip install -e ".[otel]"'
             ) from e
 
         resource = Resource.create({"service.name": service_name})
@@ -89,7 +89,7 @@ class OTELHook:
         # Span state
         self._root_span: Any = None
         self._root_ctx: Any = None
-        self._task_spans: dict[str, Any] = {}   # agent_id → active span
+        self._task_spans: dict[str, Any] = {}  # agent_id → active span
         self._task_counter: dict[str, int] = {}  # agent_id → count
 
     @staticmethod
@@ -99,6 +99,7 @@ class OTELHook:
             from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
                 OTLPSpanExporter,
             )
+
             kwargs: dict[str, Any] = {}
             if endpoint:
                 kwargs["endpoint"] = endpoint
@@ -228,9 +229,30 @@ class OTELHook:
 
         if not success:
             from opentelemetry.trace import StatusCode
+
             span.set_status(StatusCode.ERROR, "task failed")
 
         span.end()
+
+    def _on_dispatch(self, agent_id: str, payload: Any) -> None:
+        if self._root_span:
+            self._root_span.add_event(
+                "dispatch",
+                attributes={
+                    "complexity": str(payload.get("complexity", "")),
+                    "path": str(payload.get("path", "")),
+                },
+            )
+
+    def _on_route(self, agent_id: str, payload: Any) -> None:
+        if self._root_span:
+            self._root_span.add_event(
+                "route",
+                attributes={
+                    "agent_id": str(payload.get("agent_id", "")),
+                    "rationale": str(payload.get("rationale", ""))[:500],
+                },
+            )
 
     def _on_replan(self, agent_id: str, payload: Any) -> None:
         if self._root_span:
@@ -257,6 +279,8 @@ class OTELHook:
 
     # Handler dispatch table
     _handlers: dict[str, Any] = {
+        "dispatch": _on_dispatch,
+        "route": _on_route,
         "plan": _on_plan,
         "thought": _on_thought,
         "action": _on_action,
@@ -267,6 +291,7 @@ class OTELHook:
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
 
 def _safe_json(obj: Any, max_len: int = 500) -> str:
     """JSON-encode, truncate, and never raise."""
