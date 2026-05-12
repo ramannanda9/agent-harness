@@ -7,6 +7,10 @@ instead of iterating events live.
 
 Event lifecycle within a single goal:
 
+  Dispatch path (dispatch / dispatch_stream)  ← recommended default entry point:
+    DISPATCH              — classifier chose a path; payload has complexity + path
+    then either routed or orchestrated path below
+
   Routed path (run_routed / run_routed_stream):
     ROUTE                 — router picked an agent; payload has agent_id + rationale
     THOUGHT / TOKEN / ACTION / OBSERVATION / TASK_DONE  (single ReAct loop)
@@ -25,6 +29,7 @@ Event lifecycle within a single goal:
     DONE                  — orchestrator finished; payload is the final result dict
     ERROR                 — terminal failure (replaces DONE if it fires)
 """
+
 from __future__ import annotations
 
 import time
@@ -34,24 +39,25 @@ from typing import Any
 
 
 class EventType(str, Enum):
-    ROUTE       = "route"
-    PLAN        = "plan"
-    THOUGHT     = "thought"
-    TOKEN       = "token"
-    ACTION      = "action"
+    DISPATCH = "dispatch"
+    ROUTE = "route"
+    PLAN = "plan"
+    THOUGHT = "thought"
+    TOKEN = "token"
+    ACTION = "action"
     OBSERVATION = "observation"
-    TASK_DONE   = "task_done"
-    REPLAN      = "replan"
-    SYNTHESIS   = "synthesis"
-    DONE        = "done"
-    ERROR       = "error"
+    TASK_DONE = "task_done"
+    REPLAN = "replan"
+    SYNTHESIS = "synthesis"
+    DONE = "done"
+    ERROR = "error"
 
 
 @dataclass
 class BusEvent:
     type: EventType
-    agent_id: str = ""                            # empty for orchestrator-level events
+    agent_id: str = ""  # empty for orchestrator-level events
     payload: dict[str, Any] = field(default_factory=dict)
-    token: str = ""                               # set on TOKEN events
-    error: str = ""                               # set on ERROR events
+    token: str = ""  # set on TOKEN events
+    error: str = ""  # set on ERROR events
     timestamp: float = field(default_factory=time.time)

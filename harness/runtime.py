@@ -32,6 +32,33 @@ Return JSON only:
 }}
 """
 
+# ── Complexity classifier prompt ───────────────────────────────────────────────
+# One cheap LLM call. Decides whether the goal needs sub-task decomposition.
+
+_CLASSIFIER_SYSTEM = """
+You are a task complexity classifier.
+
+Available agents:
+{agent_descriptions}
+
+Classify the goal as "simple" or "complex":
+
+  simple  — one agent can handle the goal end-to-end in a single focused run.
+            It may call multiple tools, but the steps are naturally sequential
+            and don't benefit from splitting into separate subtasks.
+
+  complex — the goal benefits from decomposition: either it needs multiple
+            specialist agents working in parallel, or it has distinct phases
+            where later steps depend on the structured output of earlier ones
+            (e.g. discover → analyse → report).
+
+Return JSON only:
+{{
+  "complexity": "simple" | "complex",
+  "rationale": "<one sentence>"
+}}
+"""
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Tracer
 # ══════════════════════════════════════════════════════════════════════════════
@@ -291,6 +318,70 @@ class AgentRuntime:
             ),
         )
         return orchestrator, tracer, guard
+
+    async def _classify(self, goal: str) -> str:
+        """
+        Classify goal complexity with one cheap LLM call.
+        Returns "simple" or "complex".
+        Fast-path: single agent registered → always "simple" (nothing to decompose across).
+        """
+        if len(self._agent_registry.all_ids()) == 1:
+            return "simple"
+
+        agent_descriptions = "\n".join(
+            f"  {aid}: {self._agent_registry.get(aid).role}"
+            for aid in self._agent_registry.all_ids()
+        )
+        response = await self._llm.complete(
+            system=_CLASSIFIER_SYSTEM.format(agent_descriptions=agent_descriptions),
+            messages=[{"role": "user", "content": f"Goal: {goal}"}],
+            response_format={"type": "json_object"},
+        )
+        data = _parse_json_response(response)
+        complexity = data.get("complexity", "simple")
+        rationale = data.get("rationale", "")
+        logger.info("Classifier → %s (%s)", complexity, rationale)
+        return complexity if complexity in ("simple", "complex") else "simple"
+
+    async def dispatch_stream(self, goal: str):
+        """
+        Single entry point for any goal. Classifies complexity then delegates:
+          simple  → run_routed_stream (router picks agent, one ReAct loop)
+          complex → run_stream        (planner decomposes into sub-tasks)
+
+        Emits a DISPATCH event first so callers can see which path was chosen.
+        """
+        from harness.events import BusEvent, EventType
+
+        complexity = await self._classify(goal)
+        yield BusEvent(
+            type=EventType.DISPATCH,
+            agent_id="orchestrator",
+            payload={
+                "complexity": complexity,
+                "path": "routed" if complexity == "simple" else "orchestrated",
+            },
+        )
+
+        if complexity == "simple":
+            async for event in self.run_routed_stream(goal):
+                yield event
+        else:
+            async for event in self.run_stream(goal):
+                yield event
+
+    async def dispatch(self, goal: str) -> dict:
+        """Blocking dispatch. Returns TASK_DONE payload for simple goals,
+        DONE payload for complex (orchestrated) goals."""
+        from harness.events import EventType
+
+        result: dict = {}
+        async for event in self.dispatch_stream(goal):
+            if event.type in (EventType.TASK_DONE, EventType.DONE):
+                result = event.payload
+            elif event.type == EventType.ERROR:
+                result = {"answer": "", "confidence": 0.0, "error": event.error}
+        return result
 
     async def route(self, goal: str) -> tuple[str, str]:
         """

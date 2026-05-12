@@ -19,6 +19,7 @@ Streams live to stdout: plan → action → observation → synthesis.
 Install ah-executor to enable the shell tool (optional):
     cargo install --path executor
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -41,8 +42,8 @@ GOAL = (
     "What OS and kernel version is this machine running, and what UUID does "
     "https://httpbin.org/uuid return right now? Use shell for the OS check and "
     "http_fetch for the UUID."
-    if _EXECUTOR else
-    "Fetch https://httpbin.org/json and report the slideshow title and author "
+    if _EXECUTOR
+    else "Fetch https://httpbin.org/json and report the slideshow title and author "
     "from the JSON response."
 )
 
@@ -63,7 +64,7 @@ async def main() -> None:
     # Users would point at a gateway via base_url=... in production for
     # gateway-reported authoritative cost; this is the no-gateway fallback.
     PRICING_PER_TOKEN = {
-        "gpt-4o-mini": (0.15e-6, 0.60e-6),   # (input, output) USD / token
+        "gpt-4o-mini": (0.15e-6, 0.60e-6),  # (input, output) USD / token
     }
 
     def cost_fn(usage: dict) -> float:
@@ -85,7 +86,9 @@ async def main() -> None:
         allowed_tools.append("shell")
         print(f"ah-executor: {_EXECUTOR} (shell tool enabled)")
     else:
-        print("ah-executor: not found — shell tool disabled (cargo install --path executor to enable)")
+        print(
+            "ah-executor: not found — shell tool disabled (cargo install --path executor to enable)"
+        )
 
     agents = AgentRegistry().register(
         AgentConfig(
@@ -123,11 +126,15 @@ async def main() -> None:
         ),
     )
 
-    # Routed run: router picks the best agent in one LLM call, then the agent
-    # runs its ReAct loop directly — no task decomposition, no synthesis step.
+    # dispatch_stream: classifier decides simple→routed or complex→orchestrated.
+    # User only provides a goal — routing and planning happen automatically.
     final: dict = {}
-    async for event in runtime.run_routed_stream(GOAL):
-        if event.type == EventType.ROUTE:
+    async for event in runtime.dispatch_stream(GOAL):
+        if event.type == EventType.DISPATCH:
+            print(
+                f"[dispatch]  complexity={event.payload['complexity']} path={event.payload['path']}"
+            )
+        elif event.type == EventType.ROUTE:
             print(f"[route]     → {event.payload['agent_id']}: {event.payload['rationale']}")
         elif event.type == EventType.THOUGHT:
             thought = event.payload.get("thought", "")
