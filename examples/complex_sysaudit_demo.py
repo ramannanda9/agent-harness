@@ -42,9 +42,14 @@ from tools.builtin.http_fetch import HTTPFetch
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.5")
+MODEL = os.environ.get("OPENAI_MODEL", "gpt-4.5-mini")
 PROJECT_DIR = Path(os.environ.get("PROJECT_DIR", Path(__file__).parent.parent)).resolve()
 PYPI_PACKAGE = os.environ.get("PYPI_PACKAGE", "agent-harness")
+
+# Persistent store config — set these to enable durable memory across runs.
+# Without them the demo falls back to in-memory stores (lost on exit).
+REDIS_URL = os.environ.get("REDIS_URL")  # e.g. redis://localhost:6379
+LANCE_PATH = os.environ.get("LANCE_PATH")  # e.g. ./lance_episodic
 
 AUDIT_GOAL = f"""Audit this project and machine. Investigate all three areas in parallel:
 
@@ -83,6 +88,52 @@ def _trunc(s: str, n: int = 140) -> str:
     return s if len(s) <= n else s[:n] + "…"
 
 
+async def _build_stores(llm):
+    """
+    Build semantic + episodic stores.
+
+    Tries Redis (REDIS_URL) and LanceDB (LANCE_PATH) for durable memory.
+    Falls back to in-memory stores when env vars are not set or deps missing.
+    Returns (semantic_store, episodic_store, description_string).
+    """
+    semantic_store = None
+    episodic_store = None
+    labels = []
+
+    if REDIS_URL:
+        try:
+            import redis.asyncio as redis
+
+            from memory.redis_store import RedisSemanticStore
+
+            client = redis.from_url(REDIS_URL, decode_responses=True)
+            await client.ping()
+            semantic_store = RedisSemanticStore(client, key_prefix="sysaudit:")
+            labels.append(f"semantic=redis ({REDIS_URL})")
+        except Exception as e:
+            print(f"[memory]     Redis unavailable ({e}) — falling back to in-memory")
+
+    if LANCE_PATH:
+        try:
+            from memory.episodic_lance import LanceDBEpisodicStore, LocalEmbedder
+
+            store = LanceDBEpisodicStore(uri=LANCE_PATH, embedder=LocalEmbedder())
+            await store.initialize()
+            episodic_store = store
+            labels.append(f"episodic=lancedb ({LANCE_PATH})")
+        except Exception as e:
+            print(f"[memory]     LanceDB unavailable ({e}) — falling back to in-memory")
+
+    if semantic_store is None:
+        semantic_store = InMemorySemanticStore()
+        labels.append("semantic=in-memory")
+    if episodic_store is None:
+        episodic_store = InMemoryEpisodicStore()
+        labels.append("episodic=in-memory")
+
+    return semantic_store, episodic_store, "  ".join(labels)
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 
@@ -112,12 +163,14 @@ async def main() -> None:
         sys.exit(2)
 
     enable_otel = bool(os.environ.get("OTEL_ENABLED"))
+    semantic_store, episodic_store, store_label = await _build_stores(None)
 
     print(_sep("═"))
     print(f"Model:      {MODEL}")
     print(f"Project:    {PROJECT_DIR}")
     print(f"PyPI pkg:   {PYPI_PACKAGE}")
     print(f"OTEL:       {'enabled' if enable_otel else 'disabled'}")
+    print(f"Memory:     {store_label}")
     print(_sep("═"))
 
     llm = OpenAILLM(model=MODEL)
@@ -204,8 +257,6 @@ async def main() -> None:
             )
         )
 
-        semantic_store = InMemorySemanticStore()
-        episodic_store = InMemoryEpisodicStore()
         memory = MemoryManager(
             semantic_store=semantic_store,
             episodic_store=episodic_store,
@@ -317,9 +368,10 @@ async def main() -> None:
         for k, v in global_facts.items():
             print(f"  {k}: {_trunc(str(v), 100)}")
 
-        episodes = episodic_store._episodes
-        print(f"\nEpisodic summaries ({len(episodes)}):")
-        for ep in episodes:
+        # Episodic search works across both in-memory and LanceDB stores.
+        recent_episodes = await episodic_store.search(AUDIT_GOAL, top_k=5)
+        print(f"\nEpisodic summaries ({len(recent_episodes)}):")
+        for ep in recent_episodes:
             ts = ep.get("metadata", {}).get("timestamp", "?")
             print(f"  [{ts}]")
             print(f"  {_trunc(ep['text'], 200)}")
