@@ -38,10 +38,9 @@ from tools.builtin.http_fetch import HTTPFetch
 _EXECUTOR = find_executor()
 
 GOAL = (
-    "Do two things and report both: "
-    "(1) Use the shell tool to get the OS name and kernel version. "
-    "(2) Fetch https://httpbin.org/uuid and extract the UUID. "
-    "Present both results clearly."
+    "What OS and kernel version is this machine running, and what UUID does "
+    "https://httpbin.org/uuid return right now? Use shell for the OS check and "
+    "http_fetch for the UUID."
     if _EXECUTOR else
     "Fetch https://httpbin.org/json and report the slideshow title and author "
     "from the JSON response."

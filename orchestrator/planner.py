@@ -103,6 +103,8 @@ Return a JSON plan with this exact shape:
 
 Rules:
 - Use only agent_ids from the available agents list
+- Prefer the minimum number of tasks — use a single task if one agent can handle the entire goal
+- Only split into multiple tasks when different agents are needed OR when true parallelism provides clear value
 - Parallelize tasks that don't depend on each other
 - on_failure options: retry | skip | replan | abort
 - depends_on: list of task ids that must complete before this task starts
