@@ -17,6 +17,7 @@ WorkingMemory:
 Anthropic users can wrap their `count_tokens` API call similarly; just
 be aware that remote calls in the eviction hot path add latency.
 """
+
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -36,6 +37,7 @@ def count_tokens(text: str) -> int:
 
 
 # ── LLM Protocol — injected, not imported ─────────────────────────────────────
+
 
 class LLMClient(Protocol):
     async def complete(
@@ -59,10 +61,10 @@ Output ONLY the summary paragraph — no preamble, no labels.
 
 @dataclass
 class Message:
-    role: str         # system | user | assistant
+    role: str  # system | user | assistant
     content: str
-    token_count: int = 0   # set by WorkingMemory.append using its configured counter
-    pinned: bool = False   # pinned messages are never evicted (e.g. system prompt)
+    token_count: int = 0  # set by WorkingMemory.append using its configured counter
+    pinned: bool = False  # pinned messages are never evicted (e.g. system prompt)
 
 
 class WorkingMemory:
@@ -74,16 +76,19 @@ class WorkingMemory:
         messages are passed to the LLM for summarization, replaced by a
         single compressed message, and the originals are dropped.
 
-        Summarization fires at most once per append() to avoid recursive
-        compression. If the summarized result still exceeds budget, a hard
-        FIFO drop is applied as a safety valve.
+        The summary role is set to the opposite of the first non-pinned
+        message that follows it, preserving the alternating user/assistant
+        invariant the ReAct format requires.
+
+        Up to two summarization passes fire per append() before falling back
+        to a hard FIFO drop as a last resort.
     """
 
     def __init__(
         self,
         llm: LLMClient,
         max_tokens: int = 8000,
-        summarize_ratio: float = 0.5,   # summarize oldest 50% when evicting
+        summarize_ratio: float = 0.5,  # summarize oldest 50% when evicting
         token_counter: Callable[[str], int] | None = None,
     ) -> None:
         self._llm = llm
@@ -98,7 +103,10 @@ class WorkingMemory:
 
     async def append(self, role: str, content: str, pinned: bool = False) -> None:
         msg = Message(
-            role=role, content=content, pinned=pinned, token_count=self._count(content),
+            role=role,
+            content=content,
+            pinned=pinned,
+            token_count=self._count(content),
         )
         self._messages.append(msg)
         self._token_total += msg.token_count
@@ -122,7 +130,7 @@ class WorkingMemory:
 
     # ── Eviction ──────────────────────────────────────────────────────────────
 
-    async def _evict(self) -> None:
+    async def _evict(self, _depth: int = 0) -> None:
         evictable = [m for m in self._messages if not m.pinned]
         if not evictable:
             return  # all messages pinned — hard budget violation, accept it
@@ -132,24 +140,36 @@ class WorkingMemory:
         to_summarize = evictable[:cutoff]
 
         summary_text = await self._summarize(to_summarize)
-        summary_content = f"[Memory summary]: {summary_text}"
+        summary_content = f"[Memory compressed]: {summary_text}"
+
+        # Use the opposite role of the first non-pinned message that follows the
+        # summarized block, so the ReAct alternating user/assistant invariant holds.
+        summarized_ids = set(id(m) for m in to_summarize)
+        remaining = [m for m in self._messages if id(m) not in summarized_ids]
+        first_after = next((m for m in remaining if not m.pinned), None)
+        summary_role = "assistant" if (first_after and first_after.role == "user") else "user"
+
         summary_msg = Message(
-            role="user", content=summary_content, token_count=self._count(summary_content),
+            role=summary_role,
+            content=summary_content,
+            token_count=self._count(summary_content),
         )
 
         # remove summarized messages, insert summary in their place
-        summarized_set = set(id(m) for m in to_summarize)
-        insert_idx = next(
-            i for i, m in enumerate(self._messages) if id(m) in summarized_set
-        )
-        self._messages = [m for m in self._messages if id(m) not in summarized_set]
+        insert_idx = next(i for i, m in enumerate(self._messages) if id(m) in summarized_ids)
+        self._messages = [m for m in self._messages if id(m) not in summarized_ids]
         self._messages.insert(insert_idx, summary_msg)
 
         # recompute token total
         self._token_total = sum(m.token_count for m in self._messages)
         self._summarization_count += 1
 
-        # safety valve: if still over budget, hard FIFO drop non-pinned
+        # Second-pass summarization before resorting to hard drops (max 2 passes).
+        if self._token_total > self.max_tokens and _depth < 1:
+            await self._evict(_depth=_depth + 1)
+            return
+
+        # safety valve: if still over budget after both passes, hard FIFO drop
         while self._token_total > self.max_tokens:
             for i, m in enumerate(self._messages):
                 if not m.pinned:
@@ -160,9 +180,7 @@ class WorkingMemory:
                 break  # nothing left to drop
 
     async def _summarize(self, messages: list[Message]) -> str:
-        formatted = "\n".join(
-            f"[{m.role.upper()}]: {m.content}" for m in messages
-        )
+        formatted = "\n".join(f"[{m.role.upper()}]: {m.content}" for m in messages)
         try:
             result = await self._llm.complete(
                 system=SUMMARIZE_SYSTEM,
