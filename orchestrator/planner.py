@@ -24,6 +24,7 @@ Public API:
   - run_stream(goal)  — canonical. AsyncGenerator[BusEvent, None]. Live events.
   - run(goal)         — thin drain that returns the final result dict.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -36,17 +37,19 @@ from enum import Enum
 from typing import Any
 
 from harness.events import BusEvent, EventType
+from harness.utils import parse_llm_json
 
 logger = logging.getLogger(__name__)
 
 
 # ── Data Structures ───────────────────────────────────────────────────────────
 
+
 class OnFailure(str, Enum):
-    RETRY   = "retry"    # retry the task once
-    SKIP    = "skip"     # skip and continue
-    REPLAN  = "replan"   # trigger replanning
-    ABORT   = "abort"    # abort entire run
+    RETRY = "retry"  # retry the task once
+    SKIP = "skip"  # skip and continue
+    REPLAN = "replan"  # trigger replanning
+    ABORT = "abort"  # abort entire run
 
 
 @dataclass
@@ -65,7 +68,7 @@ class TaskResult:
     task_id: str
     agent_id: str
     answer: str
-    confidence: float        # 0.0 – 1.0
+    confidence: float  # 0.0 – 1.0
     steps: int
     success: bool
     error: str | None = None
@@ -152,10 +155,11 @@ Return JSON only.
 
 # ── Evaluator ─────────────────────────────────────────────────────────────────
 
+
 @dataclass
 class EvalConfig:
-    confidence_threshold: float = 0.6    # below this → replan trigger
-    max_replan_count: int = 2            # hard limit on replanning iterations
+    confidence_threshold: float = 0.6  # below this → replan trigger
+    max_replan_count: int = 2  # hard limit on replanning iterations
 
 
 def should_replan(result: TaskResult, config: EvalConfig) -> bool:
@@ -164,6 +168,7 @@ def should_replan(result: TaskResult, config: EvalConfig) -> bool:
 
 
 # ── Orchestrator ──────────────────────────────────────────────────────────────
+
 
 class Orchestrator:
     """
@@ -183,10 +188,10 @@ class Orchestrator:
 
     def __init__(
         self,
-        agents: dict[str, Any],      # agent_id → BaseAgent
-        memory,                       # MemoryManager
-        tracer,                       # Tracer
-        guard,                        # BudgetGuard
+        agents: dict[str, Any],  # agent_id → BaseAgent
+        memory,  # MemoryManager
+        tracer,  # Tracer
+        guard,  # BudgetGuard
         llm,
         eval_config: EvalConfig | None = None,
     ) -> None:
@@ -209,7 +214,8 @@ class Orchestrator:
         plan_dict = _plan_to_dict(plan)
         self._tracer.log("plan", "orchestrator", {"plan": plan_dict})
         yield BusEvent(
-            type=EventType.PLAN, agent_id="orchestrator",
+            type=EventType.PLAN,
+            agent_id="orchestrator",
             payload={"plan": plan_dict},
         )
 
@@ -221,10 +227,7 @@ class Orchestrator:
 
         while pending and not aborted:
             self._guard.check()
-            ready = [
-                t for t in pending
-                if all(dep in completed for dep in t.depends_on)
-            ]
+            ready = [t for t in pending if all(dep in completed for dep in t.depends_on)]
             if not ready:
                 logger.warning(
                     "Dependency deadlock — remaining tasks: %s",
@@ -248,9 +251,13 @@ class Orchestrator:
                     continue
 
                 self._tracer.log(
-                    "task_result", task.agent_id,
-                    {"task_id": task.id, "success": result.success,
-                     "confidence": result.confidence},
+                    "task_result",
+                    task.agent_id,
+                    {
+                        "task_id": task.id,
+                        "success": result.success,
+                        "confidence": result.confidence,
+                    },
                 )
                 yield BusEvent(
                     type=EventType.TASK_DONE,
@@ -294,13 +301,18 @@ class Orchestrator:
                 )
                 pending = list(new_plan.tasks)
                 replan_count += 1
-                self._tracer.log("replan", "orchestrator", {
-                    "replan_count": replan_count,
-                    "trigger_task": task.id,
-                    "new_task_count": len(pending),
-                })
+                self._tracer.log(
+                    "replan",
+                    "orchestrator",
+                    {
+                        "replan_count": replan_count,
+                        "trigger_task": task.id,
+                        "new_task_count": len(pending),
+                    },
+                )
                 yield BusEvent(
-                    type=EventType.REPLAN, agent_id="orchestrator",
+                    type=EventType.REPLAN,
+                    agent_id="orchestrator",
                     payload={
                         "replan_count": replan_count,
                         "trigger_task": task.id,
@@ -314,7 +326,9 @@ class Orchestrator:
         synthesis = await self._synthesize(goal, all_results)
         self._tracer.log("synthesis", "orchestrator", synthesis)
         yield BusEvent(
-            type=EventType.SYNTHESIS, agent_id="orchestrator", payload=synthesis,
+            type=EventType.SYNTHESIS,
+            agent_id="orchestrator",
+            payload=synthesis,
         )
 
         # ── 4. Run-end memory write ────────────────────────────────────────────
@@ -335,7 +349,8 @@ class Orchestrator:
         # ── 5. Final DONE ──────────────────────────────────────────────────────
         self._tracer.end_run()
         yield BusEvent(
-            type=EventType.DONE, agent_id="orchestrator",
+            type=EventType.DONE,
+            agent_id="orchestrator",
             payload={
                 "run_id": self._run_id,
                 "goal": goal,
@@ -350,8 +365,12 @@ class Orchestrator:
                 "cost_usd": self._guard.cost,
                 "elapsed_seconds": self._guard.elapsed,
                 "task_results": [
-                    {"task_id": r.task_id, "agent_id": r.agent_id,
-                     "success": r.success, "confidence": r.confidence}
+                    {
+                        "task_id": r.task_id,
+                        "agent_id": r.agent_id,
+                        "success": r.success,
+                        "confidence": r.confidence,
+                    }
                     for r in all_results
                 ],
             },
@@ -446,11 +465,20 @@ class Orchestrator:
         async def drive(task: Task) -> None:
             agent = self._agents.get(task.agent_id)
             if agent is None:
-                await bus.put((task, TaskResult(
-                    task_id=task.id, agent_id=task.agent_id, answer="",
-                    confidence=0.0, steps=0, success=False,
-                    error=f"Agent '{task.agent_id}' not found in registry",
-                )))
+                await bus.put(
+                    (
+                        task,
+                        TaskResult(
+                            task_id=task.id,
+                            agent_id=task.agent_id,
+                            answer="",
+                            confidence=0.0,
+                            steps=0,
+                            success=False,
+                            error=f"Agent '{task.agent_id}' not found in registry",
+                        ),
+                    )
+                )
                 await bus.put((task, DRIVER_DONE))
                 return
 
@@ -469,15 +497,15 @@ class Orchestrator:
                 if dep_parts:
                     instruction = (
                         f"{task.instruction}\n\n"
-                        f"--- Context from completed upstream tasks ---\n"
-                        + "\n\n".join(dep_parts)
+                        f"--- Context from completed upstream tasks ---\n" + "\n\n".join(dep_parts)
                     )
 
             last_done: dict | None = None
             last_error: str | None = None
             try:
                 async for event in agent.run_stream(
-                    task=instruction, run_id=self._run_id,
+                    task=instruction,
+                    run_id=self._run_id,
                 ):
                     if event.type == EventType.TASK_DONE:
                         last_done = event.payload
@@ -486,13 +514,17 @@ class Orchestrator:
                     await bus.put((task, event))
             except Exception as e:
                 logger.error(
-                    "Task %s agent %s crashed: %s", task.id, task.agent_id, e,
+                    "Task %s agent %s crashed: %s",
+                    task.id,
+                    task.agent_id,
+                    e,
                 )
                 last_error = str(e)
 
             if last_done is not None:
                 result = TaskResult(
-                    task_id=task.id, agent_id=task.agent_id,
+                    task_id=task.id,
+                    agent_id=task.agent_id,
                     answer=last_done.get("answer", ""),
                     confidence=last_done.get("confidence", 1.0),
                     steps=last_done.get("steps", 0),
@@ -501,8 +533,12 @@ class Orchestrator:
                 )
             else:
                 result = TaskResult(
-                    task_id=task.id, agent_id=task.agent_id, answer="",
-                    confidence=0.0, steps=0, success=False,
+                    task_id=task.id,
+                    agent_id=task.agent_id,
+                    answer="",
+                    confidence=0.0,
+                    steps=0,
+                    success=False,
                     error=last_error or "agent stream ended without TASK_DONE",
                 )
             await bus.put((task, result))
@@ -545,18 +581,15 @@ class Orchestrator:
         try:
             response = await self._llm.complete(
                 system=SYNTHESIZE_SYSTEM,
-                messages=[{
-                    "role": "user",
-                    "content": f"Goal: {goal}\n\nAgent results:\n{results_text}",
-                }],
+                messages=[
+                    {
+                        "role": "user",
+                        "content": f"Goal: {goal}\n\nAgent results:\n{results_text}",
+                    }
+                ],
                 response_format={"type": "json_object"},
             )
-            # Unwrap: LLM adapters may return {"text": "<json>"} or a raw str.
-            if isinstance(response, dict) and "text" in response:
-                return json.loads(response["text"])
-            if isinstance(response, str):
-                return json.loads(response)
-            return response
+            return parse_llm_json(response)
         except Exception as e:
             logger.error("Synthesis failed: %s", e)
             return {
@@ -569,13 +602,9 @@ class Orchestrator:
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+
 def _parse_plan(response: Any) -> Plan:
-    if isinstance(response, str):
-        data = json.loads(response)
-    elif isinstance(response, dict) and "text" in response:
-        data = json.loads(response["text"])
-    else:
-        data = response
+    data = parse_llm_json(response)
 
     tasks = [
         Task(

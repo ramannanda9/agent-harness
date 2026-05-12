@@ -22,6 +22,7 @@ Memory conflict resolution (two agents write same key):
   → last-write-wins by default
   → conflict logged in trace for post-hoc analysis
 """
+
 from __future__ import annotations
 
 import json
@@ -30,10 +31,13 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Protocol, runtime_checkable
 
+from harness.utils import parse_llm_json
+
 logger = logging.getLogger(__name__)
 
 
 # ── Store Protocols ───────────────────────────────────────────────────────────
+
 
 @runtime_checkable
 class SemanticStore(Protocol):
@@ -45,12 +49,13 @@ class SemanticStore(Protocol):
 
 @runtime_checkable
 class EpisodicStore(Protocol):
-    async def write(self, text: str, metadata: dict) -> str: ...   # returns episode_id
+    async def write(self, text: str, metadata: dict) -> str: ...  # returns episode_id
     async def search(self, query: str, top_k: int = 3) -> list[dict]: ...
     async def get(self, episode_id: str) -> dict | None: ...
 
 
 # ── Data contracts ────────────────────────────────────────────────────────────
+
 
 @dataclass
 class MemoryWriteRequest:
@@ -58,15 +63,17 @@ class MemoryWriteRequest:
     Structured output from LLM extraction at run end.
     All fields must be concrete — no vague observations.
     """
-    semantic_facts: dict[str, Any]   # deterministic KV for global semantic store
-    episodic_summary: str            # natural language paragraph for vector store
+
+    semantic_facts: dict[str, Any]  # deterministic KV for global semantic store
+    episodic_summary: str  # natural language paragraph for vector store
     metadata: dict = field(default_factory=dict)
-    ttl_seconds: int | None = None   # None = no expiry
+    ttl_seconds: int | None = None  # None = no expiry
 
 
 @dataclass
 class MemoryContext:
     """Injected into agent system prompt at run start."""
+
     semantic_facts: dict[str, Any]
     episodes: list[dict]
 
@@ -133,6 +140,7 @@ Return JSON only. No preamble, no markdown fences.
 
 # ── Memory Manager ────────────────────────────────────────────────────────────
 
+
 class MemoryManager:
     """
     Unified interface over semantic (Redis KV) and episodic (vector) stores.
@@ -150,7 +158,7 @@ class MemoryManager:
         semantic_store: SemanticStore,
         episodic_store: EpisodicStore,
         llm,
-        working_facts_ttl: int = 3600,     # agent working facts expire in 1 hour
+        working_facts_ttl: int = 3600,  # agent working facts expire in 1 hour
         context_max_episodes: int = 3,
         context_max_semantic_keys: int = 20,
     ) -> None:
@@ -180,21 +188,24 @@ class MemoryManager:
         existing = await self._semantic.read(namespaced_key)
 
         if existing is not None and existing != value:
-            self._conflict_log.append({
-                "key": namespaced_key,
-                "old": existing,
-                "new": value,
-                "agent_id": agent_id,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            })
+            self._conflict_log.append(
+                {
+                    "key": namespaced_key,
+                    "old": existing,
+                    "new": value,
+                    "agent_id": agent_id,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+            )
             logger.debug(
                 "Memory conflict on key=%s agent=%s old=%r new=%r",
-                namespaced_key, agent_id, existing, value,
+                namespaced_key,
+                agent_id,
+                existing,
+                value,
             )
 
-        await self._semantic.write(
-            namespaced_key, value, ttl_seconds=self._working_facts_ttl
-        )
+        await self._semantic.write(namespaced_key, value, ttl_seconds=self._working_facts_ttl)
 
     async def read_working_facts(self, run_id: str) -> dict[str, Any]:
         """Read all working facts written during this run (across all agents)."""
@@ -223,7 +234,8 @@ class MemoryManager:
 
         logger.info(
             "Run-end memory write complete: %d semantic facts, episode_id=%s",
-            len(extracted.semantic_facts), episode_id,
+            len(extracted.semantic_facts),
+            episode_id,
         )
         return extracted
 
@@ -244,13 +256,7 @@ class MemoryManager:
                 messages=[{"role": "user", "content": prompt}],
                 response_format={"type": "json_object"},
             )
-            # normalize response — handle raw dict or string
-            if isinstance(response, str):
-                data = json.loads(response)
-            elif isinstance(response, dict) and "text" in response:
-                data = json.loads(response["text"])
-            else:
-                data = response
+            data = parse_llm_json(response)
 
             return MemoryWriteRequest(
                 semantic_facts=data.get("semantic_facts", {}),
@@ -270,11 +276,15 @@ class MemoryManager:
         for key, value in req.semantic_facts.items():
             existing = await self._semantic.read(key)
             if existing is not None and existing != value:
-                self._conflict_log.append({
-                    "key": key, "old": existing, "new": value,
-                    "scope": "global",
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                })
+                self._conflict_log.append(
+                    {
+                        "key": key,
+                        "old": existing,
+                        "new": value,
+                        "scope": "global",
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    }
+                )
             await self._semantic.write(key, value, ttl_seconds=req.ttl_seconds)
 
     async def _write_episodic(
@@ -284,9 +294,9 @@ class MemoryManager:
             "goal": goal,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "agent_ids": [r.get("agent_id") for r in agent_results],
-            "outcome": "success" if any(
-                r.get("confidence", 0) > 0.5 for r in agent_results
-            ) else "uncertain",
+            "outcome": "success"
+            if any(r.get("confidence", 0) > 0.5 for r in agent_results)
+            else "uncertain",
             **req.metadata,
         }
         return await self._episodic.write(
@@ -314,9 +324,7 @@ class MemoryManager:
         if agent_id:
             all_facts = await self._semantic.search_prefix(f"agent:{agent_id}:")
             # take most recent N keys
-            semantic_facts = dict(
-                list(all_facts.items())[:self._context_max_semantic_keys]
-            )
+            semantic_facts = dict(list(all_facts.items())[: self._context_max_semantic_keys])
 
         return MemoryContext(
             semantic_facts=semantic_facts,
