@@ -37,7 +37,7 @@ harness/runtime.py          AgentRuntime — single entry point, wire once run a
 harness/events.py           BusEvent + EventType — canonical event vocabulary
 harness/llm/openai.py       OpenAILLM — OpenAI adapter with usage + cost tracking
 harness/otel.py             OTELHook — OpenTelemetry span exporter (opt-in)
-harness/sandbox.py          Sandbox + SandboxedTool — Rust-executor adapter
+harness/executor_bridge.py  ExecutorBridge + ExecutorTool — controlled subprocess launcher with optional Docker sandboxing
 orchestrator/planner.py     Hybrid DAG orchestrator — plan, replan, synthesize
 agents/base.py              Generic BaseAgent — ReAct loop, no subclassing needed
 memory/manager.py           MemoryManager — semantic KV + episodic vector
@@ -241,45 +241,67 @@ Cost ceiling fires on the *next* `check()` (start of next ReAct step or
 orchestrator batch), not synchronously mid-call — accept this for 0.0.1, the
 guard's job is preventing runaway loops, not bounding individual calls.
 
-## Sandboxed tools
+## Tool execution
 
 Tools that shell out (`kubectl`, `curl`, `sh -c …`) should not run inside the
-agent process. The Rust executor at `executor/` is a one-shot subprocess
-sandbox that the Python `Sandbox` client invokes per tool call.
+agent process. `ExecutorBridge` provides a controlled subprocess launcher with
+two backends.
 
-What the sandbox enforces:
+### What every backend enforces
 
 - **Tool allowlist** — set at startup; the LLM cannot extend it.
 - **Wall-clock timeout** per call.
 - **Output size cap** (default 1 MiB, configurable).
-- **Subprocess isolation** — a tool crash cannot reach the agent.
-- **Scrubbed environment** — only `PATH` is forwarded; everything else dropped.
 
-What it does **not** do — for syscall / fs / network isolation, deploy the
-harness inside a container or VM:
+### `backend="none"` (default) — Rust executor
 
-- No seccomp / landlock filters.
-- No fs or network namespacing.
-- No rlimit-based CPU / memory caps.
-
-Build and wire up:
+Routes each call through the compiled Rust binary at `executor/`. Adds
+process-level isolation (a tool crash cannot reach the agent) and a scrubbed
+environment (only `PATH` is forwarded). Does **not** provide syscall filtering,
+filesystem namespacing, or network isolation.
 
 ```bash
 cd executor && cargo build --release
-# binary at executor/target/release/executor
 ```
 
 ```python
-from harness.sandbox import Sandbox, SandboxConfig, SandboxedTool
+from harness.executor_bridge import ExecutorBridge, ExecutorConfig, ExecutorTool
 
-sandbox = Sandbox(SandboxConfig(
+bridge = ExecutorBridge(ExecutorConfig(
     binary_path="executor/target/release/executor",
     allowed_tools=("kubectl", "curl"),   # "shell" is opt-in only
 ))
 
-tools.register(SandboxedTool(
-    name="kubectl", executor_tool="kubectl", sandbox=sandbox, arg_key="args",
+kubectl_tool = ExecutorTool("kubectl", "kubectl", bridge, arg_key="args")
+```
+
+### `backend="docker"` — real OS-level isolation
+
+Each tool call runs in a fresh Docker container. Provides network isolation,
+read-only filesystem, and memory/CPU limits. The Rust binary is not used in
+this mode. Requires Docker daemon on the host.
+
+```python
+from harness.executor_bridge import ExecutorBridge, ExecutorConfig, ExecutorTool
+
+bridge = ExecutorBridge(ExecutorConfig(
+    allowed_tools=("kubectl",),
+    backend="docker",
+    docker_image="bitnami/kubectl:latest",
+    docker_network="none",      # no outbound network
+    docker_memory="256m",
+    docker_cpus="1.0",
+    docker_read_only=True,
 ))
+
+kubectl_tool = ExecutorTool("kubectl", "kubectl", bridge, arg_key="args")
+```
+
+The `shell` tool (dict-style args) works with both backends:
+
+```python
+shell_tool = ExecutorTool("shell", "shell", bridge)
+# LLM calls: {"action": "shell", "args": {"cmd": "jq '.name' data.json"}}
 ```
 
 ## Tests
