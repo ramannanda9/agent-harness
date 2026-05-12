@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from harness.events import BusEvent, EventType
+from harness.utils import fire
 from memory.manager import MemoryManager
 from memory.working import WorkingMemory
 
@@ -294,11 +295,13 @@ class BaseAgent:
                     )
                     combined.append({"tool": tool_name, "result": obs})
                     if obs and not isinstance(obs, str):
-                        await self._memory.write_working_fact(
-                            run_id=run_id,
-                            agent_id=self.config.agent_id,
-                            key=f"step_{step}_{i}_{tool_name}",
-                            value=obs,
+                        fire(
+                            self._memory.write_working_fact(
+                                run_id=run_id,
+                                agent_id=self.config.agent_id,
+                                key=f"step_{step}_{i}_{tool_name}",
+                                value=obs,
+                            )
                         )
 
                 await self._working_memory.append("assistant", json.dumps(response))
@@ -339,11 +342,13 @@ class BaseAgent:
                 )
 
                 if observation and not isinstance(observation, str):
-                    await self._memory.write_working_fact(
-                        run_id=run_id,
-                        agent_id=self.config.agent_id,
-                        key=f"step_{step}_{tool_name}",
-                        value=observation,
+                    fire(
+                        self._memory.write_working_fact(
+                            run_id=run_id,
+                            agent_id=self.config.agent_id,
+                            key=f"step_{step}_{tool_name}",
+                            value=observation,
+                        )
                     )
 
                 obs_text = (

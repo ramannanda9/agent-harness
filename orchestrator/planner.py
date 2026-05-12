@@ -37,7 +37,7 @@ from enum import Enum
 from typing import Any
 
 from harness.events import BusEvent, EventType
-from harness.utils import parse_llm_json
+from harness.utils import fire, parse_llm_json
 
 logger = logging.getLogger(__name__)
 
@@ -213,10 +213,11 @@ class Orchestrator:
         plan = await self._plan(goal)
         plan_dict = _plan_to_dict(plan)
         self._tracer.log("plan", "orchestrator", {"plan": plan_dict})
-        await self._memory.write_semantic_fact("orchestrator:last_plan_rationale", plan.rationale)
-        await self._memory.write_semantic_fact(
-            "orchestrator:last_plan_agents",
-            [t.agent_id for t in plan.tasks],
+        fire(self._memory.write_semantic_fact("orchestrator:last_plan_rationale", plan.rationale))
+        fire(
+            self._memory.write_semantic_fact(
+                "orchestrator:last_plan_agents", [t.agent_id for t in plan.tasks]
+            )
         )
         yield BusEvent(
             type=EventType.PLAN,
@@ -315,13 +316,20 @@ class Orchestrator:
                         "new_task_count": len(pending),
                     },
                 )
-                await self._memory.write_semantic_fact(
-                    "orchestrator:last_replan_trigger",
-                    {"task_id": task.id, "error": result.error, "confidence": result.confidence},
+                fire(
+                    self._memory.write_semantic_fact(
+                        "orchestrator:last_replan_trigger",
+                        {
+                            "task_id": task.id,
+                            "error": result.error,
+                            "confidence": result.confidence,
+                        },
+                    )
                 )
-                await self._memory.write_semantic_fact(
-                    "orchestrator:last_replan_agents",
-                    [t.agent_id for t in new_plan.tasks],
+                fire(
+                    self._memory.write_semantic_fact(
+                        "orchestrator:last_replan_agents", [t.agent_id for t in new_plan.tasks]
+                    )
                 )
                 yield BusEvent(
                     type=EventType.REPLAN,
