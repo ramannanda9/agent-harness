@@ -42,7 +42,7 @@ from tools.builtin.http_fetch import HTTPFetch
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-MODEL = os.environ.get("OPENAI_MODEL", "gpt-4.5-mini")
+MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.4-mini")
 PROJECT_DIR = Path(os.environ.get("PROJECT_DIR", Path(__file__).parent.parent)).resolve()
 PYPI_PACKAGE = os.environ.get("PYPI_PACKAGE", "agent-harness")
 
@@ -200,7 +200,22 @@ async def main() -> None:
             "Use the ReAct JSON format — never reply in plain prose."
         )
 
-        agents = (
+        _analyst_config = AgentConfig(
+            agent_id="analyst_agent",
+            role="synthesises findings and prioritises actions from memory — no tool calls needed",
+            system_prompt=(
+                "You are a technical analyst. You have no tools. "
+                "Reason over the facts and past experience already in your context "
+                "and produce a clear, prioritised answer. "
+                "Use the ReAct JSON format — finish in one step."
+            ),
+            allowed_tools=[],
+            max_steps=2,
+        )
+
+        # Pass 1 registry: data-collection agents only — analyst_agent is hidden
+        # so the planner cannot assign it a synthesis task before memory exists.
+        audit_agents = (
             AgentRegistry()
             .register(
                 AgentConfig(
@@ -241,21 +256,10 @@ async def main() -> None:
                     max_steps=4,
                 )
             )
-            .register(
-                AgentConfig(
-                    agent_id="analyst_agent",
-                    role="synthesises findings and prioritises actions from memory — no tool calls needed",
-                    system_prompt=(
-                        "You are a technical analyst. You have no tools. "
-                        "Reason over the facts and past experience already in your context "
-                        "and produce a clear, prioritised answer. "
-                        "Use the ReAct JSON format — finish in one step."
-                    ),
-                    allowed_tools=[],
-                    max_steps=2,
-                )
-            )
         )
+
+        # Pass 2 registry: analyst_agent only — routes directly, no planner needed.
+        followup_agents = AgentRegistry().register(_analyst_config)
 
         memory = MemoryManager(
             semantic_store=semantic_store,
@@ -263,19 +267,23 @@ async def main() -> None:
             llm=llm,
         )
 
-        runtime = AgentRuntime(
-            agent_registry=agents,
-            tool_registry=tools,
-            memory=memory,
-            llm=llm,
-            guardrail_config=GuardrailConfig(
-                max_total_cost_usd=5.0,
-                max_wall_time_seconds=300,
-                max_replan_count=1,
-                confidence_threshold=0.5,
-            ),
-            enable_otel=enable_otel,
-        )
+        def _make_runtime(registry: AgentRegistry) -> AgentRuntime:
+            return AgentRuntime(
+                agent_registry=registry,
+                tool_registry=tools,
+                memory=memory,
+                llm=llm,
+                guardrail_config=GuardrailConfig(
+                    max_total_cost_usd=5.0,
+                    max_wall_time_seconds=300,
+                    max_replan_count=1,
+                    confidence_threshold=0.5,
+                ),
+                enable_otel=enable_otel,
+            )
+
+        audit_runtime = _make_runtime(audit_agents)
+        followup_runtime = _make_runtime(followup_agents)
 
         # ── Pass 1: Full audit ────────────────────────────────────────────────
 
@@ -284,7 +292,7 @@ async def main() -> None:
 
         task_results: list[dict] = []
 
-        async for event in runtime.dispatch_stream(AUDIT_GOAL):
+        async for event in audit_runtime.dispatch_stream(AUDIT_GOAL):
             if event.type == EventType.DISPATCH:
                 print(
                     f"\n[dispatch]   complexity={event.payload['complexity']}"
@@ -385,7 +393,7 @@ async def main() -> None:
         print(f"PASS 2 — follow-up (memory recall)\nGoal: {FOLLOWUP_GOAL}")
         print(_sep("═"))
 
-        async for event in runtime.dispatch_stream(FOLLOWUP_GOAL):
+        async for event in followup_runtime.dispatch_stream(FOLLOWUP_GOAL):
             if event.type == EventType.DISPATCH:
                 print(
                     f"\n[dispatch]   complexity={event.payload['complexity']}"
