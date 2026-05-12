@@ -213,6 +213,11 @@ class Orchestrator:
         plan = await self._plan(goal)
         plan_dict = _plan_to_dict(plan)
         self._tracer.log("plan", "orchestrator", {"plan": plan_dict})
+        await self._memory.write_semantic_fact("orchestrator:last_plan_rationale", plan.rationale)
+        await self._memory.write_semantic_fact(
+            "orchestrator:last_plan_agents",
+            [t.agent_id for t in plan.tasks],
+        )
         yield BusEvent(
             type=EventType.PLAN,
             agent_id="orchestrator",
@@ -309,6 +314,14 @@ class Orchestrator:
                         "trigger_task": task.id,
                         "new_task_count": len(pending),
                     },
+                )
+                await self._memory.write_semantic_fact(
+                    "orchestrator:last_replan_trigger",
+                    {"task_id": task.id, "error": result.error, "confidence": result.confidence},
+                )
+                await self._memory.write_semantic_fact(
+                    "orchestrator:last_replan_agents",
+                    [t.agent_id for t in new_plan.tasks],
                 )
                 yield BusEvent(
                     type=EventType.REPLAN,

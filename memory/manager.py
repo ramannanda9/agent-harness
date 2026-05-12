@@ -272,6 +272,26 @@ class MemoryManager:
                 episodic_summary=f"Run completed for goal: {goal}. Extraction failed: {e}",
             )
 
+    async def write_semantic_fact(
+        self,
+        key: str,
+        value: Any,
+        ttl_seconds: int | None = None,
+    ) -> None:
+        """Write a single global semantic fact — persists across runs, no run/agent prefix."""
+        existing = await self._semantic.read(key)
+        if existing is not None and existing != value:
+            self._conflict_log.append(
+                {
+                    "key": key,
+                    "old": existing,
+                    "new": value,
+                    "scope": "global",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+        await self._semantic.write(key, value, ttl_seconds=ttl_seconds)
+
     async def _write_semantic_global(self, req: MemoryWriteRequest) -> None:
         for key, value in req.semantic_facts.items():
             existing = await self._semantic.read(key)
