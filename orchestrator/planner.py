@@ -393,6 +393,11 @@ class Orchestrator:
             for aid, agent in self._agents.items()
         )
         prompt = f"Goal: {goal}"
+
+        mem_context = await self._memory.build_context(goal)
+        if not mem_context.is_empty():
+            prompt += f"\n\nRelevant context from memory:\n{mem_context.render()}"
+
         if context:
             prompt += f"\n\nAdditional context:\n{context}"
 
@@ -414,6 +419,11 @@ class Orchestrator:
             f"  {aid}: {getattr(agent, 'role', 'no description')}"
             for aid, agent in self._agents.items()
         )
+        replan_prompt = f"Replan for goal: {goal}"
+        mem_context = await self._memory.build_context(goal)
+        if not mem_context.is_empty():
+            replan_prompt += f"\n\nRelevant context from memory:\n{mem_context.render()}"
+
         response = await self._llm.complete(
             system=REPLAN_SYSTEM.format(
                 agent_descriptions=agent_descriptions,
@@ -438,7 +448,7 @@ class Orchestrator:
                     indent=2,
                 ),
             ),
-            messages=[{"role": "user", "content": f"Replan for goal: {goal}"}],
+            messages=[{"role": "user", "content": replan_prompt}],
             response_format={"type": "json_object"},
         )
         return _parse_plan(response)
