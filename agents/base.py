@@ -387,6 +387,13 @@ class BaseAgent:
                         token=token,
                     )
                 response = _parse_action_json(accumulated)
+                if response is None:
+                    logger.warning(
+                        "Agent %s stream got unparseable response: %r",
+                        self.config.agent_id,
+                        accumulated[:300],
+                    )
+                    self._last_think_error = f"Unparseable stream response: {accumulated[:300]}"
             else:
                 raw = await self._llm.complete(
                     system=None,
@@ -394,12 +401,20 @@ class BaseAgent:
                     response_format={"type": "json_object"},
                 )
                 response = _normalize_response(raw)
+                if response is None:
+                    logger.warning(
+                        "Agent %s got unparseable response: %r",
+                        self.config.agent_id,
+                        raw,
+                    )
+                    self._last_think_error = f"Unparseable response: {str(raw)[:300]}"
         except Exception as e:
             logger.error("Agent %s think failed: %s", self.config.agent_id, e)
             response = None
             self._last_think_error = str(e)
         else:
-            self._last_think_error = None
+            if response is not None:
+                self._last_think_error = None
 
         yield BusEvent(
             type=EventType.THOUGHT,
