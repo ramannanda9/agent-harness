@@ -640,8 +640,8 @@ def _parse_plan(response: Any) -> Plan:
     tasks = [
         Task(
             id=t.get("id", f"t{i}"),
-            agent_id=t.get("agent_id", ""),
-            instruction=t.get("instruction", ""),
+            agent_id=t["agent_id"],
+            instruction=t["instruction"],
             depends_on=t.get("depends_on", []),
             on_failure=OnFailure(t.get("on_failure", "replan")),
         )
