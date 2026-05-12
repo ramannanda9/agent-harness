@@ -639,13 +639,14 @@ def _parse_plan(response: Any) -> Plan:
 
     tasks = [
         Task(
-            id=t["id"],
-            agent_id=t["agent_id"],
-            instruction=t["instruction"],
+            id=t.get("id", f"t{i}"),
+            agent_id=t.get("agent_id", ""),
+            instruction=t.get("instruction", ""),
             depends_on=t.get("depends_on", []),
             on_failure=OnFailure(t.get("on_failure", "replan")),
         )
-        for t in data.get("tasks", [])
+        for i, t in enumerate(data.get("tasks", []))
+        if t.get("agent_id") and t.get("instruction")
     ]
     return Plan(tasks=tasks, rationale=data.get("rationale", ""))
 

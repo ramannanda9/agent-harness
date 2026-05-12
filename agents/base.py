@@ -473,25 +473,28 @@ def _normalize_response(response: Any) -> dict | None:
 
 
 def _parse_action_json(text: str) -> dict | None:
-    """Extract and parse the first complete JSON object in text.
+    """Extract and parse the first parseable JSON object in text.
 
-    Uses json.JSONDecoder.raw_decode so that extra tokens streamed after the
-    action JSON (common with newer models) don't corrupt the parse.
+    Scans forward through every '{' so that a malformed preamble (e.g. a
+    thought with an unescaped newline) doesn't block the valid action object
+    that follows it.
     """
     text = text.strip()
     if not text:
         return None
 
-    start = text.find("{")
-    if start < 0:
+    decoder = json.JSONDecoder()
+    pos = 0
+    while True:
+        start = text.find("{", pos)
+        if start < 0:
+            break
         try:
-            obj = json.loads(text)
-            return obj if isinstance(obj, dict) else None
+            obj, _ = decoder.raw_decode(text, start)
+            if isinstance(obj, dict):
+                return obj
         except (json.JSONDecodeError, ValueError):
-            return None
+            pass
+        pos = start + 1
 
-    try:
-        obj, _ = json.JSONDecoder().raw_decode(text, start)
-        return obj if isinstance(obj, dict) else None
-    except (json.JSONDecodeError, ValueError):
-        return None
+    return None

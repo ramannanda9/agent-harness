@@ -33,6 +33,16 @@ class TestParseActionJson:
         assert result is not None
         assert result["action"] == "http_fetch"
 
+    def test_malformed_preamble_then_valid_action(self):
+        """Model emits a truncated/invalid JSON block before the real action object."""
+        text = (
+            '{"thought": "Need to gather info.\n'  # unescaped newline → invalid JSON
+            '{"action": "shell", "args": {"cmd": "uname -a"}, "thought": "t"}'
+        )
+        result = _parse_action_json(text)
+        assert result is not None
+        assert result["action"] == "shell"
+
     def test_extra_whitespace_and_prose_before_json(self):
         text = '  Here is my response:\n{"action": "finish", "answer": "hi", "thought": "t"}'
         result = _parse_action_json(text)
