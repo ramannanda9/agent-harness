@@ -7,6 +7,11 @@ instead of iterating events live.
 
 Event lifecycle within a single goal:
 
+  Routed path (run_routed / run_routed_stream):
+    ROUTE                 — router picked an agent; payload has agent_id + rationale
+    THOUGHT / TOKEN / ACTION / OBSERVATION / TASK_DONE  (single ReAct loop)
+
+  Orchestrated path (run / run_stream):
     PLAN                  — orchestrator emitted a static DAG
     (per task in DAG)
         THOUGHT           — agent's next-step reasoning
@@ -29,6 +34,7 @@ from typing import Any
 
 
 class EventType(str, Enum):
+    ROUTE       = "route"
     PLAN        = "plan"
     THOUGHT     = "thought"
     TOKEN       = "token"

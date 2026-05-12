@@ -5,19 +5,41 @@ harness/tracer.py   — Tracer: records every event in the run.
 harness/guardrails.py — BudgetGuard: cost, depth, time limits.
 harness/registry.py — AgentRegistry + ToolRegistry.
 """
+
 from __future__ import annotations
 
+import json
+import logging
 import time
 from dataclasses import dataclass, field
 from typing import Any
+
+logger = logging.getLogger(__name__)
+
+# ── Router prompt ─────────────────────────────────────────────────────────────
+# Deliberately minimal — one cheap LLM call, no decomposition.
+
+_ROUTER_SYSTEM = """
+You are a routing agent. Select the single best agent to handle the goal.
+
+Available agents:
+{agent_descriptions}
+
+Return JSON only:
+{{
+  "agent_id": "<agent_id from the list above>",
+  "rationale": "<one sentence explaining why>"
+}}
+"""
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Tracer
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 @dataclass
 class TraceEvent:
-    event_type: str      # thought | action | task_result | plan | replan | synthesis
+    event_type: str  # thought | action | task_result | plan | replan | synthesis
     agent_id: str
     payload: Any
     timestamp: float = field(default_factory=time.time)
@@ -26,23 +48,48 @@ class TraceEvent:
 class Tracer:
     """
     Records every event during a run.
-    In production: emit to OTEL collector, LangSmith, or Arize.
+
+    Hooks: attach side-channel exporters (e.g. OTEL) via add_hook().
+    Each hook must implement on_event(event_type, agent_id, payload)
+    and optionally on_start_run(run_id, goal) / on_end_run().
     """
+
     def __init__(self) -> None:
         self._events: list[TraceEvent] = []
+        self._hooks: list = []
+
+    def add_hook(self, hook) -> None:
+        """Attach an exporter hook (e.g. OTELHook)."""
+        self._hooks.append(hook)
 
     def log(self, event_type: str, agent_id: str, payload: Any) -> None:
         self._events.append(TraceEvent(event_type, agent_id, payload))
+        for hook in self._hooks:
+            hook.on_event(event_type, agent_id, payload)
+
+    def start_run(self, run_id: str, goal: str) -> None:
+        """Signal run start to hooks (e.g. for OTEL root span)."""
+        for hook in self._hooks:
+            if hasattr(hook, "on_start_run"):
+                hook.on_start_run(run_id, goal)
+
+    def end_run(self) -> None:
+        """Signal run end to hooks (e.g. to close OTEL root span)."""
+        for hook in self._hooks:
+            if hasattr(hook, "on_end_run"):
+                hook.on_end_run()
 
     def dump(self) -> list[dict]:
         result = []
         for e in self._events:
-            result.append({
-                "event_type": e.event_type,
-                "agent_id": e.agent_id,
-                "payload": e.payload,
-                "timestamp": e.timestamp,
-            })
+            result.append(
+                {
+                    "event_type": e.event_type,
+                    "agent_id": e.agent_id,
+                    "payload": e.payload,
+                    "timestamp": e.timestamp,
+                }
+            )
         return result
 
     def get_agent_trace(self, agent_id: str) -> list[dict]:
@@ -54,6 +101,7 @@ class Tracer:
 
     def print_trace(self, truncate: int = 300) -> None:
         import json
+
         for e in self._events:
             payload_str = json.dumps(e.payload, default=str)
             if len(payload_str) > truncate:
@@ -65,11 +113,12 @@ class Tracer:
 # Guardrails
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 @dataclass
 class GuardrailConfig:
     max_total_cost_usd: float = 2.0
     max_wall_time_seconds: int = 180
-    max_replan_count: int = 2          # forwarded to EvalConfig
+    max_replan_count: int = 2  # forwarded to EvalConfig
     confidence_threshold: float = 0.6  # forwarded to EvalConfig
 
 
@@ -78,6 +127,7 @@ class BudgetGuard:
     Hard budget limits enforced on every check() call.
     Call check() at the start of each ReAct step and each orchestration loop.
     """
+
     def __init__(self, config: GuardrailConfig) -> None:
         self.config = config
         self._cost: float = 0.0
@@ -110,6 +160,7 @@ class BudgetGuard:
 # Registry
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 class ToolRegistry:
     def __init__(self) -> None:
         self._tools: dict[str, Any] = {}
@@ -133,6 +184,7 @@ class ToolRegistry:
 class AgentRegistry:
     def __init__(self) -> None:
         from agents.base import AgentConfig
+
         self._configs: dict[str, AgentConfig] = {}
 
     def register(self, config: Any) -> AgentRegistry:
@@ -151,6 +203,7 @@ class AgentRegistry:
 # ══════════════════════════════════════════════════════════════════════════════
 # AgentRuntime — single entry point
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 class AgentRuntime:
     """
@@ -180,15 +233,17 @@ class AgentRuntime:
         self,
         agent_registry: AgentRegistry,
         tool_registry: ToolRegistry,
-        memory: Any,                      # MemoryManager
+        memory: Any,  # MemoryManager
         llm: Any,
         guardrail_config: GuardrailConfig | None = None,
+        enable_otel: bool = False,
     ) -> None:
         self._agent_registry = agent_registry
         self._tool_registry = tool_registry
         self._memory = memory
         self._llm = llm
         self._guardrail_config = guardrail_config or GuardrailConfig()
+        self._enable_otel = enable_otel
 
     def _build_orchestrator(self):
         """Construct fresh tracer, guard, agents, and orchestrator for one run."""
@@ -196,7 +251,18 @@ class AgentRuntime:
         from orchestrator.planner import EvalConfig, Orchestrator
 
         tracer = Tracer()
+
+        if self._enable_otel:
+            from harness.otel import OTELHook
+
+            tracer.add_hook(OTELHook())
         guard = BudgetGuard(self._guardrail_config)
+
+        # Adapters that implement set_budget(guard) (e.g. OpenAILLM) get the
+        # fresh per-run guard so they can call add_cost() on every completion.
+        # Duck-typed so users can plug in any LLM client that doesn't.
+        if hasattr(self._llm, "set_budget"):
+            self._llm.set_budget(guard)
 
         # state lives in memory, not agents — instantiate fresh per run
         agents = {
@@ -226,6 +292,116 @@ class AgentRuntime:
         )
         return orchestrator, tracer, guard
 
+    async def route(self, goal: str) -> tuple[str, str]:
+        """
+        Pick the best agent for a goal without decomposing into subtasks.
+
+        Fast-path: if only one agent is registered, return it immediately
+        without an LLM call.
+
+        Returns (agent_id, rationale).
+        """
+        all_ids = self._agent_registry.all_ids()
+
+        if len(all_ids) == 1:
+            return all_ids[0], "only one agent registered"
+
+        agent_descriptions = "\n".join(
+            f"  {aid}: {self._agent_registry.get(aid).role}" for aid in all_ids
+        )
+        response = await self._llm.complete(
+            system=_ROUTER_SYSTEM.format(agent_descriptions=agent_descriptions),
+            messages=[{"role": "user", "content": f"Goal: {goal}"}],
+            response_format={"type": "json_object"},
+        )
+
+        data = _parse_json_response(response)
+        agent_id = data.get("agent_id", "")
+        rationale = data.get("rationale", "")
+
+        if agent_id not in all_ids:
+            logger.warning(
+                "Router returned unknown agent_id %r — falling back to %r",
+                agent_id,
+                all_ids[0],
+            )
+            agent_id = all_ids[0]
+
+        return agent_id, rationale
+
+    async def run_routed_stream(self, goal: str):
+        """
+        Route to the best agent then run its ReAct loop directly.
+        Yields a ROUTE event first, then all agent events.
+        Use this instead of run_stream when you have a single-turn goal
+        that one agent can handle end-to-end — no task decomposition.
+        """
+        from harness.events import BusEvent, EventType
+
+        agent_id, rationale = await self.route(goal)
+        logger.info("Router → %s (%s)", agent_id, rationale)
+        yield BusEvent(
+            type=EventType.ROUTE,
+            agent_id=agent_id,
+            payload={"agent_id": agent_id, "rationale": rationale},
+        )
+        async for event in self.run_agent_stream(agent_id, goal):
+            yield event
+
+    async def run_routed(self, goal: str) -> dict:
+        """Blocking routed run. Returns the TASK_DONE payload dict."""
+        from harness.events import EventType
+
+        result: dict = {}
+        async for event in self.run_routed_stream(goal):
+            if event.type == EventType.TASK_DONE:
+                result = event.payload
+            elif event.type == EventType.ERROR:
+                result = {"answer": "", "confidence": 0.0, "error": event.error}
+        return result
+
+    async def run_agent_stream(self, agent_id: str, task: str):
+        """
+        Run a single named agent directly, bypassing orchestrator planning.
+
+        Use this when you know exactly which agent should handle the task and
+        don't need multi-agent decomposition. The agent runs its ReAct loop and
+        yields BusEvents (THOUGHT, TOKEN, ACTION, OBSERVATION, TASK_DONE, ERROR).
+
+        async for event in runtime.run_agent_stream("researcher", "what is 2+2?"):
+            ...
+        """
+        from agents.base import BaseAgent
+
+        tracer = Tracer()
+        guard = BudgetGuard(self._guardrail_config)
+        if hasattr(self._llm, "set_budget"):
+            self._llm.set_budget(guard)
+
+        config = self._agent_registry.get(agent_id)
+        agent = BaseAgent(
+            config=config,
+            tools=self._tool_registry.get_subset(config.allowed_tools),
+            memory=self._memory,
+            tracer=tracer,
+            guard=guard,
+            llm=self._llm,
+        )
+        async for event in agent.run_stream(task):
+            yield event
+
+    async def run_agent(self, agent_id: str, task: str) -> dict:
+        """Blocking single-agent run. Returns the TASK_DONE payload dict."""
+        from harness.events import EventType
+
+        result: dict = {}
+        async for event in self.run_agent_stream(agent_id, task):
+            if event.type == EventType.TASK_DONE:
+                result = event.payload
+            elif event.type == EventType.ERROR:
+                result = {"answer": "", "confidence": 0.0, "error": event.error}
+        return result
+
     async def run(self, goal: str) -> dict:
         from harness.events import EventType
 
@@ -251,3 +427,17 @@ class AgentRuntime:
         orchestrator, _tracer, _guard = self._build_orchestrator()
         async for event in orchestrator.run_stream(goal):
             yield event
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+
+def _parse_json_response(response: Any) -> dict:
+    """Unwrap LLM adapter response (dict with 'text', raw str, or dict)."""
+    if isinstance(response, dict) and "text" in response:
+        return json.loads(response["text"])
+    if isinstance(response, str):
+        return json.loads(response)
+    if isinstance(response, dict):
+        return response
+    return {}

@@ -16,3 +16,4 @@ lance_episodic/
 executor/target/
 .python-version
 .claude/
+.vscode/

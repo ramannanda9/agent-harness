@@ -182,6 +182,96 @@ async def test_runtime_runs_two_task_dag_to_completion():
     assert memory._episodic.count() == 1
 
 
+# ── Router tests ──────────────────────────────────────────────────────────────
+
+
+async def test_route_single_agent_skips_llm():
+    """With one agent registered, route() returns it without calling the LLM."""
+    llm = ScriptedLLM()
+    tools = ToolRegistry().register(EchoTool())
+    agents = AgentRegistry().register(
+        AgentConfig(
+            agent_id="analyst", role="analyses",
+            system_prompt="You analyse.", allowed_tools=["echo"],
+        )
+    )
+    memory = MemoryManager(
+        semantic_store=InMemorySemanticStore(),
+        episodic_store=InMemoryEpisodicStore(),
+        llm=llm,
+    )
+    runtime = AgentRuntime(agent_registry=agents, tool_registry=tools, memory=memory, llm=llm)
+
+    agent_id, rationale = await runtime.route("investigate something")
+
+    assert agent_id == "analyst"
+    assert rationale == "only one agent registered"
+    assert llm.calls == []   # no LLM call made
+
+
+async def test_route_multi_agent_calls_llm():
+    """With multiple agents, route() makes one LLM call and returns the chosen id."""
+
+    def router(system, messages, kwargs):
+        return {"agent_id": "reporter", "rationale": "goal needs reporting"}
+
+    llm = ScriptedLLM(routes={"routing agent": router})
+    runtime, _ = _build_runtime(llm)
+
+    agent_id, rationale = await runtime.route("summarise findings")
+
+    assert agent_id == "reporter"
+    assert rationale == "goal needs reporting"
+    router_calls = [c for c in llm.calls if "routing agent" in (c["system"] or "").lower()]
+    assert len(router_calls) == 1
+
+
+async def test_route_falls_back_on_unknown_agent_id():
+    """If router returns an unregistered agent_id, fall back to first registered."""
+
+    def router(system, messages, kwargs):
+        return {"agent_id": "ghost", "rationale": "should not exist"}
+
+    llm = ScriptedLLM(routes={"routing agent": router})
+    runtime, _ = _build_runtime(llm)
+
+    agent_id, _ = await runtime.route("anything")
+    assert agent_id in runtime._agent_registry.all_ids()
+
+
+async def test_run_routed_returns_task_done_payload():
+    """run_routed ends at TASK_DONE — no synthesis, no DONE event."""
+    llm = ScriptedLLM(routes=_routes_for_runtime())
+    runtime, _ = _build_runtime(llm)
+
+    result = await runtime.run_routed("analyse something")
+
+    assert "answer" in result
+    assert "confidence" in result
+    # routed path produces no orchestrator DONE payload fields
+    assert "replan_count" not in result
+    assert "task_results" not in result
+
+
+async def test_run_routed_stream_emits_route_event():
+    """run_routed_stream yields a ROUTE event before agent events."""
+    from harness.events import EventType
+
+    llm = ScriptedLLM(routes=_routes_for_runtime())
+    runtime, _ = _build_runtime(llm)
+
+    events = []
+    async for event in runtime.run_routed_stream("analyse something"):
+        events.append(event)
+
+    types = [e.type for e in events]
+    assert types[0] == EventType.ROUTE
+    assert EventType.TASK_DONE in types
+    # no PLAN or SYNTHESIS — those belong to the orchestrated path
+    assert EventType.PLAN not in types
+    assert EventType.SYNTHESIS not in types
+
+
 async def test_runtime_handles_unknown_agent_in_plan():
     """Planner emits a task for an unregistered agent — should not crash, task fails."""
     routes = _routes_for_runtime()

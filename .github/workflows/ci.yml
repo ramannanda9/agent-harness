@@ -26,7 +26,7 @@ jobs:
       - name: Lint
         run: ruff check .
 
-      - name: Test (sandbox integration tests skipped — see executor job)
+      - name: Test (executor integration tests skipped without binary — see executor job)
         run: pytest -v
 
   executor:
@@ -41,20 +41,19 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo build
+      - name: Cache cargo registry
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            executor/target
           key: cargo-${{ runner.os }}-${{ hashFiles('executor/Cargo.toml') }}
 
-      - name: Build executor
-        run: cargo build --release --manifest-path executor/Cargo.toml
+      - name: Install ah-executor
+        run: cargo install --path executor
 
       - name: Install Python deps
         run: pip install -e ".[dev]"
 
-      - name: Sandbox integration tests (real Rust binary)
-        run: pytest -v tests/test_sandbox.py
+      - name: Executor integration tests (real ah-executor binary)
+        run: pytest -v tests/test_executor_bridge.py

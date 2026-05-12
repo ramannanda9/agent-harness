@@ -8,28 +8,36 @@ Config-driven — register tools and agents, run any goal. No subclassing.
 ## Install
 
 ```bash
-pip install -e ".[dev]"                   # core + tests + lint
-pip install -e ".[lance,redis,dev]"       # also install LanceDB + Redis stores
+pip install -e ".[dev]"                              # core + tests + lint
+pip install -e ".[openai,http,dev]"                  # OpenAI adapter + HTTPFetch tool
+pip install -e ".[lance,redis,dev]"                  # LanceDB + Redis durable memory
+pip install -e ".[mcp]"                              # MCP tool adapter
+pip install -e ".[otel]"                             # OpenTelemetry tracing
 ```
 
-The core package has no runtime dependencies. The `lance`, `redis`,
-`anthropic`, and `openai` extras pull in heavier libs only if you opt in.
+The core package has no runtime dependencies. The `openai`, `http`, `lance`,
+`redis`, `anthropic`, `mcp`, and `otel` extras pull in heavier libs only if
+you opt in.
 
 ## Quickstart
 
 ```bash
-python examples/quickstart.py
+python examples/quickstart.py                          # mock LLM, no keys, no network
+OPENAI_API_KEY=sk-... python examples/openai_demo.py   # real OpenAI + HTTPFetch
 ```
 
-Runs end-to-end against a deterministic mock LLM — no API keys needed.
-Swap `MockLLM` for an Anthropic or OpenAI client to run against a real model.
+`quickstart.py` exercises the full wiring against a deterministic `MockLLM`.
+`openai_demo.py` runs the same shape against a real model — streams live
+events to stdout and prints elapsed time + cost at the end.
 
 ## Architecture
 
 ```
 harness/runtime.py          AgentRuntime — single entry point, wire once run anything
 harness/events.py           BusEvent + EventType — canonical event vocabulary
-harness/sandbox.py          Sandbox + SandboxedTool — Rust-executor adapter
+harness/llm/openai.py       OpenAILLM — OpenAI adapter with usage + cost tracking
+harness/otel.py             OTELHook — OpenTelemetry span exporter (opt-in)
+harness/executor_bridge.py  ExecutorBridge + ExecutorTool — controlled subprocess launcher with optional Docker sandboxing
 orchestrator/planner.py     Hybrid DAG orchestrator — plan, replan, synthesize
 agents/base.py              Generic BaseAgent — ReAct loop, no subclassing needed
 memory/manager.py           MemoryManager — semantic KV + episodic vector
@@ -37,12 +45,24 @@ memory/working.py           WorkingMemory — LLM summarization eviction
 memory/episodic_lance.py    LanceDB episodic store — IVF_PQ ANN, batch writes
 memory/redis_store.py       Redis semantic store — durable KV with TTL
 memory/stores.py            InMemory stores — local dev default, no deps
+tools/builtin/http_fetch.py HTTPFetch — minimal read-only GET tool
+tools/mcp/adapter.py        MCP tool adapter — connect any MCP server
 ```
 
 Execution is **streaming-primary**: every run flows through `run_stream()`,
 which yields `BusEvent`s for plan, thoughts, tool calls, observations, task
 completions, replans, and synthesis. The blocking `run()` is a thin drain
 over the same stream.
+
+## Examples
+
+| Script | What it shows | Requires |
+|---|---|---|
+| `examples/quickstart.py` | End-to-end against `MockLLM` + `EchoTool` — reference wiring. | nothing |
+| `examples/openai_demo.py` | Real OpenAI + `HTTPFetch` + `shell` (via `ah-executor`), routed single-agent run, live event stream, cost reporting. | `OPENAI_API_KEY`, `[openai,http]` |
+| `examples/executor_bridge_demo.py` | `ExecutorBridge` backends side-by-side: allowlist, env scrubbing, Docker network/fs isolation, timeout, positional-arg tools. | `ah-executor` and/or Docker |
+| `examples/durable_memory_demo.py` | Redis (semantic) + LanceDB (episodic) memory persistence across two related goals. | `OPENAI_API_KEY`, `[openai,redis,lance]`, Redis reachable |
+| `examples/mcp_demo.py` | Connects to an MCP filesystem server and gives the agent its tools. | `OPENAI_API_KEY`, `[openai,mcp]`, `npx` |
 
 ## Adding a new domain (3 steps)
 
@@ -61,6 +81,43 @@ agents.register(AgentConfig(
 # 3. Run
 result = await runtime.run("my goal")
 ```
+
+## LLM clients
+
+The harness is **BYO-LLM.** Any object with
+`async def complete(system, messages, **kwargs) -> dict` works. Optional
+`async def stream_complete(system, messages) -> AsyncGenerator[str, None]`
+enables `TOKEN` events.
+
+The OpenAI adapter is shipped because it's the easiest spin:
+
+```python
+from harness.llm.openai import OpenAILLM
+
+llm = OpenAILLM(model="gpt-4o-mini")                # reads OPENAI_API_KEY from env
+runtime = AgentRuntime(..., llm=llm)
+```
+
+To use Anthropic / Gemini / Ollama / a local SGLang or vLLM server / anything
+else — write a 30-line adapter implementing those two methods. See
+`harness/llm/openai.py` for the reference shape; the harness never imports a
+provider SDK directly.
+
+## Built-in tools
+
+One tool ships out of the box — `HTTPFetch`, intentionally boring. Anything
+heavier (auth, retries, connection pooling, scraping) belongs in a tool you
+write yourself. Tools just need `.name` and `async def execute(**kwargs)`.
+
+```python
+from tools.builtin.http_fetch import HTTPFetch
+
+tools.register(HTTPFetch(max_bytes=64 * 1024))      # body capped at 64 KiB
+```
+
+Returns `{status, content_type, body, truncated, url}`. Errors come back as
+`{"error": "..."}` so the agent treats them as observations rather than
+crashing the loop.
 
 ## Memory write timing
 
@@ -88,33 +145,67 @@ memory = MemoryManager(semantic_store=semantic, episodic_store=episodic, llm=llm
 Or write your own backend conforming to the `SemanticStore` / `EpisodicStore`
 protocols in `memory/manager.py`.
 
-## Streaming and blocking — same execution path
+## Execution paths
 
-Both calls drive the same orchestrator; `run()` is just `.collect()` over
-`run_stream()`.
+Three paths, same event vocabulary — pick the one that matches your task:
+
+### 1. Routed — `run_routed` / `run_routed_stream`
+
+One lightweight LLM call picks the best agent, then that agent runs its
+ReAct loop directly. No task decomposition, no synthesis step. Use this
+for single-turn goals where one agent handles everything end-to-end.
 
 ```python
 from harness.events import EventType
 
-# Blocking — returns the final result dict
-result = await runtime.run("investigate worker-07")
-
-# Streaming — yields events live; display or drain however you want
-async for event in runtime.run_stream("investigate worker-07"):
-    if event.type == EventType.TOKEN:                # only if LLM streams tokens
-        print(event.token, end="", flush=True)
+async for event in runtime.run_routed_stream("what is the current disk usage?"):
+    if event.type == EventType.ROUTE:
+        print(f"→ {event.payload['agent_id']}: {event.payload['rationale']}")
     elif event.type == EventType.ACTION:
-        print(f"\n→ {event.payload['tool']}({event.payload['args']})")
-    elif event.type == EventType.OBSERVATION:
-        print(f"  ← {event.payload['observation']}")
-    elif event.type == EventType.REPLAN:
-        print(f"\n[replan #{event.payload['replan_count']}]")
-    elif event.type == EventType.DONE:
-        print(f"\n{event.payload['answer']}")
+        print(f"  tool: {event.payload['tool']}")
+    elif event.type == EventType.TASK_DONE:
+        print(event.payload["answer"])
 ```
 
-Event types: `PLAN`, `THOUGHT`, `TOKEN`, `ACTION`, `OBSERVATION`, `TASK_DONE`,
-`REPLAN`, `SYNTHESIS`, `DONE`, `ERROR` (see `harness/events.py`).
+Fast-path: if only one agent is registered, `route()` returns it immediately
+without an LLM call.
+
+### 2. Direct — `run_agent` / `run_agent_stream`
+
+You name the agent; it runs its ReAct loop directly. Use when you already
+know which agent to call and want to skip routing entirely.
+
+```python
+result = await runtime.run_agent("researcher", "summarise this document")
+```
+
+### 3. Orchestrated — `run` / `run_stream`
+
+The planner decomposes the goal into a task DAG, assigns tasks to specialist
+agents, runs them (in parallel where dependencies allow), and synthesises a
+final answer. Use for multi-agent goals where different specialists handle
+different parts of the work.
+
+```python
+async for event in runtime.run_stream("investigate GPU spike on worker-07"):
+    if event.type == EventType.PLAN:
+        for t in event.payload["plan"]["tasks"]:
+            print(f"  {t['id']}@{t['agent_id']}: {t['instruction']}")
+    elif event.type == EventType.REPLAN:
+        print(f"[replan #{event.payload['replan_count']}]")
+    elif event.type == EventType.DONE:
+        print(event.payload["answer"])
+```
+
+Event types by path:
+
+| Event | Routed | Direct | Orchestrated |
+|---|---|---|---|
+| `ROUTE` | ✓ | — | — |
+| `THOUGHT` / `TOKEN` / `ACTION` / `OBSERVATION` | ✓ | ✓ | ✓ |
+| `TASK_DONE` | ✓ | ✓ | ✓ |
+| `PLAN` / `REPLAN` / `SYNTHESIS` / `DONE` | — | — | ✓ |
+| `ERROR` | ✓ | ✓ | ✓ |
 
 `TOKEN` events fire only when your LLM client exposes
 `async def stream_complete(system, messages) -> AsyncGenerator[str, None]`.
@@ -134,45 +225,118 @@ enc = tiktoken.get_encoding("cl100k_base")
 wm = WorkingMemory(llm=..., token_counter=lambda s: len(enc.encode(s)))
 ```
 
-## Sandboxed tools
+## Cost tracking
+
+The harness deliberately **does not maintain a pricing table** — tables go
+stale, and per-org rollups don't belong in an SDK. Token counts come from the
+provider authoritatively (free). Dollars are optional and follow this
+precedence, per call:
+
+**1. Gateway header (recommended).** Route the OpenAI client through LiteLLM
+proxy, Helicone, OpenRouter via `base_url=...` and `OpenAILLM` reads
+`x-litellm-response-cost` / `x-cost-usd` / `x-helicone-cost-usd` from the
+response automatically. Real cost, gateway-maintained pricing.
+
+```python
+llm = OpenAILLM(model="gpt-4o-mini", base_url="https://my-litellm/v1")
+```
+
+**2. `cost_fn(usage) -> float`** — caller-supplied. For when you hit a
+provider directly and want a local pricing function:
+
+```python
+def my_pricing(usage):
+    rates = {"gpt-4o-mini": (0.15e-6, 0.60e-6)}     # (input, output) USD/token
+    served = usage.get("model", "")
+    for prefix, (in_rate, out_rate) in rates.items():
+        if served.startswith(prefix):
+            return usage["tokens_in"] * in_rate + usage["tokens_out"] * out_rate
+    return 0.0
+
+llm = OpenAILLM(model="gpt-4o-mini", cost_fn=my_pricing)
+```
+
+**3. Neither.** Tokens still flow on every call (visible via `last_usage` and
+in OTEL span attributes when OTEL is enabled). `cost_usd` is just omitted. No
+crash, no surprise charges from a stale rate table.
+
+`AgentRuntime` wires a fresh `BudgetGuard` per run and calls
+`llm.set_budget(guard)` automatically (duck-typed; safe if the adapter
+doesn't support it). When `max_total_cost_usd` is exceeded, the next
+`BudgetGuard.check()` raises and aborts the run. The final `DONE` event
+payload carries `cost_usd` and `elapsed_seconds` at the top level:
+
+```python
+async for event in runtime.run_stream(goal):
+    if event.type == EventType.DONE:
+        print(f"${event.payload['cost_usd']:.4f} in {event.payload['elapsed_seconds']:.1f}s")
+```
+
+Cost ceiling fires on the *next* `check()` (start of next ReAct step or
+orchestrator batch), not synchronously mid-call — accept this for 0.0.1, the
+guard's job is preventing runaway loops, not bounding individual calls.
+
+## Tool execution
 
 Tools that shell out (`kubectl`, `curl`, `sh -c …`) should not run inside the
-agent process. The Rust executor at `executor/` is a one-shot subprocess
-sandbox that the Python `Sandbox` client invokes per tool call.
+agent process. `ExecutorBridge` provides a controlled subprocess launcher with
+two backends.
 
-What the sandbox enforces:
+### What every backend enforces
 
 - **Tool allowlist** — set at startup; the LLM cannot extend it.
 - **Wall-clock timeout** per call.
 - **Output size cap** (default 1 MiB, configurable).
-- **Subprocess isolation** — a tool crash cannot reach the agent.
-- **Scrubbed environment** — only `PATH` is forwarded; everything else dropped.
 
-What it does **not** do — for syscall / fs / network isolation, deploy the
-harness inside a container or VM:
+### `backend="none"` (default) — Rust executor
 
-- No seccomp / landlock filters.
-- No fs or network namespacing.
-- No rlimit-based CPU / memory caps.
-
-Build and wire up:
+Routes each call through the compiled Rust binary at `executor/`. Adds
+process-level isolation (a tool crash cannot reach the agent) and a scrubbed
+environment (only `PATH` is forwarded). Does **not** provide syscall filtering,
+filesystem namespacing, or network isolation.
 
 ```bash
-cd executor && cargo build --release
-# binary at executor/target/release/executor
+cargo install --path executor   # installs ah-executor to ~/.cargo/bin
 ```
 
 ```python
-from harness.sandbox import Sandbox, SandboxConfig, SandboxedTool
+from harness.executor_bridge import ExecutorBridge, ExecutorConfig, ExecutorTool
 
-sandbox = Sandbox(SandboxConfig(
-    binary_path="executor/target/release/executor",
+# binary_path auto-discovered from PATH via shutil.which("ah-executor")
+bridge = ExecutorBridge(ExecutorConfig(
     allowed_tools=("kubectl", "curl"),   # "shell" is opt-in only
 ))
 
-tools.register(SandboxedTool(
-    name="kubectl", executor_tool="kubectl", sandbox=sandbox, arg_key="args",
+kubectl_tool = ExecutorTool("kubectl", "kubectl", bridge, arg_key="args")
+```
+
+### `backend="docker"` — real OS-level isolation
+
+Each tool call runs in a fresh Docker container. Provides network isolation,
+read-only filesystem, and memory/CPU limits. The Rust binary is not used in
+this mode. Requires Docker daemon on the host.
+
+```python
+from harness.executor_bridge import ExecutorBridge, ExecutorConfig, ExecutorTool
+
+bridge = ExecutorBridge(ExecutorConfig(
+    allowed_tools=("kubectl",),
+    backend="docker",
+    docker_image="bitnami/kubectl:latest",
+    docker_network="none",      # no outbound network
+    docker_memory="256m",
+    docker_cpus="1.0",
+    docker_read_only=True,
 ))
+
+kubectl_tool = ExecutorTool("kubectl", "kubectl", bridge, arg_key="args")
+```
+
+The `shell` tool (dict-style args) works with both backends:
+
+```python
+shell_tool = ExecutorTool("shell", "shell", bridge)
+# LLM calls: {"action": "shell", "args": {"cmd": "jq '.name' data.json"}}
 ```
 
 ## Tests
@@ -180,3 +344,89 @@ tools.register(SandboxedTool(
 ```bash
 pytest
 ```
+
+## MCP Tools
+
+Connect any [MCP](https://modelcontextprotocol.io)-compatible server and its
+tools become available to agents — no wrapper code needed.
+
+```bash
+pip install -e ".[mcp]"
+```
+
+```python
+from mcp import StdioServerParameters
+from tools.mcp import MCPServerConnection
+
+params = StdioServerParameters(
+    command="npx",
+    args=["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+)
+
+async with MCPServerConnection(params, server_name="filesystem") as conn:
+    conn.register_tools(tool_registry)          # bulk-register all discovered tools
+    agents.register(AgentConfig(
+        agent_id="explorer",
+        role="explores the filesystem",
+        system_prompt="...",
+        allowed_tools=conn.tool_names,           # auto-populated from MCP server
+    ))
+    result = await runtime.run("list files in /tmp")
+```
+
+Supports **stdio** and **SSE** transports. The `MCPServerConnection` context
+manager handles the full lifecycle — connect, discover, and cleanup.
+
+See `examples/mcp_demo.py` for a runnable example.
+
+## OpenTelemetry Tracing
+
+Visualize agent runs in Jaeger, Datadog, or any OTEL-compatible backend.
+
+```bash
+pip install -e ".[otel]"
+```
+
+One flag enables tracing:
+
+```python
+runtime = AgentRuntime(
+    agent_registry=agents,
+    tool_registry=tools,
+    memory=memory,
+    llm=llm,
+    enable_otel=True,           # ← that's it
+)
+```
+
+Span hierarchy:
+
+```
+[run]  goal="Fetch httpbin.org/json..."
+  ├── [plan]         task_count=2
+  ├── [task]         agent=researcher, task_id=t1
+  │     ├── thought  "I need to fetch..."
+  │     ├── action   tool=http_fetch
+  │     └── thought  "Got the response..."
+  ├── [task]         agent=researcher, task_id=t2
+  │     └── thought  "Extracting title..."
+  └── [synthesis]    confidence=0.95
+```
+
+Local Jaeger setup:
+
+```bash
+# Start Jaeger (OTLP on :4318, UI on :16686)
+docker run -d --name jaeger \
+  -p 16686:16686 -p 4318:4318 \
+  jaegertracing/all-in-one:latest
+
+# Run your agent
+OPENAI_API_KEY=sk-... python examples/openai_demo.py
+
+# View traces at http://localhost:16686
+```
+
+The OTEL hook is a side-channel on the existing `Tracer` — the in-memory trace
+is always available via `result["trace"]` regardless of whether OTEL is enabled.
+Zero overhead and zero imports when `enable_otel=False`.

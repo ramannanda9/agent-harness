@@ -22,14 +22,32 @@ redis = ["redis>=5.0"]
 # Convenience extras for users wiring real LLM clients.
 anthropic = ["anthropic>=0.25"]
 openai = ["openai>=1.0"]
-# Dev: tests + lint + types + fakeredis for the redis-store unit tests.
+# HTTP-fetch builtin tool — async client.
+http = ["httpx>=0.27"]
+# MCP (Model Context Protocol) tool adapter.
+mcp = ["mcp>=1.0"]
+# OpenTelemetry tracing — visualise runs in Jaeger / Datadog / etc.
+otel = [
+    "opentelemetry-api>=1.20",
+    "opentelemetry-sdk>=1.20",
+    "opentelemetry-exporter-otlp-proto-http>=1.20",
+]
+# Dev: tests + lint + types + fakeredis + httpx + openai for unit tests.
 dev = [
     "pytest>=8",
     "pytest-asyncio>=0.23",
+    "pre-commit>=3.7",
     "ruff>=0.4",
     "mypy>=1.10",
     "redis>=5.0",
     "fakeredis>=2.20",
+    "httpx>=0.27",
+    "openai>=1.0",
+    "respx>=0.21",
+    "mcp>=1.0",
+    "opentelemetry-api>=1.20",
+    "opentelemetry-sdk>=1.20",
+    "opentelemetry-exporter-otlp-proto-http>=1.20",
 ]
 
 [tool.setuptools.packages.find]
