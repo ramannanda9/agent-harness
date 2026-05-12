@@ -7,6 +7,7 @@ Wires up:
   - shell tool via ah-executor (native backend) — skipped gracefully if not installed
   - A single-agent registry that uses both tools
   - In-memory semantic + episodic stores
+  - Optional OpenTelemetry tracing (set OTEL_ENABLED=1, requires pip install -e ".[otel]")
 
 The agent fetches a remote URL and runs a shell command in the same run,
 demonstrating the LLM orchestrating two heterogeneous tool types without
@@ -18,6 +19,11 @@ Streams live to stdout: plan → action → observation → synthesis.
 
 Install ah-executor to enable the shell tool (optional):
     cargo install --path executor
+
+Enable OpenTelemetry tracing (optional):
+    docker run -d --name jaeger -p 16686:16686 -p 4318:4318 jaegertracing/all-in-one:latest
+    OTEL_ENABLED=1 OPENAI_API_KEY=sk-... python examples/openai_demo.py
+    # View traces at http://localhost:16686
 """
 
 from __future__ import annotations
@@ -113,6 +119,10 @@ async def main() -> None:
         llm=llm,
     )
 
+    enable_otel = bool(os.environ.get("OTEL_ENABLED"))
+    if enable_otel:
+        print("OpenTelemetry: enabled (traces → http://localhost:16686)")
+
     runtime = AgentRuntime(
         agent_registry=agents,
         tool_registry=tools,
@@ -124,6 +134,7 @@ async def main() -> None:
             max_replan_count=1,
             confidence_threshold=0.5,
         ),
+        enable_otel=enable_otel,
     )
 
     # dispatch_stream: classifier decides simple→routed or complex→orchestrated.
