@@ -8,12 +8,13 @@ harness/registry.py — AgentRegistry + ToolRegistry.
 
 from __future__ import annotations
 
-import json
 import logging
 import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
+
+from harness.utils import parse_llm_json
 
 logger = logging.getLogger(__name__)
 
@@ -569,12 +570,4 @@ class AgentRuntime:
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 
-def _parse_json_response(response: Any) -> dict:
-    """Unwrap LLM adapter response (dict with 'text', raw str, or dict)."""
-    if isinstance(response, dict) and "text" in response:
-        return json.loads(response["text"])
-    if isinstance(response, str):
-        return json.loads(response)
-    if isinstance(response, dict):
-        return response
-    return {}
+_parse_json_response = parse_llm_json

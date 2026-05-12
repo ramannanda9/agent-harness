@@ -64,6 +64,7 @@ explicit control.
 |---|---|---|
 | `examples/quickstart.py` | End-to-end against `MockLLM` + `EchoTool` — reference wiring. | nothing |
 | `examples/openai_demo.py` | Real OpenAI + `HTTPFetch` + `shell` (via `ah-executor`), routed single-agent run, live event stream, cost reporting. | `OPENAI_API_KEY`, `[openai,http]` |
+| `examples/complex_sysaudit_demo.py` | Three heterogeneous agents in parallel: `shell_agent` (ah-executor), `filesystem_agent` (MCP), `web_agent` (HTTPFetch) — orchestrated path, DAG plan, synthesis. | `OPENAI_API_KEY`, `[openai,http,mcp]`, `ah-executor`, `npx` |
 | `examples/executor_bridge_demo.py` | `ExecutorBridge` backends side-by-side: allowlist, env scrubbing, Docker network/fs isolation, timeout, positional-arg tools. | `ah-executor` and/or Docker |
 | `examples/durable_memory_demo.py` | Redis (semantic) + LanceDB (episodic) memory persistence across two related goals. | `OPENAI_API_KEY`, `[openai,redis,lance]`, Redis reachable |
 | `examples/mcp_demo.py` | Connects to an MCP filesystem server and gives the agent its tools. | `OPENAI_API_KEY`, `[openai,mcp]`, `npx` |

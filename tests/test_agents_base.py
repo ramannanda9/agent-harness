@@ -170,7 +170,7 @@ async def test_unparseable_llm_response_returns_error(agent_factory, llm: Script
     result = await agent.run("anything")
 
     assert result["confidence"] == 0.0
-    assert "unparseable" in result["error"]
+    assert "unparseable" in result["error"].lower()
 
 
 # ── Parallel tool calls ───────────────────────────────────────────────────────

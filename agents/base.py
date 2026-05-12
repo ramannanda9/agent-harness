@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from harness.events import BusEvent, EventType
+from harness.utils import fire
 from memory.manager import MemoryManager
 from memory.working import WorkingMemory
 
@@ -127,6 +128,7 @@ class BaseAgent:
         self._guard = guard
         self._llm = llm
         self._working_memory: WorkingMemory | None = None
+        self._last_think_error: str | None = None
 
     # ── Streaming entry point (canonical) ─────────────────────────────────────
 
@@ -204,10 +206,11 @@ class BaseAgent:
                     yield thought_event
 
             if response is None:
+                reason = self._last_think_error or "LLM returned unparseable response"
                 yield BusEvent(
                     type=EventType.ERROR,
                     agent_id=self.config.agent_id,
-                    error="LLM returned unparseable response",
+                    error=reason,
                 )
                 return
 
@@ -292,11 +295,13 @@ class BaseAgent:
                     )
                     combined.append({"tool": tool_name, "result": obs})
                     if obs and not isinstance(obs, str):
-                        await self._memory.write_working_fact(
-                            run_id=run_id,
-                            agent_id=self.config.agent_id,
-                            key=f"step_{step}_{i}_{tool_name}",
-                            value=obs,
+                        fire(
+                            self._memory.write_working_fact(
+                                run_id=run_id,
+                                agent_id=self.config.agent_id,
+                                key=f"step_{step}_{i}_{tool_name}",
+                                value=obs,
+                            )
                         )
 
                 await self._working_memory.append("assistant", json.dumps(response))
@@ -337,11 +342,13 @@ class BaseAgent:
                 )
 
                 if observation and not isinstance(observation, str):
-                    await self._memory.write_working_fact(
-                        run_id=run_id,
-                        agent_id=self.config.agent_id,
-                        key=f"step_{step}_{tool_name}",
-                        value=observation,
+                    fire(
+                        self._memory.write_working_fact(
+                            run_id=run_id,
+                            agent_id=self.config.agent_id,
+                            key=f"step_{step}_{tool_name}",
+                            value=observation,
+                        )
                     )
 
                 obs_text = (
@@ -385,6 +392,13 @@ class BaseAgent:
                         token=token,
                     )
                 response = _parse_action_json(accumulated)
+                if response is None:
+                    logger.warning(
+                        "Agent %s stream got unparseable response: %r",
+                        self.config.agent_id,
+                        accumulated[:300],
+                    )
+                    self._last_think_error = f"Unparseable stream response: {accumulated[:300]}"
             else:
                 raw = await self._llm.complete(
                     system=None,
@@ -392,9 +406,20 @@ class BaseAgent:
                     response_format={"type": "json_object"},
                 )
                 response = _normalize_response(raw)
+                if response is None:
+                    logger.warning(
+                        "Agent %s got unparseable response: %r",
+                        self.config.agent_id,
+                        raw,
+                    )
+                    self._last_think_error = f"Unparseable response: {str(raw)[:300]}"
         except Exception as e:
             logger.error("Agent %s think failed: %s", self.config.agent_id, e)
             response = None
+            self._last_think_error = str(e)
+        else:
+            if response is not None:
+                self._last_think_error = None
 
         yield BusEvent(
             type=EventType.THOUGHT,
@@ -448,14 +473,25 @@ def _normalize_response(response: Any) -> dict | None:
 
 
 def _parse_action_json(text: str) -> dict | None:
+    """Extract and parse the first parseable JSON object in text.
+
+    Scans forward through every '{' so that a malformed preamble (e.g. a
+    thought with an unescaped newline) doesn't block the valid action object
+    that follows it.
+    """
     text = text.strip()
     if not text:
         return None
-    try:
-        start = text.find("{")
-        end = text.rfind("}") + 1
-        if start >= 0 and end > start:
-            return json.loads(text[start:end])
-        return json.loads(text)
-    except (json.JSONDecodeError, ValueError):
-        return None
+
+    decoder = json.JSONDecoder()
+    pos = 0
+    while (start := text.find("{", pos)) >= 0:
+        try:
+            obj, _ = decoder.raw_decode(text, start)
+            if isinstance(obj, dict):
+                return obj
+        except (json.JSONDecodeError, ValueError):
+            pass
+        pos = start + 1
+
+    return None
