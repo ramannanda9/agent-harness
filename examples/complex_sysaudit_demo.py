@@ -42,7 +42,7 @@ from tools.builtin.http_fetch import HTTPFetch
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-MODEL = os.environ.get("OPENAI_MODEL", "gpt-4.5")
+MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.5")
 PROJECT_DIR = Path(os.environ.get("PROJECT_DIR", Path(__file__).parent.parent)).resolve()
 PYPI_PACKAGE = os.environ.get("PYPI_PACKAGE", "agent-harness")
 
