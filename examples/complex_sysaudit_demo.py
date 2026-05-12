@@ -46,7 +46,7 @@ MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.5")
 PROJECT_DIR = Path(os.environ.get("PROJECT_DIR", Path(__file__).parent.parent)).resolve()
 PYPI_PACKAGE = os.environ.get("PYPI_PACKAGE", "agent-harness")
 
-GOAL = f"""Audit this project and machine. Investigate all three areas in parallel:
+AUDIT_GOAL = f"""Audit this project and machine. Investigate all three areas in parallel:
 
 1. SYSTEM & GIT (shell_agent):
    - OS, kernel, CPU model, total/free memory, uptime
@@ -65,6 +65,12 @@ GOAL = f"""Audit this project and machine. Investigate all three areas in parall
 Combine findings into a project health report. Flag anything noteworthy:
 version drift between pyproject.toml and PyPI, uncommitted changes, high
 memory pressure, or files changed recently."""
+
+FOLLOWUP_GOAL = (
+    "Based on the project audit you just completed, give me a prioritised action list: "
+    "what needs attention first and why? Focus on version drift, uncommitted changes, "
+    "and any memory or process concerns."
+)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -113,7 +119,6 @@ async def main() -> None:
     print(f"Project:    {PROJECT_DIR}")
     print(f"PyPI pkg:   {PYPI_PACKAGE}")
     print(f"OTEL:       {'enabled' if enable_otel else 'disabled'}")
-    print(f"\nGoal:\n{GOAL}")
     print(_sep("═"))
 
     llm = OpenAILLM(model=MODEL)
@@ -186,9 +191,11 @@ async def main() -> None:
             )
         )
 
+        semantic_store = InMemorySemanticStore()
+        episodic_store = InMemoryEpisodicStore()
         memory = MemoryManager(
-            semantic_store=InMemorySemanticStore(),
-            episodic_store=InMemoryEpisodicStore(),
+            semantic_store=semantic_store,
+            episodic_store=episodic_store,
             llm=llm,
         )
 
@@ -198,19 +205,22 @@ async def main() -> None:
             memory=memory,
             llm=llm,
             guardrail_config=GuardrailConfig(
-                max_total_cost_usd=3.0,
-                max_wall_time_seconds=180,
+                max_total_cost_usd=5.0,
+                max_wall_time_seconds=300,
                 max_replan_count=1,
                 confidence_threshold=0.5,
             ),
             enable_otel=enable_otel,
         )
 
-        # ── Stream ────────────────────────────────────────────────────────────
+        # ── Pass 1: Full audit ────────────────────────────────────────────────
+
+        print(f"\nPASS 1 — full audit\nGoal: {_trunc(AUDIT_GOAL, 120)}")
+        print(_sep("═"))
 
         task_results: list[dict] = []
 
-        async for event in runtime.dispatch_stream(GOAL):
+        async for event in runtime.dispatch_stream(AUDIT_GOAL):
             if event.type == EventType.DISPATCH:
                 print(
                     f"\n[dispatch]   complexity={event.payload['complexity']}"
@@ -271,6 +281,82 @@ async def main() -> None:
                     f"Replans: {p.get('replan_count', 0)}  |  "
                     f"Cost: ${p.get('cost_usd', 0):.4f}  |  "
                     f"Time: {p.get('elapsed_seconds', 0):.1f}s"
+                )
+
+            elif event.type == EventType.ERROR:
+                print(f"\n[error]      {event.error}", file=sys.stderr)
+
+        # ── Memory inspection ─────────────────────────────────────────────────
+        # Show exactly what was extracted and stored so the second pass is
+        # transparent — you can see what the agent will read from memory.
+
+        print("\n" + _sep("─"))
+        print("MEMORY WRITTEN AFTER PASS 1")
+        print(_sep("─"))
+
+        all_semantic = await semantic_store.search_prefix("")
+        global_facts = {
+            k: v
+            for k, v in all_semantic.items()
+            if not k.startswith("run:") and not k.startswith("agent:")
+        }
+        print(f"Semantic facts ({len(global_facts)}):")
+        for k, v in global_facts.items():
+            print(f"  {k}: {_trunc(str(v), 100)}")
+
+        episodes = episodic_store._episodes
+        print(f"\nEpisodic summaries ({len(episodes)}):")
+        for ep in episodes:
+            ts = ep.get("metadata", {}).get("timestamp", "?")
+            print(f"  [{ts}]")
+            print(f"  {_trunc(ep['text'], 200)}")
+
+        # ── Pass 2: Follow-up from memory ─────────────────────────────────────
+        # Memory is injected into the agent's system prompt via build_context.
+        # Watch the thought: the agent should reason from stored facts rather
+        # than calling tools again.
+
+        print("\n" + _sep("═"))
+        print(f"PASS 2 — follow-up (memory recall)\nGoal: {FOLLOWUP_GOAL}")
+        print(_sep("═"))
+
+        async for event in runtime.dispatch_stream(FOLLOWUP_GOAL):
+            if event.type == EventType.DISPATCH:
+                print(
+                    f"\n[dispatch]   complexity={event.payload['complexity']}"
+                    f"  path={event.payload['path']}"
+                )
+
+            elif event.type == EventType.ROUTE:
+                print(
+                    f"[route]      → {event.payload['agent_id']}: "
+                    f"{_trunc(event.payload['rationale'], 90)}"
+                )
+
+            elif event.type == EventType.THOUGHT:
+                thought = event.payload.get("thought", "")
+                if thought:
+                    print(f"[{event.agent_id:<16}] think   {_trunc(thought, 110)}")
+
+            elif event.type == EventType.ACTION:
+                args = json.dumps(event.payload["args"], default=str)
+                print(f"[{event.agent_id:<16}] action  {event.payload['tool']}({_trunc(args, 90)})")
+
+            elif event.type == EventType.OBSERVATION:
+                obs = event.payload.get("observation", "")
+                print(f"[{event.agent_id:<16}] obs     {_trunc(obs, 110)}")
+
+            elif event.type == EventType.TASK_DONE:
+                p = event.payload
+                print("\n" + _sep("═"))
+                print("PRIORITISED ACTION LIST (from memory)")
+                print(_sep("═"))
+                print(p.get("answer", "(no answer)"))
+                print(_sep())
+                print(
+                    f"Confidence: {p.get('confidence', 0):.2f}  |  "
+                    f"Steps: {p.get('steps', '?')}  "
+                    f"(fewer steps = agent answered from memory, not tools)"
                 )
 
             elif event.type == EventType.ERROR:

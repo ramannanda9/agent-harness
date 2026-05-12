@@ -312,19 +312,30 @@ class MemoryManager:
 
         Reads:
           - Episodic: top-k similar past episodes via vector search
-          - Semantic: agent-specific keys if agent_id provided, else empty
-            (global semantic facts are too noisy to inject wholesale —
-             agents should request specific keys via tools in the ReAct loop)
+          - Semantic: agent-specific keys first, then global facts extracted at
+            run-end, up to context_max_semantic_keys total.
         """
         episodes = await self._episodic.search(goal, top_k=self._context_max_episodes)
 
-        # only inject agent-specific semantic facts at context-build time
-        # global facts are fetched on-demand during ReAct via memory_lookup tool
         semantic_facts: dict[str, Any] = {}
+
+        # agent-scoped facts (written as "agent:{id}:..." during previous runs)
         if agent_id:
-            all_facts = await self._semantic.search_prefix(f"agent:{agent_id}:")
-            # take most recent N keys
-            semantic_facts = dict(list(all_facts.items())[: self._context_max_semantic_keys])
+            agent_facts = await self._semantic.search_prefix(f"agent:{agent_id}:")
+            semantic_facts.update(
+                dict(list(agent_facts.items())[: self._context_max_semantic_keys])
+            )
+
+        # global facts extracted at run-end (no run: or agent: prefix)
+        remaining = self._context_max_semantic_keys - len(semantic_facts)
+        if remaining > 0:
+            all_facts = await self._semantic.search_prefix("")
+            global_facts = {
+                k: v
+                for k, v in all_facts.items()
+                if not k.startswith("run:") and not k.startswith("agent:")
+            }
+            semantic_facts.update(dict(list(global_facts.items())[:remaining]))
 
         return MemoryContext(
             semantic_facts=semantic_facts,
