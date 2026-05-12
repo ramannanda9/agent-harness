@@ -8,29 +8,34 @@ Config-driven — register tools and agents, run any goal. No subclassing.
 ## Install
 
 ```bash
-pip install -e ".[dev]"                   # core + tests + lint
-pip install -e ".[lance,redis,dev]"       # also install LanceDB + Redis stores
-pip install -e ".[mcp]"                   # MCP tool adapter
-pip install -e ".[otel]"                  # OpenTelemetry tracing
+pip install -e ".[dev]"                              # core + tests + lint
+pip install -e ".[openai,http,dev]"                  # OpenAI adapter + HTTPFetch tool
+pip install -e ".[lance,redis,dev]"                  # LanceDB + Redis durable memory
+pip install -e ".[mcp]"                              # MCP tool adapter
+pip install -e ".[otel]"                             # OpenTelemetry tracing
 ```
 
-The core package has no runtime dependencies. The `lance`, `redis`,
-`anthropic`, `openai`, `mcp`, and `otel` extras pull in heavier libs only if you opt in.
+The core package has no runtime dependencies. The `openai`, `http`, `lance`,
+`redis`, `anthropic`, `mcp`, and `otel` extras pull in heavier libs only if
+you opt in.
 
 ## Quickstart
 
 ```bash
-python examples/quickstart.py
+python examples/quickstart.py                          # mock LLM, no keys, no network
+OPENAI_API_KEY=sk-... python examples/openai_demo.py   # real OpenAI + HTTPFetch
 ```
 
-Runs end-to-end against a deterministic mock LLM — no API keys needed.
-Swap `MockLLM` for an Anthropic or OpenAI client to run against a real model.
+`quickstart.py` exercises the full wiring against a deterministic `MockLLM`.
+`openai_demo.py` runs the same shape against a real model — streams live
+events to stdout and prints elapsed time + cost at the end.
 
 ## Architecture
 
 ```
 harness/runtime.py          AgentRuntime — single entry point, wire once run anything
 harness/events.py           BusEvent + EventType — canonical event vocabulary
+harness/llm/openai.py       OpenAILLM — OpenAI adapter with usage + cost tracking
 harness/otel.py             OTELHook — OpenTelemetry span exporter (opt-in)
 harness/sandbox.py          Sandbox + SandboxedTool — Rust-executor adapter
 orchestrator/planner.py     Hybrid DAG orchestrator — plan, replan, synthesize
@@ -49,6 +54,15 @@ which yields `BusEvent`s for plan, thoughts, tool calls, observations, task
 completions, replans, and synthesis. The blocking `run()` is a thin drain
 over the same stream.
 
+## Examples
+
+| Script | What it shows | Requires |
+|---|---|---|
+| `examples/quickstart.py` | End-to-end against `MockLLM` + `EchoTool` — reference wiring. | nothing |
+| `examples/openai_demo.py` | Real OpenAI run + `HTTPFetch` tool, live event stream, token + cost reporting. | `OPENAI_API_KEY`, `[openai,http]` |
+| `examples/durable_memory_demo.py` | Redis (semantic) + LanceDB (episodic) memory persistence across two related goals. | `OPENAI_API_KEY`, `[openai,redis,lance]`, Redis reachable |
+| `examples/mcp_demo.py` | Connects to an MCP filesystem server and gives the agent its tools. | `OPENAI_API_KEY`, `[openai,mcp]`, `npx` |
+
 ## Adding a new domain (3 steps)
 
 ```python
@@ -66,6 +80,43 @@ agents.register(AgentConfig(
 # 3. Run
 result = await runtime.run("my goal")
 ```
+
+## LLM clients
+
+The harness is **BYO-LLM.** Any object with
+`async def complete(system, messages, **kwargs) -> dict` works. Optional
+`async def stream_complete(system, messages) -> AsyncGenerator[str, None]`
+enables `TOKEN` events.
+
+The OpenAI adapter is shipped because it's the easiest spin:
+
+```python
+from harness.llm.openai import OpenAILLM
+
+llm = OpenAILLM(model="gpt-4o-mini")                # reads OPENAI_API_KEY from env
+runtime = AgentRuntime(..., llm=llm)
+```
+
+To use Anthropic / Gemini / Ollama / a local SGLang or vLLM server / anything
+else — write a 30-line adapter implementing those two methods. See
+`harness/llm/openai.py` for the reference shape; the harness never imports a
+provider SDK directly.
+
+## Built-in tools
+
+One tool ships out of the box — `HTTPFetch`, intentionally boring. Anything
+heavier (auth, retries, connection pooling, scraping) belongs in a tool you
+write yourself. Tools just need `.name` and `async def execute(**kwargs)`.
+
+```python
+from tools.builtin.http_fetch import HTTPFetch
+
+tools.register(HTTPFetch(max_bytes=64 * 1024))      # body capped at 64 KiB
+```
+
+Returns `{status, content_type, body, truncated, url}`. Errors come back as
+`{"error": "..."}` so the agent treats them as observations rather than
+crashing the loop.
 
 ## Memory write timing
 
@@ -138,6 +189,57 @@ import tiktoken
 enc = tiktoken.get_encoding("cl100k_base")
 wm = WorkingMemory(llm=..., token_counter=lambda s: len(enc.encode(s)))
 ```
+
+## Cost tracking
+
+The harness deliberately **does not maintain a pricing table** — tables go
+stale, and per-org rollups don't belong in an SDK. Token counts come from the
+provider authoritatively (free). Dollars are optional and follow this
+precedence, per call:
+
+**1. Gateway header (recommended).** Route the OpenAI client through LiteLLM
+proxy, Helicone, OpenRouter via `base_url=...` and `OpenAILLM` reads
+`x-litellm-response-cost` / `x-cost-usd` / `x-helicone-cost-usd` from the
+response automatically. Real cost, gateway-maintained pricing.
+
+```python
+llm = OpenAILLM(model="gpt-4o-mini", base_url="https://my-litellm/v1")
+```
+
+**2. `cost_fn(usage) -> float`** — caller-supplied. For when you hit a
+provider directly and want a local pricing function:
+
+```python
+def my_pricing(usage):
+    rates = {"gpt-4o-mini": (0.15e-6, 0.60e-6)}     # (input, output) USD/token
+    served = usage.get("model", "")
+    for prefix, (in_rate, out_rate) in rates.items():
+        if served.startswith(prefix):
+            return usage["tokens_in"] * in_rate + usage["tokens_out"] * out_rate
+    return 0.0
+
+llm = OpenAILLM(model="gpt-4o-mini", cost_fn=my_pricing)
+```
+
+**3. Neither.** Tokens still flow on every call (visible via `last_usage` and
+in OTEL span attributes when OTEL is enabled). `cost_usd` is just omitted. No
+crash, no surprise charges from a stale rate table.
+
+`AgentRuntime` wires a fresh `BudgetGuard` per run and calls
+`llm.set_budget(guard)` automatically (duck-typed; safe if the adapter
+doesn't support it). When `max_total_cost_usd` is exceeded, the next
+`BudgetGuard.check()` raises and aborts the run. The final `DONE` event
+payload carries `cost_usd` and `elapsed_seconds` at the top level:
+
+```python
+async for event in runtime.run_stream(goal):
+    if event.type == EventType.DONE:
+        print(f"${event.payload['cost_usd']:.4f} in {event.payload['elapsed_seconds']:.1f}s")
+```
+
+Cost ceiling fires on the *next* `check()` (start of next ReAct step or
+orchestrator batch), not synchronously mid-call — accept this for 0.0.1, the
+guard's job is preventing runaway loops, not bounding individual calls.
 
 ## Sandboxed tools
 
