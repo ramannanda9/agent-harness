@@ -485,10 +485,7 @@ def _parse_action_json(text: str) -> dict | None:
 
     decoder = json.JSONDecoder()
     pos = 0
-    while True:
-        start = text.find("{", pos)
-        if start < 0:
-            break
+    while (start := text.find("{", pos)) >= 0:
         try:
             obj, _ = decoder.raw_decode(text, start)
             if isinstance(obj, dict):
