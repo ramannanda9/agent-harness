@@ -470,8 +470,8 @@ def _normalize_response(response: Any) -> dict | None:
 def _parse_action_json(text: str) -> dict | None:
     """Extract and parse the first complete JSON object in text.
 
-    Uses brace-depth tracking so that extra tokens streamed after the action
-    JSON (common with newer models) don't corrupt the parse.
+    Uses json.JSONDecoder.raw_decode so that extra tokens streamed after the
+    action JSON (common with newer models) don't corrupt the parse.
     """
     text = text.strip()
     if not text:
@@ -480,36 +480,13 @@ def _parse_action_json(text: str) -> dict | None:
     start = text.find("{")
     if start < 0:
         try:
-            return json.loads(text)
+            obj = json.loads(text)
+            return obj if isinstance(obj, dict) else None
         except (json.JSONDecodeError, ValueError):
             return None
 
-    depth = 0
-    in_string = False
-    escape = False
-    for i, ch in enumerate(text[start:], start):
-        if escape:
-            escape = False
-            continue
-        if ch == "\\" and in_string:
-            escape = True
-            continue
-        if ch == '"':
-            in_string = not in_string
-            continue
-        if in_string:
-            continue
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                try:
-                    return json.loads(text[start : i + 1])
-                except (json.JSONDecodeError, ValueError):
-                    return None
-
     try:
-        return json.loads(text)
+        obj, _ = json.JSONDecoder().raw_decode(text, start)
+        return obj if isinstance(obj, dict) else None
     except (json.JSONDecodeError, ValueError):
         return None
