@@ -41,6 +41,12 @@ logger = logging.getLogger(__name__)
 
 _SEP = "─" * 60
 
+# Held by request_approval for the duration of the banner+stdin interaction.
+# Concurrent agents acquire-and-release this before printing events so their
+# output doesn't interleave with the approval prompt.
+# asyncio.Lock() is safe to create at import time in Python ≥ 3.10.
+stdout_lock: asyncio.Lock = asyncio.Lock()
+
 
 # ── Resume helper ─────────────────────────────────────────────────────────────
 
@@ -257,16 +263,20 @@ async def request_approval(
       y / yes     → approved, tool runs
       n / no      → rejected, tool skipped (error observation returned)
       <any text>  → correction injected into WorkingMemory; tool skipped
+
+    Holds stdout_lock for the duration so concurrent agent events don't
+    interleave with the banner or the input prompt.
     """
-    await store.write_request(req)
-    _print_banner(req)
+    async with stdout_lock:
+        await store.write_request(req)
+        _print_banner(req)
 
-    guard.suspend()
-    try:
-        loop = asyncio.get_running_loop()
-        raw = await loop.run_in_executor(None, input, "  Approve? [y/n/correction]: ")
-    finally:
-        guard.resume()
+        guard.suspend()
+        try:
+            loop = asyncio.get_running_loop()
+            raw = await loop.run_in_executor(None, input, "  Approve? [y/n/correction]: ")
+        finally:
+            guard.resume()
 
-    print()
-    return _parse_stdin(req.approval_id, raw)
+        print()
+        return _parse_stdin(req.approval_id, raw)

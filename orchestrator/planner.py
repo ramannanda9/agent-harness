@@ -37,6 +37,7 @@ from enum import Enum
 from typing import Any
 
 from harness.events import BusEvent, EventType
+from harness.hitl import stdout_lock as _hitl_stdout_lock
 from harness.utils import fire, parse_llm_json
 
 logger = logging.getLogger(__name__)
@@ -587,6 +588,11 @@ class Orchestrator:
                     # in run_stream after building the TaskResult and applying
                     # replan / on_failure logic.
                     if payload.type != EventType.TASK_DONE:
+                        # Wait for any active HITL gate to finish before yielding
+                        # so concurrent agent output doesn't interleave with the
+                        # approval banner or input prompt.
+                        async with _hitl_stdout_lock:
+                            pass
                         yield payload
                 elif isinstance(payload, TaskResult):
                     results_out[task.id] = payload
