@@ -36,16 +36,19 @@ events to stdout and prints elapsed time + cost at the end.
 harness/runtime.py          AgentRuntime — single entry point, wire once run anything
 harness/events.py           BusEvent + EventType — canonical event vocabulary
 harness/llm/openai.py       OpenAILLM — OpenAI adapter with usage + cost tracking
+harness/annotation.py       Annotation store + AnnotationHook — RLHF trajectory capture
+harness/hitl.py             HITL approval gate — interactive CLI, Redis checkpoint/resume
 harness/otel.py             OTELHook — OpenTelemetry span exporter (opt-in)
 harness/executor_bridge.py  ExecutorBridge + ExecutorTool — controlled subprocess launcher with optional Docker sandboxing
 orchestrator/planner.py     Hybrid DAG orchestrator — plan, replan, synthesize
 agents/base.py              Generic BaseAgent — ReAct loop, no subclassing needed
 memory/manager.py           MemoryManager — semantic KV + episodic vector
-memory/working.py           WorkingMemory — LLM summarization eviction
+memory/working.py           WorkingMemory — LLM summarization eviction, checkpoint/restore
 memory/episodic_lance.py    LanceDB episodic store — IVF_PQ ANN, batch writes
 memory/redis_store.py       Redis semantic store — durable KV with TTL
 memory/stores.py            InMemory stores — local dev default, no deps
 tools/builtin/http_fetch.py HTTPFetch — minimal read-only GET tool
+tools/builtin/fetch_image.py FetchImage — fetch URL and return OpenAI image_url block
 tools/mcp/adapter.py        MCP tool adapter — connect any MCP server
 ```
 
@@ -64,6 +67,7 @@ explicit control.
 |---|---|---|
 | `examples/quickstart.py` | End-to-end against `MockLLM` + `EchoTool` — reference wiring. | nothing |
 | `examples/openai_demo.py` | Real OpenAI + `HTTPFetch` + `shell` (via `ah-executor`), routed single-agent run, live event stream, cost reporting. | `OPENAI_API_KEY`, `[openai,http]` |
+| `examples/vision_demo.py` | Multimodal agent: fetches two images in parallel via `FetchImage`, describes each using the LLM's vision capability, synthesises a report. | `OPENAI_API_KEY`, `[openai,http]` |
 | `examples/complex_sysaudit_demo.py` | Three heterogeneous agents in parallel: `shell_agent` (ah-executor), `filesystem_agent` (MCP), `web_agent` (HTTPFetch) — orchestrated path, DAG plan, synthesis. | `OPENAI_API_KEY`, `[openai,http,mcp]`, `ah-executor`, `npx` |
 | `examples/executor_bridge_demo.py` | `ExecutorBridge` backends side-by-side: allowlist, env scrubbing, Docker network/fs isolation, timeout, positional-arg tools. | `ah-executor` and/or Docker |
 | `examples/durable_memory_demo.py` | Redis (semantic) + LanceDB (episodic) memory persistence across two related goals. | `OPENAI_API_KEY`, `[openai,redis,lance]`, Redis reachable |
@@ -468,3 +472,161 @@ OPENAI_API_KEY=sk-... python examples/openai_demo.py
 The OTEL hook is a side-channel on the existing `Tracer` — the in-memory trace
 is always available via `result["trace"]` regardless of whether OTEL is enabled.
 Zero overhead and zero imports when `enable_otel=False`.
+
+## Vision / multimodal agents
+
+`WorkingMemory` accepts `str | list` content so image blocks pass through to
+vision-capable LLMs without modification.
+
+```bash
+pip install -e ".[openai,http]"
+```
+
+```python
+from tools.builtin.fetch_image import FetchImage
+
+tools.register(FetchImage())
+
+agents.register(AgentConfig(
+    agent_id="vision_agent",
+    role="fetches images and describes their visual content",
+    system_prompt="Use fetch_image to retrieve images — you can see them directly.",
+    allowed_tools=["fetch_image"],
+    working_memory_max_tokens=16_000,   # images use ~500 tokens each in budget
+))
+
+result = await runtime.run_agent("vision_agent", "describe https://example.com/photo.jpg")
+```
+
+`FetchImage` downloads the URL, base64-encodes the body, and returns an OpenAI
+`image_url` content block. The agent appends it to `WorkingMemory` as a content
+list; the LLM receives the actual image. `OBSERVATION` events and the
+summarization LLM see `[image]` as a placeholder so text-only paths are never
+handed raw base64.
+
+Image token budget: a fixed `500` token estimate per image block (conservative
+mid-point of GPT-4o `auto` detail range). Override with a real counter if you
+need exact figures.
+
+## Trajectory capture and RLHF
+
+Every agent run automatically logs its full `WorkingMemory` message history as
+a `"trajectory"` tracer event. Wire `InMemoryAnnotationStore` to collect and
+rate trajectories:
+
+```python
+from harness.annotation import InMemoryAnnotationStore
+
+store = InMemoryAnnotationStore()
+runtime = AgentRuntime(..., annotation_store=store)
+
+await runtime.run_agent("my_agent", "task")
+
+# drain unrated trajectories
+for annotation in store.list_unrated():
+    print(annotation.agent_id, annotation.answer, annotation.confidence)
+    store.rate(annotation.annotation_id, rating=0.9)          # 1.0 = ideal
+
+# export to training pipeline
+training_data = store.list_all()
+```
+
+`Annotation` fields:
+
+| Field | Type | Description |
+|---|---|---|
+| `messages` | `list[dict]` | Full `WorkingMemory` trajectory — system prompt, every thought, tool call, observation, and final answer |
+| `answer` | `str` | Agent's final answer (`""` on failure) |
+| `confidence` | `float` | Agent's self-reported confidence `[0, 1]` |
+| `steps` | `int` | ReAct steps taken |
+| `error` | `str` | `""` on success; failure reason otherwise |
+| `summarization_count` | `int` | Number of `WorkingMemory` compression passes |
+| `rating` | `float \| None` | Human rating `[0, 1]` — `None` until rated |
+| `correction` | `str \| None` | Human-supplied correct answer when `rating < 1` |
+
+Trajectory capture fires in a `finally` block — it records on success, on
+max-steps exhaustion, and on crash. Swap `InMemoryAnnotationStore` for any
+backend that implements the same interface (`write`, `get`, `list_all`,
+`list_run`, `list_unrated`, `rate`, `count`).
+
+## Human-in-the-Loop (HITL)
+
+Gate specific tool calls behind an interactive CLI prompt. Opt-in per agent via
+`hitl_tools`; zero overhead when unused.
+
+```bash
+pip install -e ".[redis]"
+```
+
+```python
+import redis.asyncio as aioredis
+from harness.hitl import RedisApprovalStore
+
+client = aioredis.from_url("redis://localhost:6379", decode_responses=True)
+approval_store = RedisApprovalStore(client)
+
+agents.register(AgentConfig(
+    agent_id="file_agent",
+    role="manages files",
+    system_prompt="...",
+    allowed_tools=["read_file", "write_file", "delete_file"],
+    hitl_tools=["write_file", "delete_file"],   # these two require human approval
+))
+
+runtime = AgentRuntime(..., approval_store=approval_store)
+await runtime.run_agent("file_agent", "clean up the logs directory")
+```
+
+When the agent calls `write_file` or `delete_file` a prompt appears:
+
+```
+────────────────────────────────────────────────────────────
+  HITL Approval Required
+────────────────────────────────────────────────────────────
+  Tool:  delete_file
+  Args:  {"path": "/var/log/app.log"}
+  Agent: file_agent  step=2
+  Run:   3f7a1b2c-...
+  ID:    a1b2-c3d4
+────────────────────────────────────────────────────────────
+  Approve? [y/n/correction]:
+```
+
+**Prompt semantics:**
+
+| Input | Effect |
+|---|---|
+| `y` / `yes` | Tool runs |
+| `n` / `no` | Tool skipped; agent sees a rejection observation |
+| any other text | Correction: tool skipped, text injected into `WorkingMemory` as a user message; LLM self-corrects on the next step |
+
+**Wall-time budget** is suspended while waiting for input — human think-time
+does not count against `max_wall_time_seconds`.
+
+### Crash / Ctrl-C resume
+
+The run checkpoint (step number + full `WorkingMemory`) is written to Redis
+before every approval prompt. If the process is killed:
+
+```python
+# In a new process — same runtime configuration
+await runtime.resume_agent("3f7a1b2c-...")   # run_id printed in the banner
+```
+
+The checkpoint is restored, the same approval banner is shown again, and the
+run continues from the saved step. Checkpoints expire after 24 hours (configurable via `RedisApprovalStore(ttl_seconds=...)`).
+
+### Correction steering and replanning
+
+When the human types a correction instead of y/n:
+
+- **Single-agent run**: correction is injected as a `user` message in
+  `WorkingMemory`. The LLM sees it on the next think step and self-corrects
+  without replanning. Suitable for redirecting tool choice or adjusting
+  parameters.
+- **Multi-agent orchestrated run**: if the correction implies a different agent
+  or task structure, call `resume_agent` with updated context instead, which
+  re-enters the orchestrator.
+
+The `annotation_store` and `approval_store` are independent — both can be wired
+simultaneously for RLHF data collection with HITL review.
