@@ -11,6 +11,12 @@ The dispatch classifier routes to the orchestrated path (planner → DAG → syn
 because the goal spans three heterogeneous tool domains. Tasks run in parallel where
 dependencies allow; the synthesiser produces a combined project health report.
 
+HITL: the `shell` tool on shell_agent requires human approval before each command
+runs. Type y to approve, n to reject, or any text to steer the agent instead.
+If the process is interrupted, the banner prints the exact command to resume:
+
+    python examples/complex_sysaudit_demo.py --resume <run_id>
+
     OPENAI_API_KEY=sk-... python examples/complex_sysaudit_demo.py
 
 Requires:
@@ -18,9 +24,10 @@ Requires:
   pip install -e ".[openai,http,mcp]"    # adapters
 
 Optional:
-  OTEL_ENABLED=1   — send traces to Jaeger on localhost:4318
-  PROJECT_DIR=...  — project root to audit (defaults to repo root)
-  PYPI_PACKAGE=... — PyPI package name to fetch (defaults to agent-harness)
+  OTEL_ENABLED=1          — send traces to Jaeger on localhost:4318
+  PROJECT_DIR=...         — project root to audit (defaults to repo root)
+  PYPI_PACKAGE=...        — PyPI package name to fetch (defaults to agent-harness)
+  HITL_CHECKPOINT_DIR=... — override checkpoint directory (default ~/.agent-harness/checkpoints)
 """
 
 from __future__ import annotations
@@ -34,6 +41,7 @@ from pathlib import Path
 from agents.base import AgentConfig
 from harness.events import EventType
 from harness.executor_bridge import ExecutorBridge, ExecutorConfig, ExecutorTool, find_executor
+from harness.hitl import maybe_resume
 from harness.llm.openai import OpenAILLM
 from harness.runtime import AgentRegistry, AgentRuntime, GuardrailConfig, ToolRegistry
 from memory.manager import MemoryManager
@@ -165,12 +173,17 @@ async def main() -> None:
     enable_otel = bool(os.environ.get("OTEL_ENABLED"))
     semantic_store, episodic_store, store_label = await _build_stores(None)
 
+    from harness.hitl import FileApprovalStore
+
+    checkpoint_dir = FileApprovalStore()._dir
+
     print(_sep("═"))
     print(f"Model:      {MODEL}")
     print(f"Project:    {PROJECT_DIR}")
     print(f"PyPI pkg:   {PYPI_PACKAGE}")
     print(f"OTEL:       {'enabled' if enable_otel else 'disabled'}")
     print(f"Memory:     {store_label}")
+    print(f"HITL:       shell commands gated  (checkpoints → {checkpoint_dir})")
     print(_sep("═"))
 
     llm = OpenAILLM(model=MODEL)
@@ -227,6 +240,7 @@ async def main() -> None:
                         + _react_suffix
                     ),
                     allowed_tools=["shell"],
+                    hitl_tools=["shell"],  # every shell command requires human approval
                     max_steps=8,
                 )
             )
@@ -284,6 +298,13 @@ async def main() -> None:
 
         audit_runtime = _make_runtime(audit_agents)
         followup_runtime = _make_runtime(followup_agents)
+
+        # ── Resume check ──────────────────────────────────────────────────────
+        # If --resume <run_id> is in sys.argv, restore checkpoint and re-prompt
+        # the pending approval, then continue from the saved step.  The banner
+        # printed the exact command to paste, so the user just re-runs with that flag.
+        if await maybe_resume(audit_runtime):
+            return
 
         # ── Pass 1: Full audit ────────────────────────────────────────────────
 

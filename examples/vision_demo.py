@@ -40,8 +40,8 @@ from tools.builtin.http_fetch import HTTPFetch
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-# gpt-4o supports vision; gpt-4o-mini does too but with lower quality on complex images.
-MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o")
+# gpt-5.4-mini supports vision.
+MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.4-mini")
 
 # Public domain test images — stable Wikipedia/httpbin URLs.
 # httpbin /image/jpeg → JPEG of a horse; /image/png → PNG badge.

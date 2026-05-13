@@ -32,7 +32,8 @@ import logging
 import uuid
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
-from typing import Any
+from datetime import datetime, timezone
+from typing import Any, Final
 
 from harness.events import BusEvent, EventType
 from harness.utils import fire
@@ -40,6 +41,10 @@ from memory.manager import MemoryManager
 from memory.working import WorkingMemory
 
 logger = logging.getLogger(__name__)
+
+# Sentinel returned by _run_tool_gated when human injects a correction.
+# Caller must `continue` the ReAct loop — WM is already updated.
+_HITL_CORRECTION: Final = object()
 
 
 # ── Agent Config ──────────────────────────────────────────────────────────────
@@ -55,6 +60,11 @@ class AgentConfig:
     memory_context_enabled: bool = True
     confidence_from_llm: bool = True  # if False, confidence=1.0 on success
     working_memory_max_tokens: int = 8000  # WorkingMemory eviction threshold; tune per agent
+    hitl_tools: list[str] = None  # tools requiring human approval; None = no HITL
+
+    def __post_init__(self):
+        if self.hitl_tools is None:
+            self.hitl_tools = []
 
 
 # ── ReAct Response Schema ─────────────────────────────────────────────────────
@@ -119,6 +129,7 @@ class BaseAgent:
         tracer,
         guard,
         llm,
+        approval_store: Any | None = None,  # RedisApprovalStore — enables HITL + resume
     ) -> None:
         self.config = config
         self.role = config.role  # exposed for orchestrator planner prompt
@@ -127,7 +138,9 @@ class BaseAgent:
         self._tracer = tracer
         self._guard = guard
         self._llm = llm
+        self._approval_store = approval_store
         self._working_memory: WorkingMemory | None = None
+        self._task: str = ""
         self._last_think_error: str | None = None
 
     # ── Streaming entry point (canonical) ─────────────────────────────────────
@@ -138,6 +151,7 @@ class BaseAgent:
         run_id: str | None = None,
     ) -> AsyncGenerator[BusEvent, None]:
         run_id = run_id or str(uuid.uuid4())
+        self._task = task
         self._working_memory = WorkingMemory(
             llm=self._llm,
             max_tokens=self.config.working_memory_max_tokens,
@@ -147,8 +161,37 @@ class BaseAgent:
         await self._working_memory.append("system", system, pinned=True)
         await self._working_memory.append("user", task)
 
+        async for event in self._run_stream_internal(run_id):
+            yield event
+
+    async def _resume_stream(
+        self,
+        run_id: str,
+        start_step: int,
+        pending: dict | None = None,
+    ) -> AsyncGenerator[BusEvent, None]:
+        """
+        Re-enter the ReAct loop from a checkpoint.
+
+        If pending is set, the last step was interrupted mid-approval.
+        The approval prompt is shown again; once the human responds the
+        tool runs (or the correction is injected) before the loop continues.
+        """
+        if pending:
+            async for event in self._replay_pending_step(run_id, pending):
+                yield event
+            start_step = pending["step"] + 1
+
+        async for event in self._run_stream_internal(run_id, start_step=start_step):
+            yield event
+
+    async def _run_stream_internal(
+        self,
+        run_id: str,
+        start_step: int = 0,
+    ) -> AsyncGenerator[BusEvent, None]:
         try:
-            async for event in self._react_stream(run_id):
+            async for event in self._react_stream(run_id, start_step=start_step):
                 yield event
         except Exception as e:
             logger.exception("Agent %s stream crashed", self.config.agent_id)
@@ -157,6 +200,17 @@ class BaseAgent:
                 agent_id=self.config.agent_id,
                 error=str(e),
             )
+        finally:
+            if self._working_memory is not None:
+                self._tracer.log(
+                    "trajectory",
+                    self.config.agent_id,
+                    {
+                        "run_id": run_id,
+                        "messages": self._working_memory.get_messages(),
+                        "summarization_count": self._working_memory.summarization_count,
+                    },
+                )
 
     # ── Blocking entry point (thin drain) ─────────────────────────────────────
 
@@ -192,8 +246,10 @@ class BaseAgent:
 
     # ── ReAct Loop (stream) ───────────────────────────────────────────────────
 
-    async def _react_stream(self, run_id: str) -> AsyncGenerator[BusEvent, None]:
-        for step in range(self.config.max_steps):
+    async def _react_stream(
+        self, run_id: str, start_step: int = 0
+    ) -> AsyncGenerator[BusEvent, None]:
+        for step in range(start_step, self.config.max_steps):
             self._guard.check()
 
             # Think — yields TOKEN events when the LLM client supports streaming.
@@ -207,6 +263,11 @@ class BaseAgent:
 
             if response is None:
                 reason = self._last_think_error or "LLM returned unparseable response"
+                self._tracer.log(
+                    "task_result",
+                    self.config.agent_id,
+                    {"answer": "", "confidence": 0.0, "steps": step, "error": reason},
+                )
                 yield BusEvent(
                     type=EventType.ERROR,
                     agent_id=self.config.agent_id,
@@ -226,6 +287,7 @@ class BaseAgent:
 
             # Finish?
             if response.get("action") == "finish":
+                await self._working_memory.append("assistant", json.dumps(response))
                 result = {
                     "agent_id": self.config.agent_id,
                     "answer": response.get("answer", ""),
@@ -244,6 +306,16 @@ class BaseAgent:
                     result["confidence"],
                     self._working_memory.summarization_count,
                 )
+                self._tracer.log(
+                    "task_result",
+                    self.config.agent_id,
+                    {
+                        "answer": result["answer"],
+                        "confidence": result["confidence"],
+                        "steps": result["steps"],
+                        "error": "",
+                    },
+                )
                 yield BusEvent(
                     type=EventType.TASK_DONE,
                     agent_id=self.config.agent_id,
@@ -254,6 +326,27 @@ class BaseAgent:
             # Act — parallel or single
             parallel_actions = response.get("actions")
             if parallel_actions and isinstance(parallel_actions, list):
+                # Gate each gated tool sequentially before fanning out.
+                # Correction from any one tool aborts the whole batch.
+                approved: list[dict] = []
+                correction_injected = False
+                for act in parallel_actions:
+                    approval = await self._gate_tool(
+                        run_id, step, act.get("tool", ""), act.get("args", {}), response
+                    )
+                    if approval is None or approval.approved:
+                        approved.append(act)
+                    elif approval.correction:
+                        await self._inject_human_guidance(response, approval.correction, run_id)
+                        correction_injected = True
+                        break
+                    # else: rejected — drop from batch silently
+
+                if correction_injected:
+                    continue
+
+                parallel_actions = approved
+
                 # Emit ACTION events first so callers see what's being launched.
                 for act in parallel_actions:
                     yield BusEvent(
@@ -266,13 +359,14 @@ class BaseAgent:
                         },
                     )
 
-                # Fan out all tool calls concurrently.
+                # Fan out all approved tool calls concurrently.
                 observations = await asyncio.gather(
                     *[
                         self._execute_tool(act.get("tool", ""), act.get("args", {}))
                         for act in parallel_actions
                     ]
                 )
+                await self._clear_checkpoint(run_id)
 
                 combined: list[dict] = []
                 for i, (act, obs) in enumerate(zip(parallel_actions, observations, strict=False)):
@@ -338,7 +432,11 @@ class BaseAgent:
                     payload={"step": step, "tool": tool_name, "args": tool_args},
                 )
 
-                observation = await self._execute_tool(tool_name, tool_args)
+                observation = await self._run_tool_gated(
+                    run_id, step, tool_name, tool_args, response
+                )
+                if observation is _HITL_CORRECTION:
+                    continue
 
                 obs_display = "[image]" if _is_image_block(observation) else str(observation)[:500]
                 self._tracer.log(
@@ -393,6 +491,16 @@ class BaseAgent:
                     await self._working_memory.append("user", f"Observation: {obs_text}")
 
         # Max steps exhausted.
+        self._tracer.log(
+            "task_result",
+            self.config.agent_id,
+            {
+                "answer": "",
+                "confidence": 0.0,
+                "steps": self.config.max_steps,
+                "error": f"Max steps ({self.config.max_steps}) reached",
+            },
+        )
         yield BusEvent(
             type=EventType.ERROR,
             agent_id=self.config.agent_id,
@@ -488,6 +596,151 @@ class BaseAgent:
             "error": reason,
             "metadata": {},
         }
+
+    async def _gate_tool(
+        self,
+        run_id: str,
+        step: int,
+        tool_name: str,
+        tool_args: dict,
+        llm_response: dict,
+    ):
+        """
+        Run the HITL approval gate for one tool.
+
+        Returns ApprovalResponse if the tool is gated, None if not.
+        Writes a crash-resumable checkpoint to the store before blocking on stdin.
+        """
+        if not (self._approval_store and tool_name in self.config.hitl_tools):
+            return None
+
+        from harness.hitl import ApprovalRequest, request_approval
+
+        approval_id = str(uuid.uuid4())
+        await self._approval_store.write_checkpoint(
+            run_id,
+            {
+                "run_id": run_id,
+                "agent_id": self.config.agent_id,
+                "task": self._task,
+                "step": step,
+                "memory": self._working_memory.to_dict(),
+                "pending": {
+                    "approval_id": approval_id,
+                    "tool": tool_name,
+                    "args": tool_args,
+                    "step": step,
+                    "llm_response": llm_response,
+                },
+            },
+        )
+        return await request_approval(
+            ApprovalRequest(
+                approval_id=approval_id,
+                run_id=run_id,
+                agent_id=self.config.agent_id,
+                tool=tool_name,
+                args=tool_args,
+                step=step,
+                timestamp=datetime.now(timezone.utc).isoformat(),
+            ),
+            self._approval_store,
+            self._guard,
+        )
+
+    async def _run_tool_gated(
+        self,
+        run_id: str,
+        step: int,
+        tool_name: str,
+        tool_args: dict,
+        response: dict,
+    ) -> Any:
+        """
+        Gate + execute a single tool.
+
+        Returns _HITL_CORRECTION sentinel if the human typed a correction
+        (WorkingMemory already updated; caller must `continue` the ReAct loop).
+        Otherwise returns the observation (str or image block).
+        """
+        approval = await self._gate_tool(run_id, step, tool_name, tool_args, response)
+        if approval is not None:
+            if approval.correction:
+                await self._inject_human_guidance(response, approval.correction, run_id)
+                return _HITL_CORRECTION
+            if not approval.approved:
+                await self._clear_checkpoint(run_id)
+                return f"Tool rejected by human: {approval.correction or 'no reason given'}"
+        obs = await self._execute_tool(tool_name, tool_args)
+        await self._clear_checkpoint(run_id)
+        return obs
+
+    async def _inject_human_guidance(self, response: dict, correction: str, run_id: str) -> None:
+        """Append human correction to WorkingMemory and clear the checkpoint."""
+        await self._working_memory.append("assistant", json.dumps(response))
+        await self._working_memory.append("user", f"Human guidance: {correction}")
+        await self._clear_checkpoint(run_id)
+
+    async def _clear_checkpoint(self, run_id: str) -> None:
+        if self._approval_store:
+            await self._approval_store.clear_checkpoint(run_id)
+
+    async def _replay_pending_step(
+        self,
+        run_id: str,
+        pending: dict,
+    ) -> AsyncGenerator[BusEvent, None]:
+        """Re-prompt approval for a step interrupted by a crash, then complete it."""
+        from harness.hitl import ApprovalRequest, request_approval
+
+        tool_name = pending["tool"]
+        tool_args = pending["args"]
+        step = pending["step"]
+        llm_response = pending["llm_response"]
+
+        approval = await request_approval(
+            ApprovalRequest(
+                approval_id=pending["approval_id"],
+                run_id=run_id,
+                agent_id=self.config.agent_id,
+                tool=tool_name,
+                args=tool_args,
+                step=step,
+                timestamp=datetime.now(timezone.utc).isoformat(),
+            ),
+            self._approval_store,
+            self._guard,
+        )
+
+        if approval.correction:
+            await self._inject_human_guidance(llm_response, approval.correction, run_id)
+            return
+
+        observation = (
+            await self._execute_tool(tool_name, tool_args)
+            if approval.approved
+            else f"Tool rejected by human: {approval.correction or 'no reason given'}"
+        )
+        obs_display = "[image]" if _is_image_block(observation) else str(observation)[:500]
+        yield BusEvent(
+            type=EventType.OBSERVATION,
+            agent_id=self.config.agent_id,
+            payload={"step": step, "tool": tool_name, "observation": obs_display},
+        )
+        await self._working_memory.append("assistant", json.dumps(llm_response))
+        if _is_image_block(observation):
+            await self._working_memory.append(
+                "user",
+                [{"type": "text", "text": f"Observation ({tool_name}):"}, observation],
+            )
+        else:
+            obs_text = (
+                json.dumps(observation, default=str)
+                if not isinstance(observation, str)
+                else observation
+            )
+            await self._working_memory.append("user", f"Observation: {obs_text}")
+        await self._clear_checkpoint(run_id)
 
 
 # ── Response normalization (module-level for testability) ────────────────────

@@ -162,6 +162,49 @@ class WorkingMemory:
         self._messages.clear()
         self._token_total = 0
 
+    def to_dict(self) -> dict:
+        """Serialize to a JSON-safe dict for checkpoint storage."""
+        return {
+            "messages": [
+                {
+                    "role": m.role,
+                    "content": m.content,
+                    "pinned": m.pinned,
+                    "token_count": m.token_count,
+                }
+                for m in self._messages
+            ],
+            "summarization_count": self._summarization_count,
+            "max_tokens": self.max_tokens,
+            "summarize_ratio": self.summarize_ratio,
+        }
+
+    @classmethod
+    def from_dict(
+        cls,
+        data: dict,
+        llm: LLMClient,
+        token_counter: Callable[[str], int] | None = None,
+    ) -> WorkingMemory:
+        """Restore from a checkpoint dict. Stored token counts are reused as-is."""
+        wm = cls(
+            llm=llm,
+            max_tokens=data["max_tokens"],
+            summarize_ratio=data["summarize_ratio"],
+            token_counter=token_counter,
+        )
+        for m in data["messages"]:
+            msg = Message(
+                role=m["role"],
+                content=m["content"],
+                pinned=m["pinned"],
+                token_count=m["token_count"],
+            )
+            wm._messages.append(msg)
+        wm._token_total = sum(msg.token_count for msg in wm._messages)
+        wm._summarization_count = data["summarization_count"]
+        return wm
+
     @property
     def summarization_count(self) -> int:
         return self._summarization_count
