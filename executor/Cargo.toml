@@ -1,7 +1,11 @@
 [package]
 name = "ah-executor"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2021"
+description = "Sandboxed subprocess executor for react-agent-harness"
+license = "MIT"
+repository = "https://github.com/ramannanda9/agent-harness"
+documentation = "https://github.com/ramannanda9/agent-harness#executor"
 
 [[bin]]
 name = "ah-executor"
