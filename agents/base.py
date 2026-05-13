@@ -33,7 +33,7 @@ import uuid
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Final
 
 from harness.events import BusEvent, EventType
 from harness.utils import fire
@@ -41,6 +41,10 @@ from memory.manager import MemoryManager
 from memory.working import WorkingMemory
 
 logger = logging.getLogger(__name__)
+
+# Sentinel returned by _run_tool_gated when human injects a correction.
+# Caller must `continue` the ReAct loop — WM is already updated.
+_HITL_CORRECTION: Final = object()
 
 
 # ── Agent Config ──────────────────────────────────────────────────────────────
@@ -322,6 +326,27 @@ class BaseAgent:
             # Act — parallel or single
             parallel_actions = response.get("actions")
             if parallel_actions and isinstance(parallel_actions, list):
+                # Gate each gated tool sequentially before fanning out.
+                # Correction from any one tool aborts the whole batch.
+                approved: list[dict] = []
+                correction_injected = False
+                for act in parallel_actions:
+                    approval = await self._gate_tool(
+                        run_id, step, act.get("tool", ""), act.get("args", {}), response
+                    )
+                    if approval is None or approval.approved:
+                        approved.append(act)
+                    elif approval.correction:
+                        await self._inject_human_guidance(response, approval.correction, run_id)
+                        correction_injected = True
+                        break
+                    # else: rejected — drop from batch silently
+
+                if correction_injected:
+                    continue
+
+                parallel_actions = approved
+
                 # Emit ACTION events first so callers see what's being launched.
                 for act in parallel_actions:
                     yield BusEvent(
@@ -334,13 +359,14 @@ class BaseAgent:
                         },
                     )
 
-                # Fan out all tool calls concurrently.
+                # Fan out all approved tool calls concurrently.
                 observations = await asyncio.gather(
                     *[
                         self._execute_tool(act.get("tool", ""), act.get("args", {}))
                         for act in parallel_actions
                     ]
                 )
+                await self._clear_checkpoint(run_id)
 
                 combined: list[dict] = []
                 for i, (act, obs) in enumerate(zip(parallel_actions, observations, strict=False)):
@@ -406,30 +432,11 @@ class BaseAgent:
                     payload={"step": step, "tool": tool_name, "args": tool_args},
                 )
 
-                # HITL gate — only when this tool is in hitl_tools and a store is wired in.
-                if self._approval_store and tool_name in self.config.hitl_tools:
-                    approval = await self._request_hitl_approval(
-                        run_id, step, tool_name, tool_args, response
-                    )
-                    if approval.correction:
-                        # Human steering: skip the tool, inject correction, continue loop.
-                        await self._working_memory.append("assistant", json.dumps(response))
-                        await self._working_memory.append(
-                            "user", f"Human guidance: {approval.correction}"
-                        )
-                        await self._clear_checkpoint(run_id)
-                        continue
-                    if not approval.approved:
-                        observation = (
-                            f"Tool rejected by human: {approval.correction or 'no reason given'}"
-                        )
-                    else:
-                        observation = await self._execute_tool(tool_name, tool_args)
-                else:
-                    observation = await self._execute_tool(tool_name, tool_args)
-
-                if self._approval_store:
-                    await self._clear_checkpoint(run_id)
+                observation = await self._run_tool_gated(
+                    run_id, step, tool_name, tool_args, response
+                )
+                if observation is _HITL_CORRECTION:
+                    continue
 
                 obs_display = "[image]" if _is_image_block(observation) else str(observation)[:500]
                 self._tracer.log(
@@ -590,7 +597,7 @@ class BaseAgent:
             "metadata": {},
         }
 
-    async def _request_hitl_approval(
+    async def _gate_tool(
         self,
         run_id: str,
         step: int,
@@ -598,19 +605,18 @@ class BaseAgent:
         tool_args: dict,
         llm_response: dict,
     ):
+        """
+        Run the HITL approval gate for one tool.
+
+        Returns ApprovalResponse if the tool is gated, None if not.
+        Writes a crash-resumable checkpoint to the store before blocking on stdin.
+        """
+        if not (self._approval_store and tool_name in self.config.hitl_tools):
+            return None
+
         from harness.hitl import ApprovalRequest, request_approval
 
         approval_id = str(uuid.uuid4())
-        req = ApprovalRequest(
-            approval_id=approval_id,
-            run_id=run_id,
-            agent_id=self.config.agent_id,
-            tool=tool_name,
-            args=tool_args,
-            step=step,
-            timestamp=datetime.now(timezone.utc).isoformat(),
-        )
-        # Checkpoint before awaiting human input so a crash can be resumed.
         await self._approval_store.write_checkpoint(
             run_id,
             {
@@ -628,7 +634,52 @@ class BaseAgent:
                 },
             },
         )
-        return await request_approval(req, self._approval_store, self._guard)
+        return await request_approval(
+            ApprovalRequest(
+                approval_id=approval_id,
+                run_id=run_id,
+                agent_id=self.config.agent_id,
+                tool=tool_name,
+                args=tool_args,
+                step=step,
+                timestamp=datetime.now(timezone.utc).isoformat(),
+            ),
+            self._approval_store,
+            self._guard,
+        )
+
+    async def _run_tool_gated(
+        self,
+        run_id: str,
+        step: int,
+        tool_name: str,
+        tool_args: dict,
+        response: dict,
+    ) -> Any:
+        """
+        Gate + execute a single tool.
+
+        Returns _HITL_CORRECTION sentinel if the human typed a correction
+        (WorkingMemory already updated; caller must `continue` the ReAct loop).
+        Otherwise returns the observation (str or image block).
+        """
+        approval = await self._gate_tool(run_id, step, tool_name, tool_args, response)
+        if approval is not None:
+            if approval.correction:
+                await self._inject_human_guidance(response, approval.correction, run_id)
+                return _HITL_CORRECTION
+            if not approval.approved:
+                await self._clear_checkpoint(run_id)
+                return f"Tool rejected by human: {approval.correction or 'no reason given'}"
+        obs = await self._execute_tool(tool_name, tool_args)
+        await self._clear_checkpoint(run_id)
+        return obs
+
+    async def _inject_human_guidance(self, response: dict, correction: str, run_id: str) -> None:
+        """Append human correction to WorkingMemory and clear the checkpoint."""
+        await self._working_memory.append("assistant", json.dumps(response))
+        await self._working_memory.append("user", f"Human guidance: {correction}")
+        await self._clear_checkpoint(run_id)
 
     async def _clear_checkpoint(self, run_id: str) -> None:
         if self._approval_store:
@@ -639,7 +690,7 @@ class BaseAgent:
         run_id: str,
         pending: dict,
     ) -> AsyncGenerator[BusEvent, None]:
-        """Re-run the interrupted step on resume, re-prompting for approval."""
+        """Re-prompt approval for a step interrupted by a crash, then complete it."""
         from harness.hitl import ApprovalRequest, request_approval
 
         tool_name = pending["tool"]
@@ -647,46 +698,48 @@ class BaseAgent:
         step = pending["step"]
         llm_response = pending["llm_response"]
 
-        req = ApprovalRequest(
-            approval_id=pending["approval_id"],
-            run_id=run_id,
-            agent_id=self.config.agent_id,
-            tool=tool_name,
-            args=tool_args,
-            step=step,
-            timestamp=datetime.now(timezone.utc).isoformat(),
+        approval = await request_approval(
+            ApprovalRequest(
+                approval_id=pending["approval_id"],
+                run_id=run_id,
+                agent_id=self.config.agent_id,
+                tool=tool_name,
+                args=tool_args,
+                step=step,
+                timestamp=datetime.now(timezone.utc).isoformat(),
+            ),
+            self._approval_store,
+            self._guard,
         )
-        approval = await request_approval(req, self._approval_store, self._guard)
 
         if approval.correction:
-            await self._working_memory.append("assistant", json.dumps(llm_response))
-            await self._working_memory.append("user", f"Human guidance: {approval.correction}")
-        else:
-            observation = (
-                await self._execute_tool(tool_name, tool_args)
-                if approval.approved
-                else f"Tool rejected by human: {approval.correction or 'no reason given'}"
-            )
-            obs_display = "[image]" if _is_image_block(observation) else str(observation)[:500]
-            yield BusEvent(
-                type=EventType.OBSERVATION,
-                agent_id=self.config.agent_id,
-                payload={"step": step, "tool": tool_name, "observation": obs_display},
-            )
-            await self._working_memory.append("assistant", json.dumps(llm_response))
-            if _is_image_block(observation):
-                await self._working_memory.append(
-                    "user",
-                    [{"type": "text", "text": f"Observation ({tool_name}):"}, observation],
-                )
-            else:
-                obs_text = (
-                    json.dumps(observation, default=str)
-                    if not isinstance(observation, str)
-                    else observation
-                )
-                await self._working_memory.append("user", f"Observation: {obs_text}")
+            await self._inject_human_guidance(llm_response, approval.correction, run_id)
+            return
 
+        observation = (
+            await self._execute_tool(tool_name, tool_args)
+            if approval.approved
+            else f"Tool rejected by human: {approval.correction or 'no reason given'}"
+        )
+        obs_display = "[image]" if _is_image_block(observation) else str(observation)[:500]
+        yield BusEvent(
+            type=EventType.OBSERVATION,
+            agent_id=self.config.agent_id,
+            payload={"step": step, "tool": tool_name, "observation": obs_display},
+        )
+        await self._working_memory.append("assistant", json.dumps(llm_response))
+        if _is_image_block(observation):
+            await self._working_memory.append(
+                "user",
+                [{"type": "text", "text": f"Observation ({tool_name}):"}, observation],
+            )
+        else:
+            obs_text = (
+                json.dumps(observation, default=str)
+                if not isinstance(observation, str)
+                else observation
+            )
+            await self._working_memory.append("user", f"Observation: {obs_text}")
         await self._clear_checkpoint(run_id)
 
 
