@@ -36,6 +36,25 @@ def count_tokens(text: str) -> int:
     return max(1, len(text) // 4) if text else 0
 
 
+# Rough token cost for a single image block regardless of resolution.
+# GPT-4o "auto" detail ≈ 85–1700 tokens depending on size; 500 is a conservative
+# mid-point that avoids under-counting without being too aggressive.
+_IMAGE_TOKEN_ESTIMATE = 500
+
+
+def _count_content(content: str | list, counter: Callable[[str], int]) -> int:
+    """Token count for a message whose content may be a string or a content-block list."""
+    if isinstance(content, str):
+        return counter(content)
+    total = sum(
+        counter(block.get("text", ""))
+        if isinstance(block, dict) and block.get("type") == "text"
+        else _IMAGE_TOKEN_ESTIMATE
+        for block in content
+    )
+    return max(1, total) if total else 0
+
+
 # ── LLM Protocol — injected, not imported ─────────────────────────────────────
 
 
@@ -50,6 +69,25 @@ class LLMClient(Protocol):
 
 # ── Working Memory ────────────────────────────────────────────────────────────
 
+
+def _format_for_summary(m: Message) -> str:
+    """Render a message as plain text for the summarization LLM.
+
+    Image content blocks are replaced with the literal string "[image]" so the
+    summarizer LLM (which may be text-only) can still produce a useful summary
+    that acknowledges the image was present without trying to decode it.
+    """
+    if isinstance(m.content, str):
+        return f"[{m.role.upper()}]: {m.content}"
+    parts = []
+    for block in m.content:
+        if isinstance(block, dict) and block.get("type") == "text":
+            parts.append(block.get("text", ""))
+        else:
+            parts.append("[image]")
+    return f"[{m.role.upper()}]: {''.join(parts)}"
+
+
 SUMMARIZE_SYSTEM = """
 You are a memory compressor for an AI agent.
 Summarize the provided conversation messages into a single, dense paragraph.
@@ -62,7 +100,7 @@ Output ONLY the summary paragraph — no preamble, no labels.
 @dataclass
 class Message:
     role: str  # system | user | assistant
-    content: str
+    content: str | list  # str for text; list of content blocks for multimodal
     token_count: int = 0  # set by WorkingMemory.append using its configured counter
     pinned: bool = False  # pinned messages are never evicted (e.g. system prompt)
 
@@ -101,12 +139,12 @@ class WorkingMemory:
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    async def append(self, role: str, content: str, pinned: bool = False) -> None:
+    async def append(self, role: str, content: str | list, pinned: bool = False) -> None:
         msg = Message(
             role=role,
             content=content,
             pinned=pinned,
-            token_count=self._count(content),
+            token_count=_count_content(content, self._count),
         )
         self._messages.append(msg)
         self._token_total += msg.token_count
@@ -180,7 +218,7 @@ class WorkingMemory:
                 break  # nothing left to drop
 
     async def _summarize(self, messages: list[Message]) -> str:
-        formatted = "\n".join(f"[{m.role.upper()}]: {m.content}" for m in messages)
+        formatted = "\n".join(_format_for_summary(m) for m in messages)
         try:
             result = await self._llm.complete(
                 system=SUMMARIZE_SYSTEM,

@@ -278,6 +278,7 @@ class BaseAgent:
                 for i, (act, obs) in enumerate(zip(parallel_actions, observations, strict=False)):
                     tool_name = act.get("tool", "")
                     tool_args = act.get("args", {})
+                    obs_display = "[image]" if _is_image_block(obs) else str(obs)[:500]
                     self._tracer.log(
                         "action",
                         self.config.agent_id,
@@ -285,16 +286,16 @@ class BaseAgent:
                             "step": step,
                             "tool": tool_name,
                             "args": tool_args,
-                            "observation": str(obs)[:500],
+                            "observation": obs_display,
                         },
                     )
                     yield BusEvent(
                         type=EventType.OBSERVATION,
                         agent_id=self.config.agent_id,
-                        payload={"step": step, "tool": tool_name, "observation": str(obs)[:500]},
+                        payload={"step": step, "tool": tool_name, "observation": obs_display},
                     )
-                    combined.append({"tool": tool_name, "result": obs})
-                    if obs and not isinstance(obs, str):
+                    combined.append({"tool": tool_name, "result": obs_display})
+                    if obs and not isinstance(obs, str) and not _is_image_block(obs):
                         fire(
                             self._memory.write_working_fact(
                                 run_id=run_id,
@@ -305,10 +306,28 @@ class BaseAgent:
                         )
 
                 await self._working_memory.append("assistant", json.dumps(response))
-                await self._working_memory.append(
-                    "user",
-                    f"Observations:\n{json.dumps(combined, default=str)}",
-                )
+                # Inject image observations as content blocks; text observations as a string.
+                image_blocks = [
+                    (act.get("tool", ""), obs)
+                    for act, obs in zip(parallel_actions, observations, strict=False)
+                    if _is_image_block(obs)
+                ]
+                if image_blocks:
+                    content: list = [
+                        {
+                            "type": "text",
+                            "text": f"Observations:\n{json.dumps(combined, default=str)}",
+                        }
+                    ]
+                    for tool_name_img, img_block in image_blocks:
+                        content.append({"type": "text", "text": f"\nImage from {tool_name_img}:"})
+                        content.append(img_block)
+                    await self._working_memory.append("user", content)
+                else:
+                    await self._working_memory.append(
+                        "user",
+                        f"Observations:\n{json.dumps(combined, default=str)}",
+                    )
             else:
                 # Single action path.
                 tool_name = response.get("action", "")
@@ -321,6 +340,7 @@ class BaseAgent:
 
                 observation = await self._execute_tool(tool_name, tool_args)
 
+                obs_display = "[image]" if _is_image_block(observation) else str(observation)[:500]
                 self._tracer.log(
                     "action",
                     self.config.agent_id,
@@ -328,7 +348,7 @@ class BaseAgent:
                         "step": step,
                         "tool": tool_name,
                         "args": tool_args,
-                        "observation": str(observation)[:500],
+                        "observation": obs_display,
                     },
                 )
                 yield BusEvent(
@@ -337,11 +357,15 @@ class BaseAgent:
                     payload={
                         "step": step,
                         "tool": tool_name,
-                        "observation": str(observation)[:500],
+                        "observation": obs_display,
                     },
                 )
 
-                if observation and not isinstance(observation, str):
+                if (
+                    observation
+                    and not isinstance(observation, str)
+                    and not _is_image_block(observation)
+                ):
                     fire(
                         self._memory.write_working_fact(
                             run_id=run_id,
@@ -351,13 +375,22 @@ class BaseAgent:
                         )
                     )
 
-                obs_text = (
-                    json.dumps(observation, default=str)
-                    if not isinstance(observation, str)
-                    else observation
-                )
                 await self._working_memory.append("assistant", json.dumps(response))
-                await self._working_memory.append("user", f"Observation: {obs_text}")
+                if _is_image_block(observation):
+                    await self._working_memory.append(
+                        "user",
+                        [
+                            {"type": "text", "text": f"Observation ({tool_name}):"},
+                            observation,
+                        ],
+                    )
+                else:
+                    obs_text = (
+                        json.dumps(observation, default=str)
+                        if not isinstance(observation, str)
+                        else observation
+                    )
+                    await self._working_memory.append("user", f"Observation: {obs_text}")
 
         # Max steps exhausted.
         yield BusEvent(
@@ -470,6 +503,11 @@ def _normalize_response(response: Any) -> dict | None:
     else:
         text = str(response).strip()
     return _parse_action_json(text)
+
+
+def _is_image_block(obs: Any) -> bool:
+    """True when a tool observation is an OpenAI-style image content block."""
+    return isinstance(obs, dict) and obs.get("type") in ("image_url", "image")
 
 
 def _parse_action_json(text: str) -> dict | None:
