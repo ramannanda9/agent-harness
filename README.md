@@ -1,4 +1,4 @@
-# agent-harness
+# react-agent-harness
 
 Bring-your-own-LLM multi-agent harness: hybrid DAG planning with replan-on-failure,
 two-tier memory (semantic KV + episodic vector), and a streaming-primary event model.
