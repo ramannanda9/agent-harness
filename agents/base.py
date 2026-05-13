@@ -32,6 +32,7 @@ import logging
 import uuid
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 from harness.events import BusEvent, EventType
@@ -55,6 +56,11 @@ class AgentConfig:
     memory_context_enabled: bool = True
     confidence_from_llm: bool = True  # if False, confidence=1.0 on success
     working_memory_max_tokens: int = 8000  # WorkingMemory eviction threshold; tune per agent
+    hitl_tools: list[str] = None  # tools requiring human approval; None = no HITL
+
+    def __post_init__(self):
+        if self.hitl_tools is None:
+            self.hitl_tools = []
 
 
 # ── ReAct Response Schema ─────────────────────────────────────────────────────
@@ -119,6 +125,7 @@ class BaseAgent:
         tracer,
         guard,
         llm,
+        approval_store: Any | None = None,  # RedisApprovalStore — enables HITL + resume
     ) -> None:
         self.config = config
         self.role = config.role  # exposed for orchestrator planner prompt
@@ -127,7 +134,9 @@ class BaseAgent:
         self._tracer = tracer
         self._guard = guard
         self._llm = llm
+        self._approval_store = approval_store
         self._working_memory: WorkingMemory | None = None
+        self._task: str = ""
         self._last_think_error: str | None = None
 
     # ── Streaming entry point (canonical) ─────────────────────────────────────
@@ -138,6 +147,7 @@ class BaseAgent:
         run_id: str | None = None,
     ) -> AsyncGenerator[BusEvent, None]:
         run_id = run_id or str(uuid.uuid4())
+        self._task = task
         self._working_memory = WorkingMemory(
             llm=self._llm,
             max_tokens=self.config.working_memory_max_tokens,
@@ -147,8 +157,37 @@ class BaseAgent:
         await self._working_memory.append("system", system, pinned=True)
         await self._working_memory.append("user", task)
 
+        async for event in self._run_stream_internal(run_id):
+            yield event
+
+    async def _resume_stream(
+        self,
+        run_id: str,
+        start_step: int,
+        pending: dict | None = None,
+    ) -> AsyncGenerator[BusEvent, None]:
+        """
+        Re-enter the ReAct loop from a checkpoint.
+
+        If pending is set, the last step was interrupted mid-approval.
+        The approval prompt is shown again; once the human responds the
+        tool runs (or the correction is injected) before the loop continues.
+        """
+        if pending:
+            async for event in self._replay_pending_step(run_id, pending):
+                yield event
+            start_step = pending["step"] + 1
+
+        async for event in self._run_stream_internal(run_id, start_step=start_step):
+            yield event
+
+    async def _run_stream_internal(
+        self,
+        run_id: str,
+        start_step: int = 0,
+    ) -> AsyncGenerator[BusEvent, None]:
         try:
-            async for event in self._react_stream(run_id):
+            async for event in self._react_stream(run_id, start_step=start_step):
                 yield event
         except Exception as e:
             logger.exception("Agent %s stream crashed", self.config.agent_id)
@@ -158,8 +197,6 @@ class BaseAgent:
                 error=str(e),
             )
         finally:
-            # Always log trajectory so AnnotationHook can capture it regardless
-            # of whether the run succeeded, errored, or was cancelled.
             if self._working_memory is not None:
                 self._tracer.log(
                     "trajectory",
@@ -205,8 +242,10 @@ class BaseAgent:
 
     # ── ReAct Loop (stream) ───────────────────────────────────────────────────
 
-    async def _react_stream(self, run_id: str) -> AsyncGenerator[BusEvent, None]:
-        for step in range(self.config.max_steps):
+    async def _react_stream(
+        self, run_id: str, start_step: int = 0
+    ) -> AsyncGenerator[BusEvent, None]:
+        for step in range(start_step, self.config.max_steps):
             self._guard.check()
 
             # Think — yields TOKEN events when the LLM client supports streaming.
@@ -367,7 +406,30 @@ class BaseAgent:
                     payload={"step": step, "tool": tool_name, "args": tool_args},
                 )
 
-                observation = await self._execute_tool(tool_name, tool_args)
+                # HITL gate — only when this tool is in hitl_tools and a store is wired in.
+                if self._approval_store and tool_name in self.config.hitl_tools:
+                    approval = await self._request_hitl_approval(
+                        run_id, step, tool_name, tool_args, response
+                    )
+                    if approval.correction:
+                        # Human steering: skip the tool, inject correction, continue loop.
+                        await self._working_memory.append("assistant", json.dumps(response))
+                        await self._working_memory.append(
+                            "user", f"Human guidance: {approval.correction}"
+                        )
+                        await self._clear_checkpoint(run_id)
+                        continue
+                    if not approval.approved:
+                        observation = (
+                            f"Tool rejected by human: {approval.correction or 'no reason given'}"
+                        )
+                    else:
+                        observation = await self._execute_tool(tool_name, tool_args)
+                else:
+                    observation = await self._execute_tool(tool_name, tool_args)
+
+                if self._approval_store:
+                    await self._clear_checkpoint(run_id)
 
                 obs_display = "[image]" if _is_image_block(observation) else str(observation)[:500]
                 self._tracer.log(
@@ -527,6 +589,105 @@ class BaseAgent:
             "error": reason,
             "metadata": {},
         }
+
+    async def _request_hitl_approval(
+        self,
+        run_id: str,
+        step: int,
+        tool_name: str,
+        tool_args: dict,
+        llm_response: dict,
+    ):
+        from harness.hitl import ApprovalRequest, request_approval
+
+        approval_id = str(uuid.uuid4())
+        req = ApprovalRequest(
+            approval_id=approval_id,
+            run_id=run_id,
+            agent_id=self.config.agent_id,
+            tool=tool_name,
+            args=tool_args,
+            step=step,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+        )
+        # Checkpoint before awaiting human input so a crash can be resumed.
+        await self._approval_store.write_checkpoint(
+            run_id,
+            {
+                "run_id": run_id,
+                "agent_id": self.config.agent_id,
+                "task": self._task,
+                "step": step,
+                "memory": self._working_memory.to_dict(),
+                "pending": {
+                    "approval_id": approval_id,
+                    "tool": tool_name,
+                    "args": tool_args,
+                    "step": step,
+                    "llm_response": llm_response,
+                },
+            },
+        )
+        return await request_approval(req, self._approval_store, self._guard)
+
+    async def _clear_checkpoint(self, run_id: str) -> None:
+        if self._approval_store:
+            await self._approval_store.clear_checkpoint(run_id)
+
+    async def _replay_pending_step(
+        self,
+        run_id: str,
+        pending: dict,
+    ) -> AsyncGenerator[BusEvent, None]:
+        """Re-run the interrupted step on resume, re-prompting for approval."""
+        from harness.hitl import ApprovalRequest, request_approval
+
+        tool_name = pending["tool"]
+        tool_args = pending["args"]
+        step = pending["step"]
+        llm_response = pending["llm_response"]
+
+        req = ApprovalRequest(
+            approval_id=pending["approval_id"],
+            run_id=run_id,
+            agent_id=self.config.agent_id,
+            tool=tool_name,
+            args=tool_args,
+            step=step,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+        )
+        approval = await request_approval(req, self._approval_store, self._guard)
+
+        if approval.correction:
+            await self._working_memory.append("assistant", json.dumps(llm_response))
+            await self._working_memory.append("user", f"Human guidance: {approval.correction}")
+        else:
+            observation = (
+                await self._execute_tool(tool_name, tool_args)
+                if approval.approved
+                else f"Tool rejected by human: {approval.correction or 'no reason given'}"
+            )
+            obs_display = "[image]" if _is_image_block(observation) else str(observation)[:500]
+            yield BusEvent(
+                type=EventType.OBSERVATION,
+                agent_id=self.config.agent_id,
+                payload={"step": step, "tool": tool_name, "observation": obs_display},
+            )
+            await self._working_memory.append("assistant", json.dumps(llm_response))
+            if _is_image_block(observation):
+                await self._working_memory.append(
+                    "user",
+                    [{"type": "text", "text": f"Observation ({tool_name}):"}, observation],
+                )
+            else:
+                obs_text = (
+                    json.dumps(observation, default=str)
+                    if not isinstance(observation, str)
+                    else observation
+                )
+                await self._working_memory.append("user", f"Observation: {obs_text}")
+
+        await self._clear_checkpoint(run_id)
 
 
 # ── Response normalization (module-level for testability) ────────────────────

@@ -155,18 +155,34 @@ class BudgetGuard:
     """
     Hard budget limits enforced on every check() call.
     Call check() at the start of each ReAct step and each orchestration loop.
+
+    suspend() / resume() pause the wall-time clock (e.g. during HITL waits)
+    so human think-time is not counted against the agent's time budget.
     """
 
     def __init__(self, config: GuardrailConfig) -> None:
         self.config = config
         self._cost: float = 0.0
         self._start: float = time.time()
+        self._suspended_seconds: float = 0.0
+        self._suspend_at: float | None = None
 
     def add_cost(self, usd: float) -> None:
         self._cost += usd
 
+    def suspend(self) -> None:
+        """Pause the wall-time clock. Safe to call multiple times; only the first has effect."""
+        if self._suspend_at is None:
+            self._suspend_at = time.time()
+
+    def resume(self) -> None:
+        """Resume the wall-time clock after a suspend()."""
+        if self._suspend_at is not None:
+            self._suspended_seconds += time.time() - self._suspend_at
+            self._suspend_at = None
+
     def check(self) -> None:
-        elapsed = time.time() - self._start
+        elapsed = time.time() - self._start - self._suspended_seconds
         if self._cost > self.config.max_total_cost_usd:
             raise RuntimeError(
                 f"Cost budget exceeded: ${self._cost:.4f} > ${self.config.max_total_cost_usd}"
@@ -178,7 +194,7 @@ class BudgetGuard:
 
     @property
     def elapsed(self) -> float:
-        return time.time() - self._start
+        return time.time() - self._start - self._suspended_seconds
 
     @property
     def cost(self) -> float:
@@ -267,6 +283,7 @@ class AgentRuntime:
         guardrail_config: GuardrailConfig | None = None,
         enable_otel: bool = False,
         annotation_store: Any | None = None,  # InMemoryAnnotationStore or compatible
+        approval_store: Any | None = None,  # RedisApprovalStore — enables HITL + resume
     ) -> None:
         self._agent_registry = agent_registry
         self._tool_registry = tool_registry
@@ -275,6 +292,7 @@ class AgentRuntime:
         self._guardrail_config = guardrail_config or GuardrailConfig()
         self._enable_otel = enable_otel
         self._annotation_store = annotation_store
+        self._approval_store = approval_store
 
     def _make_tracer(self) -> Tracer:
         """Create a fresh Tracer, attaching configured hooks."""
@@ -308,9 +326,67 @@ class AgentRuntime:
             tracer=tracer,
             guard=guard,
             llm=self._llm,
+            approval_store=self._approval_store,
         )
         async for event in agent.run_stream(task, run_id=run_id):
             yield event
+
+    async def resume_agent(self, run_id: str) -> dict:
+        """
+        Restore and continue an agent run from a Redis checkpoint.
+
+        Call this after a process crash or Ctrl-C to re-present any pending
+        HITL approval prompt and continue the ReAct loop from the saved step.
+
+        Requires approval_store to have been passed to AgentRuntime.
+        """
+        from agents.base import BaseAgent
+        from harness.events import EventType
+
+        if self._approval_store is None:
+            raise RuntimeError("resume_agent requires approval_store")
+
+        checkpoint = await self._approval_store.get_checkpoint(run_id)
+        if checkpoint is None:
+            raise KeyError(f"No checkpoint found for run_id={run_id!r}")
+
+        from memory.working import WorkingMemory
+
+        wm = WorkingMemory.from_dict(checkpoint["memory"], llm=self._llm)
+
+        config = self._agent_registry.get(checkpoint["agent_id"])
+        guard = BudgetGuard(self._guardrail_config)
+        if hasattr(self._llm, "set_budget"):
+            self._llm.set_budget(guard)
+        tracer = self._make_tracer()
+
+        agent = BaseAgent(
+            config=config,
+            tools=self._tool_registry.get_subset(config.allowed_tools),
+            memory=self._memory,
+            tracer=tracer,
+            guard=guard,
+            llm=self._llm,
+            approval_store=self._approval_store,
+        )
+        agent._working_memory = wm
+        agent._task = checkpoint["task"]
+
+        tracer.start_run(run_id, checkpoint["task"])
+        result: dict = {}
+        try:
+            async for event in agent._resume_stream(
+                run_id=run_id,
+                start_step=checkpoint["step"],
+                pending=checkpoint.get("pending"),
+            ):
+                if event.type == EventType.TASK_DONE:
+                    result = event.payload
+                elif event.type == EventType.ERROR:
+                    result = {"answer": "", "confidence": 0.0, "error": event.error}
+        finally:
+            tracer.end_run()
+        return result
 
     def _build_orchestrator(self):
         """Construct fresh tracer, guard, agents, and orchestrator for one run."""
