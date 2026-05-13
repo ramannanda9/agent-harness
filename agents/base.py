@@ -157,6 +157,19 @@ class BaseAgent:
                 agent_id=self.config.agent_id,
                 error=str(e),
             )
+        finally:
+            # Always log trajectory so AnnotationHook can capture it regardless
+            # of whether the run succeeded, errored, or was cancelled.
+            if self._working_memory is not None:
+                self._tracer.log(
+                    "trajectory",
+                    self.config.agent_id,
+                    {
+                        "run_id": run_id,
+                        "messages": self._working_memory.get_messages(),
+                        "summarization_count": self._working_memory.summarization_count,
+                    },
+                )
 
     # ── Blocking entry point (thin drain) ─────────────────────────────────────
 
@@ -207,6 +220,11 @@ class BaseAgent:
 
             if response is None:
                 reason = self._last_think_error or "LLM returned unparseable response"
+                self._tracer.log(
+                    "task_result",
+                    self.config.agent_id,
+                    {"answer": "", "confidence": 0.0, "steps": step, "error": reason},
+                )
                 yield BusEvent(
                     type=EventType.ERROR,
                     agent_id=self.config.agent_id,
@@ -226,6 +244,7 @@ class BaseAgent:
 
             # Finish?
             if response.get("action") == "finish":
+                await self._working_memory.append("assistant", json.dumps(response))
                 result = {
                     "agent_id": self.config.agent_id,
                     "answer": response.get("answer", ""),
@@ -243,6 +262,16 @@ class BaseAgent:
                     result["steps"],
                     result["confidence"],
                     self._working_memory.summarization_count,
+                )
+                self._tracer.log(
+                    "task_result",
+                    self.config.agent_id,
+                    {
+                        "answer": result["answer"],
+                        "confidence": result["confidence"],
+                        "steps": result["steps"],
+                        "error": "",
+                    },
                 )
                 yield BusEvent(
                     type=EventType.TASK_DONE,
@@ -393,6 +422,16 @@ class BaseAgent:
                     await self._working_memory.append("user", f"Observation: {obs_text}")
 
         # Max steps exhausted.
+        self._tracer.log(
+            "task_result",
+            self.config.agent_id,
+            {
+                "answer": "",
+                "confidence": 0.0,
+                "steps": self.config.max_steps,
+                "error": f"Max steps ({self.config.max_steps}) reached",
+            },
+        )
         yield BusEvent(
             type=EventType.ERROR,
             agent_id=self.config.agent_id,

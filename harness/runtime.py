@@ -266,6 +266,7 @@ class AgentRuntime:
         llm: Any,
         guardrail_config: GuardrailConfig | None = None,
         enable_otel: bool = False,
+        annotation_store: Any | None = None,  # InMemoryAnnotationStore or compatible
     ) -> None:
         self._agent_registry = agent_registry
         self._tool_registry = tool_registry
@@ -273,14 +274,19 @@ class AgentRuntime:
         self._llm = llm
         self._guardrail_config = guardrail_config or GuardrailConfig()
         self._enable_otel = enable_otel
+        self._annotation_store = annotation_store
 
     def _make_tracer(self) -> Tracer:
-        """Create a fresh Tracer, attaching the OTEL hook when enabled."""
+        """Create a fresh Tracer, attaching configured hooks."""
         tracer = Tracer()
         if self._enable_otel:
             from harness.otel import OTELHook
 
             tracer.add_hook(OTELHook())
+        if self._annotation_store is not None:
+            from harness.annotation import AnnotationHook
+
+            tracer.add_hook(AnnotationHook(self._annotation_store))
         return tracer
 
     async def _run_agent_with_tracer(self, agent_id: str, task: str, tracer: Tracer, run_id: str):
@@ -311,12 +317,7 @@ class AgentRuntime:
         from agents.base import BaseAgent
         from orchestrator.planner import EvalConfig, Orchestrator
 
-        tracer = Tracer()
-
-        if self._enable_otel:
-            from harness.otel import OTELHook
-
-            tracer.add_hook(OTELHook())
+        tracer = self._make_tracer()
         guard = BudgetGuard(self._guardrail_config)
 
         # Adapters that implement set_budget(guard) (e.g. OpenAILLM) get the
