@@ -421,6 +421,7 @@ class AgentRuntime:
                 tracer=tracer,
                 guard=guard,
                 llm=self._llm,
+                approval_store=self._approval_store,
             )
             for agent_id in self._agent_registry.all_ids()
         }
