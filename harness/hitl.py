@@ -31,8 +31,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import sys
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -88,7 +90,86 @@ class ApprovalResponse:
     correction: str | None = None  # non-None → steering; tool is skipped
 
 
-# ── Redis store ───────────────────────────────────────────────────────────────
+# ── File store (default, zero deps) ──────────────────────────────────────────
+
+
+class FileApprovalStore:
+    """
+    Default approval store — persists checkpoints as JSON files.
+
+    Zero dependencies. One file per run at <checkpoint_dir>/<run_id>.json.
+    Old files are not cleaned up automatically; run
+        FileApprovalStore.purge_old(days=7)
+    periodically if you want automatic expiry.
+
+    Usage (no args needed for the default location):
+        store = FileApprovalStore()                          # ~/.agent-harness/checkpoints/
+        store = FileApprovalStore("/var/lib/myapp/hitl")    # custom dir
+    """
+
+    def __init__(self, checkpoint_dir: str | Path | None = None) -> None:
+        self._dir = Path(
+            checkpoint_dir
+            or os.environ.get("HITL_CHECKPOINT_DIR", Path.home() / ".agent-harness" / "checkpoints")
+        )
+        self._dir.mkdir(parents=True, exist_ok=True)
+
+    def _path(self, run_id: str) -> Path:
+        return self._dir / f"{run_id}.json"
+
+    async def write_request(self, req: ApprovalRequest) -> None:
+        path = self._path(req.run_id)
+        data = json.loads(path.read_text()) if path.exists() else {}
+        data["request"] = asdict(req)
+        path.write_text(json.dumps(data, default=str, indent=2))
+
+    async def get_request(self, approval_id: str) -> ApprovalRequest | None:
+        # File store indexes by run_id; approval_id is inside the file.
+        # Scan checkpoints for a matching approval_id (rare, only on resume).
+        for p in self._dir.glob("*.json"):
+            try:
+                data = json.loads(p.read_text())
+                req = data.get("request")
+                if req and req.get("approval_id") == approval_id:
+                    return ApprovalRequest(**req)
+            except Exception:
+                continue
+        return None
+
+    async def write_checkpoint(self, run_id: str, checkpoint: dict) -> None:
+        path = self._path(run_id)
+        data = json.loads(path.read_text()) if path.exists() else {}
+        data["checkpoint"] = checkpoint
+        path.write_text(json.dumps(data, default=str, indent=2))
+
+    async def get_checkpoint(self, run_id: str) -> dict | None:
+        path = self._path(run_id)
+        if not path.exists():
+            return None
+        data = json.loads(path.read_text())
+        return data.get("checkpoint")
+
+    async def clear_checkpoint(self, run_id: str) -> None:
+        path = self._path(run_id)
+        if path.exists():
+            path.unlink()
+
+    @classmethod
+    def purge_old(cls, days: int = 7, checkpoint_dir: str | Path | None = None) -> int:
+        """Delete checkpoint files older than `days`. Returns count removed."""
+        import time
+
+        store = cls(checkpoint_dir)
+        cutoff = time.time() - days * 86_400
+        removed = 0
+        for p in store._dir.glob("*.json"):
+            if p.stat().st_mtime < cutoff:
+                p.unlink()
+                removed += 1
+        return removed
+
+
+# ── Redis store (optional, for existing Redis users) ──────────────────────────
 
 
 class RedisApprovalStore:

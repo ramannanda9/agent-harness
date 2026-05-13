@@ -552,19 +552,10 @@ backend that implements the same interface (`write`, `get`, `list_all`,
 ## Human-in-the-Loop (HITL)
 
 Gate specific tool calls behind an interactive CLI prompt. Opt-in per agent via
-`hitl_tools`; zero overhead when unused.
-
-```bash
-pip install -e ".[redis]"
-```
+`hitl_tools`; zero overhead when unused. No extra dependencies — checkpoints
+are stored as JSON files by default.
 
 ```python
-import redis.asyncio as aioredis
-from harness.hitl import RedisApprovalStore
-
-client = aioredis.from_url("redis://localhost:6379", decode_responses=True)
-approval_store = RedisApprovalStore(client)
-
 agents.register(AgentConfig(
     agent_id="file_agent",
     role="manages files",
@@ -573,8 +564,28 @@ agents.register(AgentConfig(
     hitl_tools=["write_file", "delete_file"],   # these two require human approval
 ))
 
-runtime = AgentRuntime(..., approval_store=approval_store)
+# AgentRuntime auto-creates a FileApprovalStore when hitl_tools are present.
+runtime = AgentRuntime(...)
 await runtime.run_agent("file_agent", "clean up the logs directory")
+```
+
+Checkpoints are written to `~/.agent-harness/checkpoints/` by default.
+Override the directory:
+
+```python
+from harness.hitl import FileApprovalStore
+
+runtime = AgentRuntime(..., approval_store=FileApprovalStore("/var/lib/myapp/hitl"))
+```
+
+For Redis-backed storage (shared across processes or machines):
+
+```python
+import redis.asyncio as aioredis
+from harness.hitl import RedisApprovalStore
+
+client = aioredis.from_url("redis://localhost:6379", decode_responses=True)
+runtime = AgentRuntime(..., approval_store=RedisApprovalStore(client))
 ```
 
 When the agent calls `write_file` or `delete_file` a prompt appears:

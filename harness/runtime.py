@@ -283,7 +283,7 @@ class AgentRuntime:
         guardrail_config: GuardrailConfig | None = None,
         enable_otel: bool = False,
         annotation_store: Any | None = None,  # InMemoryAnnotationStore or compatible
-        approval_store: Any | None = None,  # RedisApprovalStore — enables HITL + resume
+        approval_store: Any | None = None,  # FileApprovalStore / RedisApprovalStore
     ) -> None:
         self._agent_registry = agent_registry
         self._tool_registry = tool_registry
@@ -292,6 +292,14 @@ class AgentRuntime:
         self._guardrail_config = guardrail_config or GuardrailConfig()
         self._enable_otel = enable_otel
         self._annotation_store = annotation_store
+        # Auto-create a FileApprovalStore if any agent uses hitl_tools but no
+        # store was passed — zero-dep default, no configuration required.
+        if approval_store is None and any(
+            getattr(agent_registry.get(aid), "hitl_tools", []) for aid in agent_registry.all_ids()
+        ):
+            from harness.hitl import FileApprovalStore
+
+            approval_store = FileApprovalStore()
         self._approval_store = approval_store
 
     def _make_tracer(self) -> Tracer:
