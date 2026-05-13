@@ -13,9 +13,10 @@ Same-session flow:
 Crash / Ctrl-C / kill flow:
   1-3 as above — checkpoint is already durable in Redis.
   4. Process dies.
-  5. Human calls  await runtime.resume_agent(run_id).
-  6. Checkpoint is restored; the same approval prompt is shown again.
-  7. Human responds; run continues from the saved step.
+  5. Banner printed "Resume: python your_script.py --resume <run_id>".
+  6. Human re-runs the same script with --resume <run_id>.
+  7. maybe_resume(runtime) detects the flag, restores checkpoint, re-prompts.
+  8. Human responds; run continues from the saved step.
 
 The UUID printed at the prompt is an audit reference only.
 
@@ -30,12 +31,40 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sys
 from dataclasses import asdict, dataclass
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
 _SEP = "─" * 60
+
+
+# ── Resume helper ─────────────────────────────────────────────────────────────
+
+
+async def maybe_resume(runtime: Any) -> dict | None:
+    """
+    Check sys.argv for --resume <run_id>. If present, restore the checkpoint
+    from Redis and continue the run; return its result dict.
+    Return None if --resume is not in argv so the caller's normal path runs.
+
+    Usage in any script:
+
+        result = await maybe_resume(runtime) or await runtime.run_agent(...)
+
+    The approval banner prints the exact command to paste, e.g.:
+        python my_script.py --resume 3f7a1b2c-...
+    """
+    args = sys.argv[1:]
+    if "--resume" not in args:
+        return None
+    idx = args.index("--resume")
+    if idx + 1 >= len(args):
+        print("Usage: --resume <run_id>", file=sys.stderr)
+        sys.exit(1)
+    run_id = args[idx + 1]
+    return await runtime.resume_agent(run_id)
 
 
 # ── Data model ────────────────────────────────────────────────────────────────
@@ -108,6 +137,7 @@ class RedisApprovalStore:
 
 
 def _print_banner(req: ApprovalRequest) -> None:
+    script = sys.argv[0] if sys.argv else "your_script.py"
     print(f"\n{_SEP}")
     print("  HITL Approval Required")
     print(_SEP)
@@ -116,6 +146,8 @@ def _print_banner(req: ApprovalRequest) -> None:
     print(f"  Agent: {req.agent_id}  step={req.step}")
     print(f"  Run:   {req.run_id}")
     print(f"  ID:    {req.approval_id}")
+    print(_SEP)
+    print(f"  Ctrl-C to pause. Resume: python {script} --resume {req.run_id}")
     print(_SEP)
 
 

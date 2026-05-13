@@ -606,15 +606,26 @@ does not count against `max_wall_time_seconds`.
 ### Crash / Ctrl-C resume
 
 The run checkpoint (step number + full `WorkingMemory`) is written to Redis
-before every approval prompt. If the process is killed:
+before every approval prompt. The banner prints the exact command to resume:
 
-```python
-# In a new process — same runtime configuration
-await runtime.resume_agent("3f7a1b2c-...")   # run_id printed in the banner
+```
+  Ctrl-C to pause. Resume: python my_script.py --resume 3f7a1b2c-...
 ```
 
-The checkpoint is restored, the same approval banner is shown again, and the
-run continues from the saved step. Checkpoints expire after 24 hours (configurable via `RedisApprovalStore(ttl_seconds=...)`).
+Add one line to your script to handle it:
+
+```python
+from harness.hitl import maybe_resume
+
+result = await maybe_resume(runtime) or await runtime.run_agent("agent", "task")
+```
+
+`maybe_resume` checks `sys.argv` for `--resume <run_id>`. If present it
+restores the checkpoint from Redis, re-displays the approval banner, and
+continues the run. If absent it returns `None` so the normal path runs.
+Re-running the same script with `--resume` is all the human needs to do.
+
+Checkpoints expire after 24 hours (configurable via `RedisApprovalStore(ttl_seconds=...)`).
 
 ### Correction steering and replanning
 
