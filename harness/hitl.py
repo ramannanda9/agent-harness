@@ -47,6 +47,31 @@ _SEP = "─" * 60
 # asyncio.Lock() is safe to create at import time in Python ≥ 3.10.
 stdout_lock: asyncio.Lock = asyncio.Lock()
 
+# Process-scoped session allow-list.  Entries are (tool_name, prefix) tuples
+# where prefix is the first word of the primary command arg for shell-like
+# tools, or None for tools with no meaningful sub-command (allow any args).
+_session_allowed: set[tuple[str, str | None]] = set()
+
+
+def _session_key(tool: str, args: dict) -> tuple[str, str | None]:
+    """Return the (tool, prefix) key used for session-allow scoping."""
+    if tool in ("shell", "bash", "run", "exec"):
+        cmd = (args.get("cmd") or args.get("command") or "").strip()
+        prefix = cmd.split()[0] if cmd else None
+        return (tool, prefix)
+    return (tool, None)
+
+
+def is_session_allowed(tool: str, args: dict) -> bool:
+    """True if this tool+args combination has been session-allowed by the human."""
+    return _session_key(tool, args) in _session_allowed
+
+
+def _session_label(tool: str, args: dict) -> str:
+    """Human-readable description of what 'a' would allow."""
+    _, prefix = _session_key(tool, args)
+    return f"{tool} {prefix}" if prefix else tool
+
 
 # ── Resume helper ─────────────────────────────────────────────────────────────
 
@@ -94,6 +119,7 @@ class ApprovalResponse:
     approval_id: str
     approved: bool
     correction: str | None = None  # non-None → steering; tool is skipped
+    session_allow: bool = False  # True → add (tool, prefix) to _session_allowed
 
 
 # ── File store (default, zero deps) ──────────────────────────────────────────
@@ -225,6 +251,7 @@ class RedisApprovalStore:
 
 def _print_banner(req: ApprovalRequest) -> None:
     script = sys.argv[0] if sys.argv else "your_script.py"
+    label = _session_label(req.tool, req.args)
     print(f"\n{_SEP}")
     print("  HITL Approval Required")
     print(_SEP)
@@ -234,6 +261,9 @@ def _print_banner(req: ApprovalRequest) -> None:
     print(f"  Run:   {req.run_id}")
     print(f"  ID:    {req.approval_id}")
     print(_SEP)
+    print(
+        f"  y = approve once  |  a = allow '{label}' for session  |  n = reject  |  <text> = steer"
+    )
     print(f"  Ctrl-C to pause. Resume: python {script} --resume {req.run_id}")
     print(_SEP)
 
@@ -242,6 +272,8 @@ def _parse_stdin(approval_id: str, raw: str) -> ApprovalResponse:
     lo = raw.strip().lower()
     if lo in ("y", "yes"):
         return ApprovalResponse(approval_id=approval_id, approved=True)
+    if lo in ("a", "allow"):
+        return ApprovalResponse(approval_id=approval_id, approved=True, session_allow=True)
     if lo in ("n", "no"):
         return ApprovalResponse(approval_id=approval_id, approved=False)
     return ApprovalResponse(approval_id=approval_id, approved=True, correction=raw.strip() or None)
@@ -274,9 +306,14 @@ async def request_approval(
         guard.suspend()
         try:
             loop = asyncio.get_running_loop()
-            raw = await loop.run_in_executor(None, input, "  Approve? [y/n/correction]: ")
+            raw = await loop.run_in_executor(None, input, "  Approve? [y/n/a/correction]: ")
         finally:
             guard.resume()
 
         print()
-        return _parse_stdin(req.approval_id, raw)
+        resp = _parse_stdin(req.approval_id, raw)
+        if resp.session_allow:
+            key = _session_key(req.tool, req.args)
+            _session_allowed.add(key)
+            print(f"  ✓ '{_session_label(req.tool, req.args)}' allowed for this session\n")
+        return resp
