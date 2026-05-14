@@ -41,7 +41,6 @@ from pathlib import Path
 from agents.base import AgentConfig
 from harness.events import EventType
 from harness.executor_bridge import ExecutorBridge, ExecutorConfig, ExecutorTool, find_executor
-from harness.hitl import maybe_resume
 from harness.llm.openai import OpenAILLM
 from harness.runtime import AgentRegistry, AgentRuntime, GuardrailConfig, ToolRegistry
 from memory.manager import MemoryManager
@@ -173,9 +172,9 @@ async def main() -> None:
     enable_otel = bool(os.environ.get("OTEL_ENABLED"))
     semantic_store, episodic_store, store_label = await _build_stores(None)
 
-    from harness.hitl import FileApprovalStore
+    from harness.checkpoint import FileCheckpointStore
 
-    checkpoint_dir = FileApprovalStore()._dir
+    checkpoint_dir = FileCheckpointStore()._dir
 
     print(_sep("═"))
     print(f"Model:      {MODEL}")
@@ -299,14 +298,9 @@ async def main() -> None:
         audit_runtime = _make_runtime(audit_agents)
         followup_runtime = _make_runtime(followup_agents)
 
-        # ── Resume check ──────────────────────────────────────────────────────
-        # If --resume <run_id> is in sys.argv, restore checkpoint and re-prompt
-        # the pending approval, then continue from the saved step.  The banner
-        # printed the exact command to paste, so the user just re-runs with that flag.
-        if await maybe_resume(audit_runtime):
-            return
-
-        # ── Pass 1: Full audit ────────────────────────────────────────────────
+        # ── Pass 1: Full audit (or transparent resume) ────────────────────────
+        # dispatch_stream automatically resumes from --resume <key> when a
+        # checkpoint store is configured — no special handling needed here.
 
         print(f"\nPASS 1 — full audit\nGoal: {_trunc(AUDIT_GOAL, 120)}")
         print(_sep("═"))

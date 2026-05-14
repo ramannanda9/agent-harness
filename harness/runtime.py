@@ -283,7 +283,7 @@ class AgentRuntime:
         guardrail_config: GuardrailConfig | None = None,
         enable_otel: bool = False,
         annotation_store: Any | None = None,  # InMemoryAnnotationStore or compatible
-        approval_store: Any | None = None,  # FileApprovalStore / RedisApprovalStore
+        checkpoint_store: Any | None = None,  # FileCheckpointStore / RedisCheckpointStore
     ) -> None:
         self._agent_registry = agent_registry
         self._tool_registry = tool_registry
@@ -292,15 +292,17 @@ class AgentRuntime:
         self._guardrail_config = guardrail_config or GuardrailConfig()
         self._enable_otel = enable_otel
         self._annotation_store = annotation_store
-        # Auto-create a FileApprovalStore if any agent uses hitl_tools but no
-        # store was passed — zero-dep default, no configuration required.
-        if approval_store is None and any(
-            getattr(agent_registry.get(aid), "hitl_tools", []) for aid in agent_registry.all_ids()
+        # Auto-create a FileCheckpointStore if any agent uses hitl_tools or
+        # checkpoint_every — zero-dep default, no configuration required.
+        if checkpoint_store is None and any(
+            getattr(agent_registry.get(aid), "hitl_tools", [])
+            or getattr(agent_registry.get(aid), "checkpoint_every", 0) > 0
+            for aid in agent_registry.all_ids()
         ):
-            from harness.hitl import FileApprovalStore
+            from harness.checkpoint import FileCheckpointStore
 
-            approval_store = FileApprovalStore()
-        self._approval_store = approval_store
+            checkpoint_store = FileCheckpointStore()
+        self._checkpoint_store = checkpoint_store
 
     def _make_tracer(self) -> Tracer:
         """Create a fresh Tracer, attaching configured hooks."""
@@ -334,33 +336,41 @@ class AgentRuntime:
             tracer=tracer,
             guard=guard,
             llm=self._llm,
-            approval_store=self._approval_store,
+            checkpoint_store=self._checkpoint_store,
         )
         async for event in agent.run_stream(task, run_id=run_id):
             yield event
 
-    async def resume_agent(self, run_id: str) -> dict:
+    async def resume_agent(self, ckp_id: str) -> dict:
         """
-        Restore and continue an agent run from a Redis checkpoint.
+        Restore and continue an agent run from a checkpoint.
 
         Call this after a process crash or Ctrl-C to re-present any pending
         HITL approval prompt and continue the ReAct loop from the saved step.
 
-        Requires approval_store to have been passed to AgentRuntime.
+        ckp_id is the value printed by the HITL banner:  "<run_id>:<agent_id>".
+        The banner's --resume flag carries this value verbatim so it can be
+        passed directly to maybe_resume() / resume_agent().
+
+        Requires checkpoint_store to have been passed (or auto-created) in AgentRuntime.
         """
         from agents.base import BaseAgent
         from harness.events import EventType
 
-        if self._approval_store is None:
-            raise RuntimeError("resume_agent requires approval_store")
+        if self._checkpoint_store is None:
+            raise RuntimeError("resume_agent requires checkpoint_store")
 
-        checkpoint = await self._approval_store.get_checkpoint(run_id)
+        checkpoint = await self._checkpoint_store.read(ckp_id)
         if checkpoint is None:
-            raise KeyError(f"No checkpoint found for run_id={run_id!r}")
+            raise KeyError(f"No checkpoint found for ckp_id={ckp_id!r}")
 
         from memory.working import WorkingMemory
 
         wm = WorkingMemory.from_dict(checkpoint["memory"], llm=self._llm)
+
+        # checkpoint["run_id"] is the outer run_id; _resume_stream recomputes
+        # _ckp_id as f"{run_id}:{agent_id}" so the correct checkpoint key is used.
+        outer_run_id = checkpoint["run_id"]
 
         config = self._agent_registry.get(checkpoint["agent_id"])
         guard = BudgetGuard(self._guardrail_config)
@@ -375,16 +385,16 @@ class AgentRuntime:
             tracer=tracer,
             guard=guard,
             llm=self._llm,
-            approval_store=self._approval_store,
+            checkpoint_store=self._checkpoint_store,
         )
         agent._working_memory = wm
         agent._task = checkpoint["task"]
 
-        tracer.start_run(run_id, checkpoint["task"])
+        tracer.start_run(outer_run_id, checkpoint["task"])
         result: dict = {}
         try:
             async for event in agent._resume_stream(
-                run_id=run_id,
+                run_id=outer_run_id,
                 start_step=checkpoint["step"],
                 pending=checkpoint.get("pending"),
             ):
@@ -396,7 +406,126 @@ class AgentRuntime:
             tracer.end_run()
         return result
 
-    def _build_orchestrator(self):
+    async def resume_orchestration(self, run_id: str) -> dict:
+        """
+        Restore and continue an orchestrated run from an orchestrator checkpoint.
+
+        Skips already-completed tasks (results are injected directly) and
+        re-runs or resumes any incomplete tasks from where they left off.
+
+        Requires checkpoint_store to have been passed (or auto-created) in AgentRuntime.
+        """
+        from harness.events import EventType
+        from orchestrator.planner import _plan_from_dict, _task_result_from_dict
+
+        if self._checkpoint_store is None:
+            raise RuntimeError("resume_orchestration requires checkpoint_store")
+
+        checkpoint = await self._checkpoint_store.read(run_id)
+        if checkpoint is None:
+            raise KeyError(f"No orchestrator checkpoint found for run_id={run_id!r}")
+
+        goal = checkpoint["goal"]
+        plan = _plan_from_dict(checkpoint["plan"])
+        completed = {tid: _task_result_from_dict(r) for tid, r in checkpoint["completed"].items()}
+        replan_count = checkpoint["replan_count"]
+
+        orchestrator, tracer, _ = self._build_orchestrator(run_id=run_id)
+        result: dict = {}
+        try:
+            async for event in orchestrator.resume_stream(goal, plan, completed, replan_count):
+                if event.type == EventType.DONE:
+                    result = event.payload
+                elif event.type == EventType.ERROR:
+                    result = {"answer": "", "confidence": 0.0, "error": event.error}
+        finally:
+            tracer.end_run()
+        return result
+
+    async def resume_stream(self, key: str):
+        """
+        Resume a checkpoint and stream BusEvents — auto-detects orchestrator vs agent.
+
+        Orchestrator checkpoint (has 'plan')  → streams up to DONE.
+        Agent checkpoint       (has 'agent_id') → streams up to TASK_DONE / ERROR.
+
+        Callers iterate this exactly like dispatch_stream / run_stream:
+            async for event in runtime.resume_stream(key):
+                ...
+        """
+        if self._checkpoint_store is None:
+            raise RuntimeError("resume_stream requires checkpoint_store")
+
+        checkpoint = await self._checkpoint_store.read(key)
+        if checkpoint is None:
+            raise KeyError(f"No checkpoint found for key={key!r}")
+
+        if "plan" in checkpoint:
+            from orchestrator.planner import _plan_from_dict, _task_result_from_dict
+
+            goal = checkpoint["goal"]
+            plan = _plan_from_dict(checkpoint["plan"])
+            completed = {
+                tid: _task_result_from_dict(r) for tid, r in checkpoint["completed"].items()
+            }
+            replan_count = checkpoint["replan_count"]
+            # Orchestrator calls self._tracer.end_run() inside _execute_plan_stream.
+            orchestrator, _tracer, _ = self._build_orchestrator(run_id=key)
+            async for event in orchestrator.resume_stream(goal, plan, completed, replan_count):
+                yield event
+        else:
+            from agents.base import BaseAgent
+            from memory.working import WorkingMemory
+
+            wm = WorkingMemory.from_dict(checkpoint["memory"], llm=self._llm)
+            outer_run_id = checkpoint["run_id"]
+            config = self._agent_registry.get(checkpoint["agent_id"])
+            guard = BudgetGuard(self._guardrail_config)
+            if hasattr(self._llm, "set_budget"):
+                self._llm.set_budget(guard)
+            tracer = self._make_tracer()
+            agent = BaseAgent(
+                config=config,
+                tools=self._tool_registry.get_subset(config.allowed_tools),
+                memory=self._memory,
+                tracer=tracer,
+                guard=guard,
+                llm=self._llm,
+                checkpoint_store=self._checkpoint_store,
+            )
+            agent._working_memory = wm
+            agent._task = checkpoint["task"]
+            tracer.start_run(outer_run_id, checkpoint["task"])
+            try:
+                async for event in agent._resume_stream(
+                    run_id=outer_run_id,
+                    start_step=checkpoint["step"],
+                    pending=checkpoint.get("pending"),
+                ):
+                    yield event
+            finally:
+                tracer.end_run()
+
+    async def resume(self, key: str) -> dict:
+        """
+        Unified resume entry point — auto-detects checkpoint type:
+          - orchestrator checkpoint (has 'plan' field) → resume_orchestration
+          - agent checkpoint (has 'agent_id' field)   → resume_agent
+
+        Pass the value from --resume directly; no need to know the type upfront.
+        """
+        if self._checkpoint_store is None:
+            raise RuntimeError("resume requires checkpoint_store")
+
+        checkpoint = await self._checkpoint_store.read(key)
+        if checkpoint is None:
+            raise KeyError(f"No checkpoint found for key={key!r}")
+
+        if "plan" in checkpoint:
+            return await self.resume_orchestration(key)
+        return await self.resume_agent(key)
+
+    def _build_orchestrator(self, run_id: str | None = None):
         """Construct fresh tracer, guard, agents, and orchestrator for one run."""
         from agents.base import BaseAgent
         from orchestrator.planner import EvalConfig, Orchestrator
@@ -421,7 +550,7 @@ class AgentRuntime:
                 tracer=tracer,
                 guard=guard,
                 llm=self._llm,
-                approval_store=self._approval_store,
+                checkpoint_store=self._checkpoint_store,
             )
             for agent_id in self._agent_registry.all_ids()
         }
@@ -436,6 +565,8 @@ class AgentRuntime:
                 confidence_threshold=self._guardrail_config.confidence_threshold,
                 max_replan_count=self._guardrail_config.max_replan_count,
             ),
+            checkpoint_store=self._checkpoint_store,
+            run_id=run_id,
         )
         return orchestrator, tracer, guard
 
@@ -469,9 +600,20 @@ class AgentRuntime:
           simple  → router picks agent, one ReAct loop (OTEL-traced)
           complex → run_stream (planner decomposes into sub-tasks, has its own trace)
 
-        Emits a DISPATCH event first so callers can see which path was chosen.
+        Auto-resume: when --resume <key> is in sys.argv and a checkpoint store is
+        configured, the saved run is transparently restored and streamed — callers
+        need no resume-specific handling.
         """
         from harness.events import BusEvent, EventType
+
+        if self._checkpoint_store is not None:
+            from harness.checkpoint import maybe_resume_key
+
+            resume_key = maybe_resume_key()
+            if resume_key:
+                async for event in self.resume_stream(resume_key):
+                    yield event
+                return
 
         complexity = await self._classify(goal)
         path = "routed" if complexity == "simple" else "orchestrated"
@@ -647,7 +789,18 @@ class AgentRuntime:
         for UI / partial-result display. The final DONE event's payload is the
         same dict returned by `run()` (minus trace/budget, which are attached
         only in the blocking path).
+
+        Auto-resume: when --resume <key> is in sys.argv and a checkpoint store is
+        configured, the saved run is transparently restored and streamed.
         """
+        if self._checkpoint_store is not None:
+            from harness.checkpoint import maybe_resume_key
+
+            resume_key = maybe_resume_key()
+            if resume_key:
+                async for event in self.resume_stream(resume_key):
+                    yield event
+                return
         orchestrator, _tracer, _guard = self._build_orchestrator()
         async for event in orchestrator.run_stream(goal):
             yield event

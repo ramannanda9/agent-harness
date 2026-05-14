@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Final
 
+from harness.checkpoint import _ResumeHint
 from harness.events import BusEvent, EventType
 from harness.utils import fire
 from memory.manager import MemoryManager
@@ -61,6 +62,7 @@ class AgentConfig:
     confidence_from_llm: bool = True  # if False, confidence=1.0 on success
     working_memory_max_tokens: int = 8000  # WorkingMemory eviction threshold; tune per agent
     hitl_tools: list[str] = None  # tools requiring human approval; None = no HITL
+    checkpoint_every: int = 0  # write a resumable checkpoint every N steps; 0 = disabled
 
     def __post_init__(self):
         if self.hitl_tools is None:
@@ -129,7 +131,7 @@ class BaseAgent:
         tracer,
         guard,
         llm,
-        approval_store: Any | None = None,  # RedisApprovalStore — enables HITL + resume
+        checkpoint_store: Any | None = None,  # FileCheckpointStore / RedisCheckpointStore
     ) -> None:
         self.config = config
         self.role = config.role  # exposed for orchestrator planner prompt
@@ -138,10 +140,14 @@ class BaseAgent:
         self._tracer = tracer
         self._guard = guard
         self._llm = llm
-        self._approval_store = approval_store
+        self._checkpoint_store = checkpoint_store
         self._working_memory: WorkingMemory | None = None
         self._task: str = ""
         self._last_think_error: str | None = None
+        self._ckp_id: str = ""  # f"{run_id}:{agent_id}" — unique per agent per run
+        self._resume_key: str = (
+            ""  # key printed in --resume banner; set by orchestrator to outer run_id
+        )
 
     # ── Streaming entry point (canonical) ─────────────────────────────────────
 
@@ -151,6 +157,9 @@ class BaseAgent:
         run_id: str | None = None,
     ) -> AsyncGenerator[BusEvent, None]:
         run_id = run_id or str(uuid.uuid4())
+        self._ckp_id = f"{run_id}:{self.config.agent_id}"
+        if not self._resume_key:
+            self._resume_key = self._ckp_id
         self._task = task
         self._working_memory = WorkingMemory(
             llm=self._llm,
@@ -161,8 +170,17 @@ class BaseAgent:
         await self._working_memory.append("system", system, pinned=True)
         await self._working_memory.append("user", task)
 
-        async for event in self._run_stream_internal(run_id):
-            yield event
+        async with _ResumeHint(
+            self._resume_key,
+            self._checkpoint_store,
+            f"Agent {self.config.agent_id}",
+            check_key=self._ckp_id,
+        ) as hint:
+            async for event in self._run_stream_internal(run_id):
+                if event.type == EventType.TASK_DONE:
+                    await self._clear_checkpoint(run_id)
+                    hint.done = True
+                yield event
 
     async def _resume_stream(
         self,
@@ -177,13 +195,25 @@ class BaseAgent:
         The approval prompt is shown again; once the human responds the
         tool runs (or the correction is injected) before the loop continues.
         """
+        self._ckp_id = f"{run_id}:{self.config.agent_id}"
+        if not self._resume_key:
+            self._resume_key = self._ckp_id
         if pending:
             async for event in self._replay_pending_step(run_id, pending):
                 yield event
             start_step = pending["step"] + 1
 
-        async for event in self._run_stream_internal(run_id, start_step=start_step):
-            yield event
+        async with _ResumeHint(
+            self._resume_key,
+            self._checkpoint_store,
+            f"Agent {self.config.agent_id}",
+            check_key=self._ckp_id,
+        ) as hint:
+            async for event in self._run_stream_internal(run_id, start_step=start_step):
+                if event.type == EventType.TASK_DONE:
+                    await self._clear_checkpoint(run_id)
+                    hint.done = True
+                yield event
 
     async def _run_stream_internal(
         self,
@@ -246,11 +276,31 @@ class BaseAgent:
 
     # ── ReAct Loop (stream) ───────────────────────────────────────────────────
 
+    async def _write_step_checkpoint(self, run_id: str, step: int) -> None:
+        if self._checkpoint_store is None:
+            return
+        await self._checkpoint_store.write(
+            self._ckp_id,
+            {
+                "run_id": run_id,
+                "agent_id": self.config.agent_id,
+                "task": self._task,
+                "step": step,
+                "memory": self._working_memory.to_dict(),
+            },
+        )
+
     async def _react_stream(
         self, run_id: str, start_step: int = 0
     ) -> AsyncGenerator[BusEvent, None]:
         for step in range(start_step, self.config.max_steps):
             self._guard.check()
+            if (
+                self._checkpoint_store is not None
+                and self.config.checkpoint_every > 0
+                and step % self.config.checkpoint_every == 0
+            ):
+                await self._write_step_checkpoint(run_id, step)
 
             # Think — yields TOKEN events when the LLM client supports streaming.
             response = None
@@ -337,7 +387,9 @@ class BaseAgent:
                     if approval is None or approval.approved:
                         approved.append(act)
                     elif approval.correction:
-                        await self._inject_human_guidance(response, approval.correction, run_id)
+                        await self._inject_human_guidance(
+                            response, approval.correction, run_id, step
+                        )
                         correction_injected = True
                         break
                     # else: rejected — drop from batch silently
@@ -366,7 +418,7 @@ class BaseAgent:
                         for act in parallel_actions
                     ]
                 )
-                await self._clear_checkpoint(run_id)
+                await self._commit_checkpoint(run_id, step)
 
                 combined: list[dict] = []
                 for i, (act, obs) in enumerate(zip(parallel_actions, observations, strict=False)):
@@ -611,14 +663,17 @@ class BaseAgent:
         Returns ApprovalResponse if the tool is gated, None if not.
         Writes a crash-resumable checkpoint to the store before blocking on stdin.
         """
-        if not (self._approval_store and tool_name in self.config.hitl_tools):
+        if not (self._checkpoint_store and tool_name in self.config.hitl_tools):
             return None
 
-        from harness.hitl import ApprovalRequest, request_approval
+        from harness.hitl import ApprovalRequest, is_session_allowed, request_approval
+
+        if is_session_allowed(tool_name, tool_args):
+            return None  # fast-path: human already allowed this tool/prefix for session
 
         approval_id = str(uuid.uuid4())
-        await self._approval_store.write_checkpoint(
-            run_id,
+        await self._checkpoint_store.write(
+            self._ckp_id,
             {
                 "run_id": run_id,
                 "agent_id": self.config.agent_id,
@@ -637,14 +692,13 @@ class BaseAgent:
         return await request_approval(
             ApprovalRequest(
                 approval_id=approval_id,
-                run_id=run_id,
+                run_id=self._resume_key,  # standalone: ckp_id; orchestrated: outer run_id
                 agent_id=self.config.agent_id,
                 tool=tool_name,
                 args=tool_args,
                 step=step,
                 timestamp=datetime.now(timezone.utc).isoformat(),
             ),
-            self._approval_store,
             self._guard,
         )
 
@@ -666,24 +720,49 @@ class BaseAgent:
         approval = await self._gate_tool(run_id, step, tool_name, tool_args, response)
         if approval is not None:
             if approval.correction:
-                await self._inject_human_guidance(response, approval.correction, run_id)
+                await self._inject_human_guidance(response, approval.correction, run_id, step)
                 return _HITL_CORRECTION
             if not approval.approved:
-                await self._clear_checkpoint(run_id)
+                await self._commit_checkpoint(run_id, step)
                 return f"Tool rejected by human: {approval.correction or 'no reason given'}"
         obs = await self._execute_tool(tool_name, tool_args)
-        await self._clear_checkpoint(run_id)
+        if approval is not None:
+            # HITL was involved — overwrite pending checkpoint with clean state.
+            # Non-HITL tools leave the step checkpoint intact for the next iteration.
+            await self._commit_checkpoint(run_id, step)
         return obs
 
-    async def _inject_human_guidance(self, response: dict, correction: str, run_id: str) -> None:
-        """Append human correction to WorkingMemory and clear the checkpoint."""
+    async def _inject_human_guidance(
+        self, response: dict, correction: str, run_id: str, step: int
+    ) -> None:
+        """Append human correction to WorkingMemory and commit a clean checkpoint."""
         await self._working_memory.append("assistant", json.dumps(response))
         await self._working_memory.append("user", f"Human guidance: {correction}")
-        await self._clear_checkpoint(run_id)
+        await self._commit_checkpoint(run_id, step)
+
+    async def _commit_checkpoint(self, run_id: str, step: int) -> None:
+        """Overwrite checkpoint with current state (no pending field).
+
+        Called after HITL resolves or a tool completes so the stored state
+        always reflects reality — no stale 'pending' approval marker, and
+        the step position is preserved for crash-resume.
+        """
+        if self._checkpoint_store is None:
+            return
+        await self._checkpoint_store.write(
+            self._ckp_id,
+            {
+                "run_id": run_id,
+                "agent_id": self.config.agent_id,
+                "task": self._task,
+                "step": step,
+                "memory": self._working_memory.to_dict(),
+            },
+        )
 
     async def _clear_checkpoint(self, run_id: str) -> None:
-        if self._approval_store:
-            await self._approval_store.clear_checkpoint(run_id)
+        if self._checkpoint_store:
+            await self._checkpoint_store.delete(self._ckp_id)
 
     async def _replay_pending_step(
         self,
@@ -701,19 +780,18 @@ class BaseAgent:
         approval = await request_approval(
             ApprovalRequest(
                 approval_id=pending["approval_id"],
-                run_id=run_id,
+                run_id=self._resume_key,  # standalone: ckp_id; orchestrated: outer run_id
                 agent_id=self.config.agent_id,
                 tool=tool_name,
                 args=tool_args,
                 step=step,
                 timestamp=datetime.now(timezone.utc).isoformat(),
             ),
-            self._approval_store,
             self._guard,
         )
 
         if approval.correction:
-            await self._inject_human_guidance(llm_response, approval.correction, run_id)
+            await self._inject_human_guidance(llm_response, approval.correction, run_id, step)
             return
 
         observation = (
@@ -740,7 +818,7 @@ class BaseAgent:
                 else observation
             )
             await self._working_memory.append("user", f"Observation: {obs_text}")
-        await self._clear_checkpoint(run_id)
+        await self._commit_checkpoint(run_id, step)
 
 
 # ── Response normalization (module-level for testability) ────────────────────

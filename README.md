@@ -37,7 +37,8 @@ harness/runtime.py          AgentRuntime — single entry point, wire once run a
 harness/events.py           BusEvent + EventType — canonical event vocabulary
 harness/llm/openai.py       OpenAILLM — OpenAI adapter with usage + cost tracking
 harness/annotation.py       Annotation store + AnnotationHook — RLHF trajectory capture
-harness/hitl.py             HITL approval gate — interactive CLI, Redis checkpoint/resume
+harness/hitl.py             HITL approval gate — interactive CLI, session-allow list
+harness/checkpoint.py       CheckpointStore + _ResumeHint + maybe_resume_key — pluggable run-state persistence (file + Redis); auto-resume built into dispatch_stream / run_stream
 harness/otel.py             OTELHook — OpenTelemetry span exporter (opt-in)
 harness/executor_bridge.py  ExecutorBridge + ExecutorTool — controlled subprocess launcher with optional Docker sandboxing
 orchestrator/planner.py     Hybrid DAG orchestrator — plan, replan, synthesize
@@ -564,7 +565,7 @@ agents.register(AgentConfig(
     hitl_tools=["write_file", "delete_file"],   # these two require human approval
 ))
 
-# AgentRuntime auto-creates a FileApprovalStore when hitl_tools are present.
+# AgentRuntime auto-creates a FileCheckpointStore when hitl_tools are present.
 runtime = AgentRuntime(...)
 await runtime.run_agent("file_agent", "clean up the logs directory")
 ```
@@ -573,19 +574,19 @@ Checkpoints are written to `~/.agent-harness/checkpoints/` by default.
 Override the directory:
 
 ```python
-from harness.hitl import FileApprovalStore
+from harness.checkpoint import FileCheckpointStore
 
-runtime = AgentRuntime(..., approval_store=FileApprovalStore("/var/lib/myapp/hitl"))
+runtime = AgentRuntime(..., checkpoint_store=FileCheckpointStore("/var/lib/myapp/ckp"))
 ```
 
 For Redis-backed storage (shared across processes or machines):
 
 ```python
 import redis.asyncio as aioredis
-from harness.hitl import RedisApprovalStore
+from harness.checkpoint import RedisCheckpointStore
 
 client = aioredis.from_url("redis://localhost:6379", decode_responses=True)
-runtime = AgentRuntime(..., approval_store=RedisApprovalStore(client))
+runtime = AgentRuntime(..., checkpoint_store=RedisCheckpointStore(client))
 ```
 
 When the agent calls `write_file` or `delete_file` a prompt appears:
@@ -597,46 +598,112 @@ When the agent calls `write_file` or `delete_file` a prompt appears:
   Tool:  delete_file
   Args:  {"path": "/var/log/app.log"}
   Agent: file_agent  step=2
-  Run:   3f7a1b2c-...
+  Run:   3f7a1b2c-...:file_agent
   ID:    a1b2-c3d4
 ────────────────────────────────────────────────────────────
-  Approve? [y/n/correction]:
+  y = approve once  |  a = allow 'delete_file' for session  |  n = reject  |  <text> = steer
+  Ctrl-C to pause. Resume: python my_script.py --resume 3f7a1b2c-...:file_agent
+────────────────────────────────────────────────────────────
+  Approve? [y/n/a/correction]:
 ```
 
 **Prompt semantics:**
 
 | Input | Effect |
 |---|---|
-| `y` / `yes` | Tool runs |
+| `y` / `yes` | Tool runs once |
 | `n` / `no` | Tool skipped; agent sees a rejection observation |
+| `a` / `allow` | Tool runs **and** added to session allow-list; no further prompts for this tool (or command prefix for shell-like tools) |
 | any other text | Correction: tool skipped, text injected into `WorkingMemory` as a user message; LLM self-corrects on the next step |
+
+For shell-like tools (`shell`, `bash`, `run`, `exec`), `a` allows the **first
+word** of the command — e.g. typing `a` when approving `shell git commit ...`
+allows all `git` commands for the session but still prompts for `shell rm ...`.
 
 **Wall-time budget** is suspended while waiting for input — human think-time
 does not count against `max_wall_time_seconds`.
 
-### Crash / Ctrl-C resume
+### Step-level checkpointing
 
-The run checkpoint (step number + full `WorkingMemory`) is written to Redis
-before every approval prompt. The banner prints the exact command to resume:
-
-```
-  Ctrl-C to pause. Resume: python my_script.py --resume 3f7a1b2c-...
-```
-
-Add one line to your script to handle it:
+Enable periodic crash-resume independent of HITL:
 
 ```python
-from harness.hitl import maybe_resume
-
-result = await maybe_resume(runtime) or await runtime.run_agent("agent", "task")
+AgentConfig(
+    agent_id="long_runner",
+    ...
+    checkpoint_every=3,   # checkpoint before every 3rd step (0 = disabled)
+)
 ```
 
-`maybe_resume` checks `sys.argv` for `--resume <run_id>`. If present it
-restores the checkpoint from Redis, re-displays the approval banner, and
-continues the run. If absent it returns `None` so the normal path runs.
-Re-running the same script with `--resume` is all the human needs to do.
+The same `CheckpointStore` is used for both HITL and step checkpoints. Resume
+works with `runtime.resume(key)` regardless of how the checkpoint was created.
 
-Checkpoints expire after 24 hours (configurable via `RedisApprovalStore(ttl_seconds=...)`).
+### Checkpoint namespacing
+
+Each agent writes to its own key so orchestrated runs never overwrite each other:
+
+| Path | Checkpoint key | Stored at |
+|---|---|---|
+| Single-agent (`run_agent`, `run_routed`) | `<run_id>:<agent_id>` | `~/.agent-harness/checkpoints/<run_id>:<agent_id>.json` |
+| Orchestrated (`run`, `run_stream`) | `<run_id>` (orchestrator) + `<run_id>:<agent_id>` (each agent) | one file per agent, one file for the orchestrator |
+
+The orchestrator checkpoint stores the goal, the full plan, completed task
+results, and the replan count. It is updated after each parallel batch
+completes and deleted on clean `DONE`.
+
+### Crash / Ctrl-C resume
+
+The checkpoint (step number + full `WorkingMemory`) is written before every
+HITL prompt and (if `checkpoint_every > 0`) at each periodic step.
+
+**What the banner prints:**
+
+- **Single-agent run**: `--resume <run_id>:<agent_id>` — restores just that agent.
+- **Orchestrated run**: `--resume <run_id>` — restores the full orchestration.
+
+```
+  Run interrupted — checkpoint saved.
+  Resume: python my_script.py --resume 3f7a1b2c-...
+```
+
+**Auto-resume — no script changes required.** When `checkpoint_store` is
+configured, `dispatch_stream` and `run_stream` detect `--resume <key>` in
+`sys.argv` automatically. Your existing script resumes transparently:
+
+```bash
+python my_script.py --resume 3f7a1b2c-...
+```
+
+The runtime detects the flag, loads the checkpoint, and streams events
+identically to a fresh run. Scripts need zero resume-specific code.
+
+For **explicit control** — streaming resume or blocking resume:
+
+```python
+# streaming (same event sequence as the original run)
+async for event in runtime.resume_stream("3f7a1b2c-..."):
+    ...
+
+# blocking
+result = await runtime.resume("3f7a1b2c-...:file_agent")  # single-agent
+result = await runtime.resume("3f7a1b2c-...")              # orchestrated
+```
+
+Both `resume_stream` and `resume` auto-detect the checkpoint type (agent vs
+orchestrator) from the stored data and call the right path.
+
+If you need the resume key from `sys.argv` directly:
+
+```python
+from harness.checkpoint import maybe_resume_key
+
+key = maybe_resume_key()   # returns None if --resume is absent
+```
+
+**Orchestrated resume** skips completed tasks (injects their stored results
+directly into the synthesis step) and re-runs only the tasks that had not yet
+finished. If an individual agent's HITL checkpoint is still on disk, that agent
+is resumed at its saved step rather than re-run from scratch.
 
 ### Correction steering and replanning
 
@@ -646,9 +713,10 @@ When the human types a correction instead of y/n:
   `WorkingMemory`. The LLM sees it on the next think step and self-corrects
   without replanning. Suitable for redirecting tool choice or adjusting
   parameters.
-- **Multi-agent orchestrated run**: if the correction implies a different agent
-  or task structure, call `resume_agent` with updated context instead, which
-  re-enters the orchestrator.
+- **Orchestrated run**: the correction steers only the current agent. Because
+  the orchestrator checkpoint records task results as they complete, a full
+  `runtime.resume(run_id)` after the agent finishes will continue the remaining
+  tasks with correct upstream context.
 
-The `annotation_store` and `approval_store` are independent — both can be wired
-simultaneously for RLHF data collection with HITL review.
+The `annotation_store` and `checkpoint_store` are independent — both can be
+wired simultaneously for RLHF data collection with HITL review.

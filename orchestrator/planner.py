@@ -36,6 +36,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+from harness.checkpoint import _ResumeHint
 from harness.events import BusEvent, EventType
 from harness.hitl import stdout_lock as _hitl_stdout_lock
 from harness.utils import fire, parse_llm_json
@@ -195,6 +196,8 @@ class Orchestrator:
         guard,  # BudgetGuard
         llm,
         eval_config: EvalConfig | None = None,
+        checkpoint_store: Any | None = None,
+        run_id: str | None = None,  # supply on resume to keep the same run_id
     ) -> None:
         self._agents = agents
         self._memory = memory
@@ -202,9 +205,10 @@ class Orchestrator:
         self._guard = guard
         self._llm = llm
         self._eval = eval_config or EvalConfig()
-        self._run_id = str(uuid.uuid4())
+        self._checkpoint_store = checkpoint_store
+        self._run_id = run_id or str(uuid.uuid4())
 
-    # ── Streaming entry point (canonical) ─────────────────────────────────────
+    # ── Streaming entry points ─────────────────────────────────────────────────
 
     async def run_stream(self, goal: str) -> AsyncGenerator[BusEvent, None]:
         logger.info("Orchestrator run_id=%s goal=%r", self._run_id, goal[:80])
@@ -226,10 +230,55 @@ class Orchestrator:
             payload={"plan": plan_dict},
         )
 
-        # ── 2. Execute with hybrid replan ──────────────────────────────────────
-        completed: dict[str, TaskResult] = {}
-        pending: list[Task] = list(plan.tasks)
-        replan_count = 0
+        # ── 2. Execute ─────────────────────────────────────────────────────────
+        self._set_agent_resume_keys()
+        await self._write_orch_checkpoint(goal, plan, {}, 0)
+        async with _ResumeHint(self._run_id, self._checkpoint_store, "Orchestration") as hint:
+            async for event in self._execute_plan_stream(goal, plan, {}, 0):
+                if event.type == EventType.DONE:
+                    hint.done = True
+                yield event
+
+    async def resume_stream(
+        self,
+        goal: str,
+        plan: Plan,
+        completed: dict[str, TaskResult],
+        replan_count: int,
+    ) -> AsyncGenerator[BusEvent, None]:
+        """Re-enter execution from a saved checkpoint, skipping completed tasks."""
+        logger.info("Orchestrator resume run_id=%s completed=%s", self._run_id, list(completed))
+        self._tracer.start_run(self._run_id, goal)
+
+        yield BusEvent(
+            type=EventType.PLAN,
+            agent_id="orchestrator",
+            payload={"plan": _plan_to_dict(plan), "resumed": True},
+        )
+
+        self._set_agent_resume_keys()
+        async with _ResumeHint(self._run_id, self._checkpoint_store, "Orchestration") as hint:
+            async for event in self._execute_plan_stream(goal, plan, completed, replan_count):
+                if event.type == EventType.DONE:
+                    hint.done = True
+                yield event
+
+    def _set_agent_resume_keys(self) -> None:
+        """Tell every agent to print --resume <run_id> so humans resume the orchestration."""
+        for agent in self._agents.values():
+            agent._resume_key = self._run_id
+
+    async def _execute_plan_stream(
+        self,
+        goal: str,
+        plan: Plan,
+        completed_init: dict[str, TaskResult],
+        replan_count_init: int,
+    ) -> AsyncGenerator[BusEvent, None]:
+        """Shared execution loop for both run_stream and resume_stream."""
+        completed: dict[str, TaskResult] = dict(completed_init)
+        pending: list[Task] = [t for t in plan.tasks if t.id not in completed]
+        replan_count = replan_count_init
         aborted = False
 
         while pending and not aborted:
@@ -250,6 +299,7 @@ class Orchestrator:
                 if t in pending:
                     pending.remove(t)
             completed.update(batch_results)
+            await self._write_orch_checkpoint(goal, plan, completed, replan_count)
 
             # Per-task replan / on_failure decisions
             for task in ready:
@@ -344,7 +394,7 @@ class Orchestrator:
 
         all_results = list(completed.values())
 
-        # ── 3. Synthesize ──────────────────────────────────────────────────────
+        # ── Synthesize ─────────────────────────────────────────────────────────
         synthesis = await self._synthesize(goal, all_results)
         self._tracer.log("synthesis", "orchestrator", synthesis)
         yield BusEvent(
@@ -353,7 +403,7 @@ class Orchestrator:
             payload=synthesis,
         )
 
-        # ── 4. Run-end memory write ────────────────────────────────────────────
+        # ── Run-end memory write ───────────────────────────────────────────────
         await self._memory.write_run_end(
             goal=goal,
             agent_results=[
@@ -368,7 +418,8 @@ class Orchestrator:
             trace=self._tracer.dump(),
         )
 
-        # ── 5. Final DONE ──────────────────────────────────────────────────────
+        # ── Final DONE — delete orchestrator checkpoint ────────────────────────
+        await self._delete_orch_checkpoint()
         self._tracer.end_run()
         yield BusEvent(
             type=EventType.DONE,
@@ -381,9 +432,6 @@ class Orchestrator:
                 "conflicts": synthesis.get("conflicts", []),
                 "unknowns": synthesis.get("unknowns", []),
                 "replan_count": replan_count,
-                # Budget surface — populated by adapters that report usage/cost.
-                # cost_usd may be 0.0 if no cost source is wired up (still useful
-                # to know zero was billed; tokens flow via TASK_DONE/OTEL).
                 "cost_usd": self._guard.cost,
                 "elapsed_seconds": self._guard.elapsed,
                 "task_results": [
@@ -397,6 +445,32 @@ class Orchestrator:
                 ],
             },
         )
+
+    # ── Checkpoint helpers ────────────────────────────────────────────────────
+
+    async def _write_orch_checkpoint(
+        self,
+        goal: str,
+        plan: Plan,
+        completed: dict[str, TaskResult],
+        replan_count: int,
+    ) -> None:
+        if self._checkpoint_store is None:
+            return
+        await self._checkpoint_store.write(
+            self._run_id,
+            {
+                "run_id": self._run_id,
+                "goal": goal,
+                "plan": _plan_to_dict(plan),
+                "completed": {tid: _task_result_to_dict(r) for tid, r in completed.items()},
+                "replan_count": replan_count,
+            },
+        )
+
+    async def _delete_orch_checkpoint(self) -> None:
+        if self._checkpoint_store:
+            await self._checkpoint_store.delete(self._run_id)
 
     # ── Blocking entry point (thin drain) ─────────────────────────────────────
 
@@ -655,6 +729,37 @@ def _parse_plan(response: Any) -> Plan:
         if t.get("agent_id") and t.get("instruction")
     ]
     return Plan(tasks=tasks, rationale=data.get("rationale", ""))
+
+
+def _task_result_to_dict(r: TaskResult) -> dict:
+    return {
+        "task_id": r.task_id,
+        "agent_id": r.agent_id,
+        "answer": r.answer,
+        "confidence": r.confidence,
+        "steps": r.steps,
+        "success": r.success,
+        "error": r.error,
+        "metadata": r.metadata,
+    }
+
+
+def _task_result_from_dict(d: dict) -> TaskResult:
+    return TaskResult(
+        task_id=d["task_id"],
+        agent_id=d["agent_id"],
+        answer=d["answer"],
+        confidence=d["confidence"],
+        steps=d["steps"],
+        success=d["success"],
+        error=d.get("error"),
+        metadata=d.get("metadata", {}),
+    )
+
+
+def _plan_from_dict(d: dict) -> Plan:
+    """Restore a Plan from a checkpoint dict (inverse of _plan_to_dict)."""
+    return _parse_plan(d)
 
 
 def _plan_to_dict(plan: Plan) -> dict:
