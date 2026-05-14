@@ -120,15 +120,31 @@ class RedisCheckpointStore:
 
 class _ResumeHint:
     """
-    Async context manager that prints a --resume hint to stderr on interruption.
+    Async context manager that prints a --resume hint to stderr on interruption,
+    but only when a checkpoint actually exists in the store.
+
+    Two keys:
+      check_key  — where the checkpoint lives in the store (verified on exit).
+                   Defaults to resume_key when not supplied.
+      resume_key — printed in the hint; what the human passes to --resume.
+
+    For orchestrated agents these differ: check_key is the namespaced agent key
+    (f"{run_id}:{agent_id}") while resume_key is the bare orchestrator run_id.
 
     Set ``hint.done = True`` before leaving the managed block to suppress the
-    message (i.e. on clean success). If ``checkpoint_store`` is None the hint
-    is never printed since there is no saved state to resume from.
+    message on clean success.
     """
 
-    def __init__(self, resume_key: str, checkpoint_store: Any, label: str = "Run") -> None:
+    def __init__(
+        self,
+        resume_key: str,
+        checkpoint_store: Any,
+        label: str = "Run",
+        *,
+        check_key: str | None = None,
+    ) -> None:
         self._resume_key = resume_key
+        self._check_key = check_key if check_key is not None else resume_key
         self._store = checkpoint_store
         self._label = label
         self.done: bool = False
@@ -138,12 +154,12 @@ class _ResumeHint:
 
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> bool:
         if not self.done and self._store is not None and self._resume_key:
-            import sys
-
-            script = sys.argv[0] if sys.argv else "your_script.py"
-            print(
-                f"\n  {self._label} interrupted — checkpoint saved."
-                f"\n  Resume: python {script} --resume {self._resume_key}\n",
-                file=sys.stderr,
-            )
+            checkpoint = await self._store.read(self._check_key)
+            if checkpoint is not None:
+                script = sys.argv[0] if sys.argv else "your_script.py"
+                print(
+                    f"\n  {self._label} interrupted — checkpoint saved."
+                    f"\n  Resume: python {script} --resume {self._resume_key}\n",
+                    file=sys.stderr,
+                )
         return False

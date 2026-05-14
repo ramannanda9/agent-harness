@@ -171,7 +171,10 @@ class BaseAgent:
         await self._working_memory.append("user", task)
 
         async with _ResumeHint(
-            self._resume_key, self._checkpoint_store, f"Agent {self.config.agent_id}"
+            self._resume_key,
+            self._checkpoint_store,
+            f"Agent {self.config.agent_id}",
+            check_key=self._ckp_id,
         ) as hint:
             async for event in self._run_stream_internal(run_id):
                 if event.type == EventType.TASK_DONE:
@@ -201,7 +204,10 @@ class BaseAgent:
             start_step = pending["step"] + 1
 
         async with _ResumeHint(
-            self._resume_key, self._checkpoint_store, f"Agent {self.config.agent_id}"
+            self._resume_key,
+            self._checkpoint_store,
+            f"Agent {self.config.agent_id}",
+            check_key=self._ckp_id,
         ) as hint:
             async for event in self._run_stream_internal(run_id, start_step=start_step):
                 if event.type == EventType.TASK_DONE:
