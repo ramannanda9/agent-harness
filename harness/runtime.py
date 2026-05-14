@@ -442,6 +442,70 @@ class AgentRuntime:
             tracer.end_run()
         return result
 
+    async def resume_stream(self, key: str):
+        """
+        Resume a checkpoint and stream BusEvents — auto-detects orchestrator vs agent.
+
+        Orchestrator checkpoint (has 'plan')  → streams up to DONE.
+        Agent checkpoint       (has 'agent_id') → streams up to TASK_DONE / ERROR.
+
+        Callers iterate this exactly like dispatch_stream / run_stream:
+            async for event in runtime.resume_stream(key):
+                ...
+        """
+        if self._checkpoint_store is None:
+            raise RuntimeError("resume_stream requires checkpoint_store")
+
+        checkpoint = await self._checkpoint_store.read(key)
+        if checkpoint is None:
+            raise KeyError(f"No checkpoint found for key={key!r}")
+
+        if "plan" in checkpoint:
+            from orchestrator.planner import _plan_from_dict, _task_result_from_dict
+
+            goal = checkpoint["goal"]
+            plan = _plan_from_dict(checkpoint["plan"])
+            completed = {
+                tid: _task_result_from_dict(r) for tid, r in checkpoint["completed"].items()
+            }
+            replan_count = checkpoint["replan_count"]
+            # Orchestrator calls self._tracer.end_run() inside _execute_plan_stream.
+            orchestrator, _tracer, _ = self._build_orchestrator(run_id=key)
+            async for event in orchestrator.resume_stream(goal, plan, completed, replan_count):
+                yield event
+        else:
+            from agents.base import BaseAgent
+            from memory.working import WorkingMemory
+
+            wm = WorkingMemory.from_dict(checkpoint["memory"], llm=self._llm)
+            outer_run_id = checkpoint["run_id"]
+            config = self._agent_registry.get(checkpoint["agent_id"])
+            guard = BudgetGuard(self._guardrail_config)
+            if hasattr(self._llm, "set_budget"):
+                self._llm.set_budget(guard)
+            tracer = self._make_tracer()
+            agent = BaseAgent(
+                config=config,
+                tools=self._tool_registry.get_subset(config.allowed_tools),
+                memory=self._memory,
+                tracer=tracer,
+                guard=guard,
+                llm=self._llm,
+                checkpoint_store=self._checkpoint_store,
+            )
+            agent._working_memory = wm
+            agent._task = checkpoint["task"]
+            tracer.start_run(outer_run_id, checkpoint["task"])
+            try:
+                async for event in agent._resume_stream(
+                    run_id=outer_run_id,
+                    start_step=checkpoint["step"],
+                    pending=checkpoint.get("pending"),
+                ):
+                    yield event
+            finally:
+                tracer.end_run()
+
     async def resume(self, key: str) -> dict:
         """
         Unified resume entry point — auto-detects checkpoint type:
@@ -536,9 +600,20 @@ class AgentRuntime:
           simple  → router picks agent, one ReAct loop (OTEL-traced)
           complex → run_stream (planner decomposes into sub-tasks, has its own trace)
 
-        Emits a DISPATCH event first so callers can see which path was chosen.
+        Auto-resume: when --resume <key> is in sys.argv and a checkpoint store is
+        configured, the saved run is transparently restored and streamed — callers
+        need no resume-specific handling.
         """
         from harness.events import BusEvent, EventType
+
+        if self._checkpoint_store is not None:
+            from harness.checkpoint import maybe_resume_key
+
+            resume_key = maybe_resume_key()
+            if resume_key:
+                async for event in self.resume_stream(resume_key):
+                    yield event
+                return
 
         complexity = await self._classify(goal)
         path = "routed" if complexity == "simple" else "orchestrated"
@@ -714,7 +789,18 @@ class AgentRuntime:
         for UI / partial-result display. The final DONE event's payload is the
         same dict returned by `run()` (minus trace/budget, which are attached
         only in the blocking path).
+
+        Auto-resume: when --resume <key> is in sys.argv and a checkpoint store is
+        configured, the saved run is transparently restored and streamed.
         """
+        if self._checkpoint_store is not None:
+            from harness.checkpoint import maybe_resume_key
+
+            resume_key = maybe_resume_key()
+            if resume_key:
+                async for event in self.resume_stream(resume_key):
+                    yield event
+                return
         orchestrator, _tracer, _guard = self._build_orchestrator()
         async for event in orchestrator.run_stream(goal):
             yield event

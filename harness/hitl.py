@@ -88,21 +88,17 @@ async def maybe_resume(runtime: Any) -> dict | None:
     and continue the run; return its result dict.
     Return None if --resume is not in argv so the caller's normal path runs.
 
-    Usage in any script:
-
-        result = await maybe_resume(runtime) or await runtime.run_agent(...)
+    For most scripts, prefer the automatic resume built into dispatch_stream /
+    run_stream — no explicit call needed.
 
     The approval banner prints the exact command to paste, e.g.:
         python my_script.py --resume 3f7a1b2c-...:researcher
     """
-    args = sys.argv[1:]
-    if "--resume" not in args:
+    from harness.checkpoint import maybe_resume_key
+
+    ckp_id = maybe_resume_key()
+    if ckp_id is None:
         return None
-    idx = args.index("--resume")
-    if idx + 1 >= len(args):
-        print("Usage: --resume <ckp_id>", file=sys.stderr)
-        sys.exit(1)
-    ckp_id = args[idx + 1]
     return await runtime.resume(ckp_id)
 
 

@@ -20,9 +20,28 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Any
+
+
+def maybe_resume_key() -> str | None:
+    """
+    Extract the --resume <key> value from sys.argv, or return None.
+
+    Called automatically by AgentRuntime.dispatch_stream / run_stream so that
+    scripts resume transparently without any resume-specific code.  Also
+    available for scripts that need the key explicitly.
+    """
+    args = sys.argv[1:]
+    if "--resume" not in args:
+        return None
+    idx = args.index("--resume")
+    if idx + 1 >= len(args):
+        print("Usage: --resume <ckp_id>", file=sys.stderr)
+        sys.exit(1)
+    return args[idx + 1]
 
 
 class FileCheckpointStore:
