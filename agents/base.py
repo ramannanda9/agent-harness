@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Final
 
+from harness.checkpoint import _ResumeHint
 from harness.events import BusEvent, EventType
 from harness.utils import fire
 from memory.manager import MemoryManager
@@ -169,8 +170,14 @@ class BaseAgent:
         await self._working_memory.append("system", system, pinned=True)
         await self._working_memory.append("user", task)
 
-        async for event in self._run_stream_internal(run_id):
-            yield event
+        async with _ResumeHint(
+            self._resume_key, self._checkpoint_store, f"Agent {self.config.agent_id}"
+        ) as hint:
+            async for event in self._run_stream_internal(run_id):
+                if event.type == EventType.TASK_DONE:
+                    await self._clear_checkpoint(run_id)
+                    hint.done = True
+                yield event
 
     async def _resume_stream(
         self,
@@ -193,8 +200,14 @@ class BaseAgent:
                 yield event
             start_step = pending["step"] + 1
 
-        async for event in self._run_stream_internal(run_id, start_step=start_step):
-            yield event
+        async with _ResumeHint(
+            self._resume_key, self._checkpoint_store, f"Agent {self.config.agent_id}"
+        ) as hint:
+            async for event in self._run_stream_internal(run_id, start_step=start_step):
+                if event.type == EventType.TASK_DONE:
+                    await self._clear_checkpoint(run_id)
+                    hint.done = True
+                yield event
 
     async def _run_stream_internal(
         self,
@@ -222,7 +235,6 @@ class BaseAgent:
                         "summarization_count": self._working_memory.summarization_count,
                     },
                 )
-            await self._clear_checkpoint(run_id)  # clean up step or HITL checkpoint on exit
 
     # ── Blocking entry point (thin drain) ─────────────────────────────────────
 

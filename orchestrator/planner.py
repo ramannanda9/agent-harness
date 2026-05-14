@@ -36,6 +36,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+from harness.checkpoint import _ResumeHint
 from harness.events import BusEvent, EventType
 from harness.hitl import stdout_lock as _hitl_stdout_lock
 from harness.utils import fire, parse_llm_json
@@ -232,8 +233,11 @@ class Orchestrator:
         # ── 2. Execute ─────────────────────────────────────────────────────────
         self._set_agent_resume_keys()
         await self._write_orch_checkpoint(goal, plan, {}, 0)
-        async for event in self._execute_plan_stream(goal, plan, {}, 0):
-            yield event
+        async with _ResumeHint(self._run_id, self._checkpoint_store, "Orchestration") as hint:
+            async for event in self._execute_plan_stream(goal, plan, {}, 0):
+                if event.type == EventType.DONE:
+                    hint.done = True
+                yield event
 
     async def resume_stream(
         self,
@@ -253,8 +257,11 @@ class Orchestrator:
         )
 
         self._set_agent_resume_keys()
-        async for event in self._execute_plan_stream(goal, plan, completed, replan_count):
-            yield event
+        async with _ResumeHint(self._run_id, self._checkpoint_store, "Orchestration") as hint:
+            async for event in self._execute_plan_stream(goal, plan, completed, replan_count):
+                if event.type == EventType.DONE:
+                    hint.done = True
+                yield event
 
     def _set_agent_resume_keys(self) -> None:
         """Tell every agent to print --resume <run_id> so humans resume the orchestration."""

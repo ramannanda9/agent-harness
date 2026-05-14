@@ -97,3 +97,34 @@ class RedisCheckpointStore:
 
     async def delete(self, run_id: str) -> None:
         await self._r.delete(self._KEY.format(run_id))
+
+
+class _ResumeHint:
+    """
+    Async context manager that prints a --resume hint to stderr on interruption.
+
+    Set ``hint.done = True`` before leaving the managed block to suppress the
+    message (i.e. on clean success). If ``checkpoint_store`` is None the hint
+    is never printed since there is no saved state to resume from.
+    """
+
+    def __init__(self, resume_key: str, checkpoint_store: Any, label: str = "Run") -> None:
+        self._resume_key = resume_key
+        self._store = checkpoint_store
+        self._label = label
+        self.done: bool = False
+
+    async def __aenter__(self) -> _ResumeHint:
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> bool:
+        if not self.done and self._store is not None and self._resume_key:
+            import sys
+
+            script = sys.argv[0] if sys.argv else "your_script.py"
+            print(
+                f"\n  {self._label} interrupted — checkpoint saved."
+                f"\n  Resume: python {script} --resume {self._resume_key}\n",
+                file=sys.stderr,
+            )
+        return False
