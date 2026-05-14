@@ -37,7 +37,8 @@ harness/runtime.py          AgentRuntime — single entry point, wire once run a
 harness/events.py           BusEvent + EventType — canonical event vocabulary
 harness/llm/openai.py       OpenAILLM — OpenAI adapter with usage + cost tracking
 harness/annotation.py       Annotation store + AnnotationHook — RLHF trajectory capture
-harness/hitl.py             HITL approval gate — interactive CLI, Redis checkpoint/resume
+harness/hitl.py             HITL approval gate — interactive CLI, session-allow, crash-resume
+harness/checkpoint.py       CheckpointStore — pluggable run-state persistence (file + Redis)
 harness/otel.py             OTELHook — OpenTelemetry span exporter (opt-in)
 harness/executor_bridge.py  ExecutorBridge + ExecutorTool — controlled subprocess launcher with optional Docker sandboxing
 orchestrator/planner.py     Hybrid DAG orchestrator — plan, replan, synthesize
@@ -564,7 +565,7 @@ agents.register(AgentConfig(
     hitl_tools=["write_file", "delete_file"],   # these two require human approval
 ))
 
-# AgentRuntime auto-creates a FileApprovalStore when hitl_tools are present.
+# AgentRuntime auto-creates a FileCheckpointStore when hitl_tools are present.
 runtime = AgentRuntime(...)
 await runtime.run_agent("file_agent", "clean up the logs directory")
 ```
@@ -573,19 +574,19 @@ Checkpoints are written to `~/.agent-harness/checkpoints/` by default.
 Override the directory:
 
 ```python
-from harness.hitl import FileApprovalStore
+from harness.checkpoint import FileCheckpointStore
 
-runtime = AgentRuntime(..., approval_store=FileApprovalStore("/var/lib/myapp/hitl"))
+runtime = AgentRuntime(..., checkpoint_store=FileCheckpointStore("/var/lib/myapp/ckp"))
 ```
 
 For Redis-backed storage (shared across processes or machines):
 
 ```python
 import redis.asyncio as aioredis
-from harness.hitl import RedisApprovalStore
+from harness.checkpoint import RedisCheckpointStore
 
 client = aioredis.from_url("redis://localhost:6379", decode_responses=True)
-runtime = AgentRuntime(..., approval_store=RedisApprovalStore(client))
+runtime = AgentRuntime(..., checkpoint_store=RedisCheckpointStore(client))
 ```
 
 When the agent calls `write_file` or `delete_file` a prompt appears:
@@ -600,24 +601,49 @@ When the agent calls `write_file` or `delete_file` a prompt appears:
   Run:   3f7a1b2c-...
   ID:    a1b2-c3d4
 ────────────────────────────────────────────────────────────
-  Approve? [y/n/correction]:
+  y = approve once  |  a = allow 'delete_file' for session  |  n = reject  |  <text> = steer
+  Ctrl-C to pause. Resume: python my_script.py --resume 3f7a1b2c-...
+────────────────────────────────────────────────────────────
+  Approve? [y/n/a/correction]:
 ```
 
 **Prompt semantics:**
 
 | Input | Effect |
 |---|---|
-| `y` / `yes` | Tool runs |
+| `y` / `yes` | Tool runs once |
 | `n` / `no` | Tool skipped; agent sees a rejection observation |
+| `a` / `allow` | Tool runs **and** added to session allow-list; no further prompts for this tool (or command prefix for shell-like tools) |
 | any other text | Correction: tool skipped, text injected into `WorkingMemory` as a user message; LLM self-corrects on the next step |
+
+For shell-like tools (`shell`, `bash`, `run`, `exec`), `a` allows the **first
+word** of the command — e.g. typing `a` when approving `shell git commit ...`
+allows all `git` commands for the session but still prompts for `shell rm ...`.
 
 **Wall-time budget** is suspended while waiting for input — human think-time
 does not count against `max_wall_time_seconds`.
 
+### Step-level checkpointing
+
+Enable periodic crash-resume independent of HITL:
+
+```python
+AgentConfig(
+    agent_id="long_runner",
+    ...
+    checkpoint_every=3,   # checkpoint before every 3rd step (0 = disabled)
+)
+```
+
+The same `CheckpointStore` is used for both HITL and step checkpoints.
+On crash, resume with `--resume <run_id>` regardless of how the checkpoint
+was created.
+
 ### Crash / Ctrl-C resume
 
-The run checkpoint (step number + full `WorkingMemory`) is written to Redis
-before every approval prompt. The banner prints the exact command to resume:
+The checkpoint (step number + full `WorkingMemory`) is written before every
+HITL prompt and (if `checkpoint_every > 0`) at each periodic step. The banner
+prints the exact command to resume:
 
 ```
   Ctrl-C to pause. Resume: python my_script.py --resume 3f7a1b2c-...
@@ -632,11 +658,8 @@ result = await maybe_resume(runtime) or await runtime.run_agent("agent", "task")
 ```
 
 `maybe_resume` checks `sys.argv` for `--resume <run_id>`. If present it
-restores the checkpoint from Redis, re-displays the approval banner, and
+restores the checkpoint, re-displays the approval banner (if pending), and
 continues the run. If absent it returns `None` so the normal path runs.
-Re-running the same script with `--resume` is all the human needs to do.
-
-Checkpoints expire after 24 hours (configurable via `RedisApprovalStore(ttl_seconds=...)`).
 
 ### Correction steering and replanning
 
@@ -650,5 +673,5 @@ When the human types a correction instead of y/n:
   or task structure, call `resume_agent` with updated context instead, which
   re-enters the orchestrator.
 
-The `annotation_store` and `approval_store` are independent — both can be wired
-simultaneously for RLHF data collection with HITL review.
+The `annotation_store` and `checkpoint_store` are independent — both can be
+wired simultaneously for RLHF data collection with HITL review.

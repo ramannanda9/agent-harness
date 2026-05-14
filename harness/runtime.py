@@ -283,7 +283,7 @@ class AgentRuntime:
         guardrail_config: GuardrailConfig | None = None,
         enable_otel: bool = False,
         annotation_store: Any | None = None,  # InMemoryAnnotationStore or compatible
-        approval_store: Any | None = None,  # FileApprovalStore / RedisApprovalStore
+        checkpoint_store: Any | None = None,  # FileCheckpointStore / RedisCheckpointStore
     ) -> None:
         self._agent_registry = agent_registry
         self._tool_registry = tool_registry
@@ -292,15 +292,17 @@ class AgentRuntime:
         self._guardrail_config = guardrail_config or GuardrailConfig()
         self._enable_otel = enable_otel
         self._annotation_store = annotation_store
-        # Auto-create a FileApprovalStore if any agent uses hitl_tools but no
-        # store was passed — zero-dep default, no configuration required.
-        if approval_store is None and any(
-            getattr(agent_registry.get(aid), "hitl_tools", []) for aid in agent_registry.all_ids()
+        # Auto-create a FileCheckpointStore if any agent uses hitl_tools or
+        # checkpoint_every — zero-dep default, no configuration required.
+        if checkpoint_store is None and any(
+            getattr(agent_registry.get(aid), "hitl_tools", [])
+            or getattr(agent_registry.get(aid), "checkpoint_every", 0) > 0
+            for aid in agent_registry.all_ids()
         ):
-            from harness.hitl import FileApprovalStore
+            from harness.checkpoint import FileCheckpointStore
 
-            approval_store = FileApprovalStore()
-        self._approval_store = approval_store
+            checkpoint_store = FileCheckpointStore()
+        self._checkpoint_store = checkpoint_store
 
     def _make_tracer(self) -> Tracer:
         """Create a fresh Tracer, attaching configured hooks."""
@@ -334,27 +336,27 @@ class AgentRuntime:
             tracer=tracer,
             guard=guard,
             llm=self._llm,
-            approval_store=self._approval_store,
+            checkpoint_store=self._checkpoint_store,
         )
         async for event in agent.run_stream(task, run_id=run_id):
             yield event
 
     async def resume_agent(self, run_id: str) -> dict:
         """
-        Restore and continue an agent run from a Redis checkpoint.
+        Restore and continue an agent run from a checkpoint.
 
         Call this after a process crash or Ctrl-C to re-present any pending
         HITL approval prompt and continue the ReAct loop from the saved step.
 
-        Requires approval_store to have been passed to AgentRuntime.
+        Requires checkpoint_store to have been passed (or auto-created) in AgentRuntime.
         """
         from agents.base import BaseAgent
         from harness.events import EventType
 
-        if self._approval_store is None:
-            raise RuntimeError("resume_agent requires approval_store")
+        if self._checkpoint_store is None:
+            raise RuntimeError("resume_agent requires checkpoint_store")
 
-        checkpoint = await self._approval_store.get_checkpoint(run_id)
+        checkpoint = await self._checkpoint_store.read(run_id)
         if checkpoint is None:
             raise KeyError(f"No checkpoint found for run_id={run_id!r}")
 
@@ -375,7 +377,7 @@ class AgentRuntime:
             tracer=tracer,
             guard=guard,
             llm=self._llm,
-            approval_store=self._approval_store,
+            checkpoint_store=self._checkpoint_store,
         )
         agent._working_memory = wm
         agent._task = checkpoint["task"]
@@ -421,7 +423,7 @@ class AgentRuntime:
                 tracer=tracer,
                 guard=guard,
                 llm=self._llm,
-                approval_store=self._approval_store,
+                checkpoint_store=self._checkpoint_store,
             )
             for agent_id in self._agent_registry.all_ids()
         }

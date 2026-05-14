@@ -173,9 +173,9 @@ async def main() -> None:
     enable_otel = bool(os.environ.get("OTEL_ENABLED"))
     semantic_store, episodic_store, store_label = await _build_stores(None)
 
-    from harness.hitl import FileApprovalStore
+    from harness.checkpoint import FileCheckpointStore
 
-    checkpoint_dir = FileApprovalStore()._dir
+    checkpoint_dir = FileCheckpointStore()._dir
 
     print(_sep("═"))
     print(f"Model:      {MODEL}")

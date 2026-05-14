@@ -61,6 +61,7 @@ class AgentConfig:
     confidence_from_llm: bool = True  # if False, confidence=1.0 on success
     working_memory_max_tokens: int = 8000  # WorkingMemory eviction threshold; tune per agent
     hitl_tools: list[str] = None  # tools requiring human approval; None = no HITL
+    checkpoint_every: int = 0  # write a resumable checkpoint every N steps; 0 = disabled
 
     def __post_init__(self):
         if self.hitl_tools is None:
@@ -129,7 +130,7 @@ class BaseAgent:
         tracer,
         guard,
         llm,
-        approval_store: Any | None = None,  # RedisApprovalStore — enables HITL + resume
+        checkpoint_store: Any | None = None,  # FileCheckpointStore / RedisCheckpointStore
     ) -> None:
         self.config = config
         self.role = config.role  # exposed for orchestrator planner prompt
@@ -138,7 +139,7 @@ class BaseAgent:
         self._tracer = tracer
         self._guard = guard
         self._llm = llm
-        self._approval_store = approval_store
+        self._checkpoint_store = checkpoint_store
         self._working_memory: WorkingMemory | None = None
         self._task: str = ""
         self._last_think_error: str | None = None
@@ -211,6 +212,7 @@ class BaseAgent:
                         "summarization_count": self._working_memory.summarization_count,
                     },
                 )
+            await self._clear_checkpoint(run_id)  # clean up step or HITL checkpoint on exit
 
     # ── Blocking entry point (thin drain) ─────────────────────────────────────
 
@@ -246,11 +248,31 @@ class BaseAgent:
 
     # ── ReAct Loop (stream) ───────────────────────────────────────────────────
 
+    async def _write_step_checkpoint(self, run_id: str, step: int) -> None:
+        if self._checkpoint_store is None:
+            return
+        await self._checkpoint_store.write(
+            run_id,
+            {
+                "run_id": run_id,
+                "agent_id": self.config.agent_id,
+                "task": self._task,
+                "step": step,
+                "memory": self._working_memory.to_dict(),
+            },
+        )
+
     async def _react_stream(
         self, run_id: str, start_step: int = 0
     ) -> AsyncGenerator[BusEvent, None]:
         for step in range(start_step, self.config.max_steps):
             self._guard.check()
+            if (
+                self._checkpoint_store is not None
+                and self.config.checkpoint_every > 0
+                and step % self.config.checkpoint_every == 0
+            ):
+                await self._write_step_checkpoint(run_id, step)
 
             # Think — yields TOKEN events when the LLM client supports streaming.
             response = None
@@ -611,13 +633,13 @@ class BaseAgent:
         Returns ApprovalResponse if the tool is gated, None if not.
         Writes a crash-resumable checkpoint to the store before blocking on stdin.
         """
-        if not (self._approval_store and tool_name in self.config.hitl_tools):
+        if not (self._checkpoint_store and tool_name in self.config.hitl_tools):
             return None
 
         from harness.hitl import ApprovalRequest, request_approval
 
         approval_id = str(uuid.uuid4())
-        await self._approval_store.write_checkpoint(
+        await self._checkpoint_store.write(
             run_id,
             {
                 "run_id": run_id,
@@ -644,7 +666,6 @@ class BaseAgent:
                 step=step,
                 timestamp=datetime.now(timezone.utc).isoformat(),
             ),
-            self._approval_store,
             self._guard,
         )
 
@@ -682,8 +703,8 @@ class BaseAgent:
         await self._clear_checkpoint(run_id)
 
     async def _clear_checkpoint(self, run_id: str) -> None:
-        if self._approval_store:
-            await self._approval_store.clear_checkpoint(run_id)
+        if self._checkpoint_store:
+            await self._checkpoint_store.delete(run_id)
 
     async def _replay_pending_step(
         self,
@@ -708,7 +729,6 @@ class BaseAgent:
                 step=step,
                 timestamp=datetime.now(timezone.utc).isoformat(),
             ),
-            self._approval_store,
             self._guard,
         )
 
