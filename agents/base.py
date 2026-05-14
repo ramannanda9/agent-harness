@@ -143,6 +143,10 @@ class BaseAgent:
         self._working_memory: WorkingMemory | None = None
         self._task: str = ""
         self._last_think_error: str | None = None
+        self._ckp_id: str = ""  # f"{run_id}:{agent_id}" — unique per agent per run
+        self._resume_key: str = (
+            ""  # key printed in --resume banner; set by orchestrator to outer run_id
+        )
 
     # ── Streaming entry point (canonical) ─────────────────────────────────────
 
@@ -152,6 +156,9 @@ class BaseAgent:
         run_id: str | None = None,
     ) -> AsyncGenerator[BusEvent, None]:
         run_id = run_id or str(uuid.uuid4())
+        self._ckp_id = f"{run_id}:{self.config.agent_id}"
+        if not self._resume_key:
+            self._resume_key = self._ckp_id
         self._task = task
         self._working_memory = WorkingMemory(
             llm=self._llm,
@@ -178,6 +185,9 @@ class BaseAgent:
         The approval prompt is shown again; once the human responds the
         tool runs (or the correction is injected) before the loop continues.
         """
+        self._ckp_id = f"{run_id}:{self.config.agent_id}"
+        if not self._resume_key:
+            self._resume_key = self._ckp_id
         if pending:
             async for event in self._replay_pending_step(run_id, pending):
                 yield event
@@ -252,7 +262,7 @@ class BaseAgent:
         if self._checkpoint_store is None:
             return
         await self._checkpoint_store.write(
-            run_id,
+            self._ckp_id,
             {
                 "run_id": run_id,
                 "agent_id": self.config.agent_id,
@@ -638,11 +648,14 @@ class BaseAgent:
         if not (self._checkpoint_store and tool_name in self.config.hitl_tools):
             return None
 
-        from harness.hitl import ApprovalRequest, request_approval
+        from harness.hitl import ApprovalRequest, is_session_allowed, request_approval
+
+        if is_session_allowed(tool_name, tool_args):
+            return None  # fast-path: human already allowed this tool/prefix for session
 
         approval_id = str(uuid.uuid4())
         await self._checkpoint_store.write(
-            run_id,
+            self._ckp_id,
             {
                 "run_id": run_id,
                 "agent_id": self.config.agent_id,
@@ -661,7 +674,7 @@ class BaseAgent:
         return await request_approval(
             ApprovalRequest(
                 approval_id=approval_id,
-                run_id=run_id,
+                run_id=self._resume_key,  # standalone: ckp_id; orchestrated: outer run_id
                 agent_id=self.config.agent_id,
                 tool=tool_name,
                 args=tool_args,
@@ -719,7 +732,7 @@ class BaseAgent:
         if self._checkpoint_store is None:
             return
         await self._checkpoint_store.write(
-            run_id,
+            self._ckp_id,
             {
                 "run_id": run_id,
                 "agent_id": self.config.agent_id,
@@ -731,7 +744,7 @@ class BaseAgent:
 
     async def _clear_checkpoint(self, run_id: str) -> None:
         if self._checkpoint_store:
-            await self._checkpoint_store.delete(run_id)
+            await self._checkpoint_store.delete(self._ckp_id)
 
     async def _replay_pending_step(
         self,
@@ -749,7 +762,7 @@ class BaseAgent:
         approval = await request_approval(
             ApprovalRequest(
                 approval_id=pending["approval_id"],
-                run_id=run_id,
+                run_id=self._resume_key,  # standalone: ckp_id; orchestrated: outer run_id
                 agent_id=self.config.agent_id,
                 tool=tool_name,
                 args=tool_args,

@@ -84,7 +84,7 @@ def _session_label(tool: str, args: dict) -> str:
 
 async def maybe_resume(runtime: Any) -> dict | None:
     """
-    Check sys.argv for --resume <run_id>. If present, restore the checkpoint
+    Check sys.argv for --resume <ckp_id>. If present, restore the checkpoint
     and continue the run; return its result dict.
     Return None if --resume is not in argv so the caller's normal path runs.
 
@@ -93,17 +93,17 @@ async def maybe_resume(runtime: Any) -> dict | None:
         result = await maybe_resume(runtime) or await runtime.run_agent(...)
 
     The approval banner prints the exact command to paste, e.g.:
-        python my_script.py --resume 3f7a1b2c-...
+        python my_script.py --resume 3f7a1b2c-...:researcher
     """
     args = sys.argv[1:]
     if "--resume" not in args:
         return None
     idx = args.index("--resume")
     if idx + 1 >= len(args):
-        print("Usage: --resume <run_id>", file=sys.stderr)
+        print("Usage: --resume <ckp_id>", file=sys.stderr)
         sys.exit(1)
-    run_id = args[idx + 1]
-    return await runtime.resume_agent(run_id)
+    ckp_id = args[idx + 1]
+    return await runtime.resume(ckp_id)
 
 
 # ── Data model ────────────────────────────────────────────────────────────────
