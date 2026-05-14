@@ -614,7 +614,15 @@ class BaseAgent:
         if not (self._approval_store and tool_name in self.config.hitl_tools):
             return None
 
-        from harness.hitl import ApprovalRequest, request_approval
+        from harness.hitl import (
+            ApprovalRequest,
+            ApprovalResponse,
+            is_session_allowed,
+            request_approval,
+        )
+
+        if is_session_allowed(tool_name, tool_args):
+            return ApprovalResponse(approval_id="session-auto", approved=True)
 
         approval_id = str(uuid.uuid4())
         await self._approval_store.write_checkpoint(
