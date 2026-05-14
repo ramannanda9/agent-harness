@@ -37,8 +37,8 @@ harness/runtime.py          AgentRuntime — single entry point, wire once run a
 harness/events.py           BusEvent + EventType — canonical event vocabulary
 harness/llm/openai.py       OpenAILLM — OpenAI adapter with usage + cost tracking
 harness/annotation.py       Annotation store + AnnotationHook — RLHF trajectory capture
-harness/hitl.py             HITL approval gate — interactive CLI, session-allow, crash-resume
-harness/checkpoint.py       CheckpointStore — pluggable run-state persistence (file + Redis); one file per agent, plus one orchestrator-level file per orchestrated run
+harness/hitl.py             HITL approval gate — interactive CLI, session-allow list
+harness/checkpoint.py       CheckpointStore + _ResumeHint + maybe_resume_key — pluggable run-state persistence (file + Redis); auto-resume built into dispatch_stream / run_stream
 harness/otel.py             OTELHook — OpenTelemetry span exporter (opt-in)
 harness/executor_bridge.py  ExecutorBridge + ExecutorTool — controlled subprocess launcher with optional Docker sandboxing
 orchestrator/planner.py     Hybrid DAG orchestrator — plan, replan, synthesize
@@ -662,24 +662,42 @@ HITL prompt and (if `checkpoint_every > 0`) at each periodic step.
 - **Orchestrated run**: `--resume <run_id>` — restores the full orchestration.
 
 ```
-  Ctrl-C to pause. Resume: python my_script.py --resume 3f7a1b2c-...:file_agent
+  Run interrupted — checkpoint saved.
+  Resume: python my_script.py --resume 3f7a1b2c-...
 ```
 
-Add one line to your script to handle either case:
+**Auto-resume — no script changes required.** When `checkpoint_store` is
+configured, `dispatch_stream` and `run_stream` detect `--resume <key>` in
+`sys.argv` automatically. Your existing script resumes transparently:
 
-```python
-from harness.hitl import maybe_resume
-
-result = await maybe_resume(runtime) or await runtime.run_agent("agent", "task")
+```bash
+python my_script.py --resume 3f7a1b2c-...
 ```
 
-`maybe_resume` passes the key directly to `runtime.resume(key)`, which
-auto-detects the checkpoint type and calls the right path:
+The runtime detects the flag, loads the checkpoint, and streams events
+identically to a fresh run. Scripts need zero resume-specific code.
+
+For **explicit control** — streaming resume or blocking resume:
 
 ```python
-# manual entry points — same detection logic
+# streaming (same event sequence as the original run)
+async for event in runtime.resume_stream("3f7a1b2c-..."):
+    ...
+
+# blocking
 result = await runtime.resume("3f7a1b2c-...:file_agent")  # single-agent
 result = await runtime.resume("3f7a1b2c-...")              # orchestrated
+```
+
+Both `resume_stream` and `resume` auto-detect the checkpoint type (agent vs
+orchestrator) from the stored data and call the right path.
+
+If you need the resume key from `sys.argv` directly:
+
+```python
+from harness.checkpoint import maybe_resume_key
+
+key = maybe_resume_key()   # returns None if --resume is absent
 ```
 
 **Orchestrated resume** skips completed tasks (injects their stored results
