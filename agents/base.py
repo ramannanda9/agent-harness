@@ -359,7 +359,9 @@ class BaseAgent:
                     if approval is None or approval.approved:
                         approved.append(act)
                     elif approval.correction:
-                        await self._inject_human_guidance(response, approval.correction, run_id)
+                        await self._inject_human_guidance(
+                            response, approval.correction, run_id, step
+                        )
                         correction_injected = True
                         break
                     # else: rejected — drop from batch silently
@@ -388,7 +390,7 @@ class BaseAgent:
                         for act in parallel_actions
                     ]
                 )
-                await self._clear_checkpoint(run_id)
+                await self._commit_checkpoint(run_id, step)
 
                 combined: list[dict] = []
                 for i, (act, obs) in enumerate(zip(parallel_actions, observations, strict=False)):
@@ -687,20 +689,45 @@ class BaseAgent:
         approval = await self._gate_tool(run_id, step, tool_name, tool_args, response)
         if approval is not None:
             if approval.correction:
-                await self._inject_human_guidance(response, approval.correction, run_id)
+                await self._inject_human_guidance(response, approval.correction, run_id, step)
                 return _HITL_CORRECTION
             if not approval.approved:
-                await self._clear_checkpoint(run_id)
+                await self._commit_checkpoint(run_id, step)
                 return f"Tool rejected by human: {approval.correction or 'no reason given'}"
         obs = await self._execute_tool(tool_name, tool_args)
-        await self._clear_checkpoint(run_id)
+        if approval is not None:
+            # HITL was involved — overwrite pending checkpoint with clean state.
+            # Non-HITL tools leave the step checkpoint intact for the next iteration.
+            await self._commit_checkpoint(run_id, step)
         return obs
 
-    async def _inject_human_guidance(self, response: dict, correction: str, run_id: str) -> None:
-        """Append human correction to WorkingMemory and clear the checkpoint."""
+    async def _inject_human_guidance(
+        self, response: dict, correction: str, run_id: str, step: int
+    ) -> None:
+        """Append human correction to WorkingMemory and commit a clean checkpoint."""
         await self._working_memory.append("assistant", json.dumps(response))
         await self._working_memory.append("user", f"Human guidance: {correction}")
-        await self._clear_checkpoint(run_id)
+        await self._commit_checkpoint(run_id, step)
+
+    async def _commit_checkpoint(self, run_id: str, step: int) -> None:
+        """Overwrite checkpoint with current state (no pending field).
+
+        Called after HITL resolves or a tool completes so the stored state
+        always reflects reality — no stale 'pending' approval marker, and
+        the step position is preserved for crash-resume.
+        """
+        if self._checkpoint_store is None:
+            return
+        await self._checkpoint_store.write(
+            run_id,
+            {
+                "run_id": run_id,
+                "agent_id": self.config.agent_id,
+                "task": self._task,
+                "step": step,
+                "memory": self._working_memory.to_dict(),
+            },
+        )
 
     async def _clear_checkpoint(self, run_id: str) -> None:
         if self._checkpoint_store:
@@ -733,7 +760,7 @@ class BaseAgent:
         )
 
         if approval.correction:
-            await self._inject_human_guidance(llm_response, approval.correction, run_id)
+            await self._inject_human_guidance(llm_response, approval.correction, run_id, step)
             return
 
         observation = (
@@ -760,7 +787,7 @@ class BaseAgent:
                 else observation
             )
             await self._working_memory.append("user", f"Observation: {obs_text}")
-        await self._clear_checkpoint(run_id)
+        await self._commit_checkpoint(run_id, step)
 
 
 # ── Response normalization (module-level for testability) ────────────────────
