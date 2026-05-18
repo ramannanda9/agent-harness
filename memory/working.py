@@ -1,21 +1,28 @@
 """
 WorkingMemory — per-agent, per-run in-context memory.
 
-Eviction strategy: when token budget is hit, summarize the oldest
-50% of messages via LLM into a single compressed message, then drop
-the originals. Summarization cost is always cheaper than what it replaces.
+Eviction strategy: rolling structured summary with a recency window.
+
+When total tokens exceed `max_tokens`, the oldest unpinned messages outside
+the recency window are folded into a single structured summary block
+(sections: Facts / Tools used / Errors / Open questions). At most one
+summary block exists at any time — subsequent evictions EXTEND the existing
+summary (the LLM sees the prior structured summary plus the new batch and
+returns an updated structured summary) instead of re-summarizing its own
+paragraph output, avoiding fidelity decay across passes.
+
+The recency window (last N non-pinned, non-summary messages) is protected
+from eviction in normal operation and is only relaxed when budget pressure
+forces it. The summary's role is always set opposite the next non-pinned
+non-summary message so the ReAct user/assistant alternation invariant holds.
 
 Token counting: chars/4 heuristic by default — stable across content types
 (code, JSON, English, non-English) within ~10–20% of real BPE counts, with
-zero dependencies. For exact counts, pass a custom `token_counter` to
-WorkingMemory:
+zero dependencies. For exact counts, pass a custom `token_counter`:
 
     import tiktoken
     enc = tiktoken.get_encoding("cl100k_base")
     wm = WorkingMemory(llm=..., token_counter=lambda s: len(enc.encode(s)))
-
-Anthropic users can wrap their `count_tokens` API call similarly; just
-be aware that remote calls in the eviction hot path add latency.
 """
 
 from __future__ import annotations
@@ -73,9 +80,8 @@ class LLMClient(Protocol):
 def _format_for_summary(m: Message) -> str:
     """Render a message as plain text for the summarization LLM.
 
-    Image content blocks are replaced with the literal string "[image]" so the
-    summarizer LLM (which may be text-only) can still produce a useful summary
-    that acknowledges the image was present without trying to decode it.
+    Image content blocks become "[image]" so a text-only summarizer can still
+    produce a useful summary that acknowledges the image was present.
     """
     if isinstance(m.content, str):
         return f"[{m.role.upper()}]: {m.content}"
@@ -88,13 +94,51 @@ def _format_for_summary(m: Message) -> str:
     return f"[{m.role.upper()}]: {''.join(parts)}"
 
 
+# Marker emitted by new summaries. Legacy checkpoints from the previous
+# implementation used "[Memory compressed]:" — both are recognized on load.
+SUMMARY_HEADER = "[Memory summary]"
+_LEGACY_SUMMARY_PREFIXES = ("[Memory summary]", "[Memory compressed]")
+
+
 SUMMARIZE_SYSTEM = """
 You are a memory compressor for an AI agent.
-Summarize the provided conversation messages into a single, dense paragraph.
-Preserve: key facts discovered, tool results, decisions made, errors encountered.
-Discard: pleasantries, repeated information, verbose tool output.
-Output ONLY the summary paragraph — no preamble, no labels.
-"""
+Produce a structured summary of the conversation messages below.
+
+Use exactly this format, omitting any section that has no entries:
+
+[Memory summary]
+Facts:
+- <one fact per bullet>
+Tools used:
+- <tool>: <one-line outcome>
+Errors:
+- <error or failed approach>
+Open questions:
+- <unresolved item or next step>
+
+Rules:
+- One short line per bullet. No multi-sentence bullets.
+- Preserve concrete details (file paths, names, numbers, error messages).
+- Discard pleasantries, restated context, and verbose tool output.
+- Output ONLY the [Memory summary] block — no preamble, no closing remarks.
+""".strip()
+
+
+EXTEND_SUMMARY_SYSTEM = """
+You are a memory compressor for an AI agent.
+You are given an existing structured summary and a batch of new conversation
+messages. Produce an UPDATED structured summary that merges the new
+information into the existing one.
+
+Rules:
+- Use the same format and section headers as the existing summary.
+- Merge or deduplicate bullets where the new messages elaborate on or
+  resolve existing items (e.g. an open question becoming a fact).
+- Add new bullets for genuinely new information.
+- Keep bullets short, one line each. Preserve concrete details.
+- Omit sections with no entries.
+- Output ONLY the [Memory summary] block — no preamble, no closing remarks.
+""".strip()
 
 
 @dataclass
@@ -103,35 +147,48 @@ class Message:
     content: str | list  # str for text; list of content blocks for multimodal
     token_count: int = 0  # set by WorkingMemory.append using its configured counter
     pinned: bool = False  # pinned messages are never evicted (e.g. system prompt)
+    is_summary: bool = False  # marks the rolling-summary message (at most one)
 
 
 class WorkingMemory:
     """
     Token-budget-aware in-context memory for a single agent run.
 
+    Parameters:
+        llm: client used for compression calls.
+        max_tokens: budget; eviction fires when total exceeds this.
+        summarize_ratio: fraction of *eligible* messages folded in per
+            eviction call. Eligible = non-pinned, non-summary, outside the
+            recency window.
+        recency_window: number of trailing non-pinned, non-summary messages
+            protected from eviction in normal operation. The window is
+            relaxed (oldest-protected-first) if budget forces it. Default 4
+            preserves the last two ReAct steps verbatim.
+        token_counter: optional exact counter; defaults to chars/4 heuristic.
+
     Eviction:
-        When total tokens exceed max_tokens, the oldest unpinned 50% of
-        messages are passed to the LLM for summarization, replaced by a
-        single compressed message, and the originals are dropped.
-
-        The summary role is set to the opposite of the first non-pinned
-        message that follows it, preserving the alternating user/assistant
-        invariant the ReAct format requires.
-
-        Up to two summarization passes fire per append() before falling back
-        to a hard FIFO drop as a last resort.
+        - If a prior summary exists, the new batch is folded into it
+          (extend mode); otherwise a fresh summary is created.
+        - The new summary occupies the slot of the oldest message in the
+          replaced set, with its role set opposite the next non-pinned
+          non-summary message to preserve ReAct alternation.
+        - Up to two compaction passes fire per append() before falling
+          back to a hard FIFO drop (which still protects the recency
+          window until forced to relax it).
     """
 
     def __init__(
         self,
         llm: LLMClient,
         max_tokens: int = 8000,
-        summarize_ratio: float = 0.5,  # summarize oldest 50% when evicting
+        summarize_ratio: float = 0.5,  # summarize oldest 50% of eligible when evicting
+        recency_window: int = 4,  # protect last N non-pinned non-summary messages
         token_counter: Callable[[str], int] | None = None,
     ) -> None:
         self._llm = llm
         self.max_tokens = max_tokens
         self.summarize_ratio = summarize_ratio
+        self.recency_window = max(0, recency_window)
         self._count = token_counter or count_tokens
         self._messages: list[Message] = []
         self._token_total: int = 0
@@ -171,12 +228,14 @@ class WorkingMemory:
                     "content": m.content,
                     "pinned": m.pinned,
                     "token_count": m.token_count,
+                    "is_summary": m.is_summary,
                 }
                 for m in self._messages
             ],
             "summarization_count": self._summarization_count,
             "max_tokens": self.max_tokens,
             "summarize_ratio": self.summarize_ratio,
+            "recency_window": self.recency_window,
         }
 
     @classmethod
@@ -186,21 +245,35 @@ class WorkingMemory:
         llm: LLMClient,
         token_counter: Callable[[str], int] | None = None,
     ) -> WorkingMemory:
-        """Restore from a checkpoint dict. Stored token counts are reused as-is."""
+        """Restore from a checkpoint dict. Stored token counts are reused as-is.
+
+        Legacy checkpoints (no `is_summary` field, no `recency_window`) are
+        backfilled: content prefixed with a known summary marker is treated
+        as `is_summary=True`, and `recency_window` defaults to 4.
+        """
         wm = cls(
             llm=llm,
             max_tokens=data["max_tokens"],
             summarize_ratio=data["summarize_ratio"],
+            recency_window=data.get("recency_window", 4),
             token_counter=token_counter,
         )
         for m in data["messages"]:
-            msg = Message(
-                role=m["role"],
-                content=m["content"],
-                pinned=m["pinned"],
-                token_count=m["token_count"],
+            content = m["content"]
+            is_summary = m.get("is_summary")
+            if is_summary is None:
+                is_summary = isinstance(content, str) and any(
+                    content.startswith(p) for p in _LEGACY_SUMMARY_PREFIXES
+                )
+            wm._messages.append(
+                Message(
+                    role=m["role"],
+                    content=content,
+                    pinned=m["pinned"],
+                    token_count=m["token_count"],
+                    is_summary=bool(is_summary),
+                )
             )
-            wm._messages.append(msg)
         wm._token_total = sum(msg.token_count for msg in wm._messages)
         wm._summarization_count = data["summarization_count"]
         return wm
@@ -211,67 +284,135 @@ class WorkingMemory:
 
     # ── Eviction ──────────────────────────────────────────────────────────────
 
+    def _eligible_indices(self, relax_recency: int = 0) -> list[int]:
+        """Indices of summarizable messages (non-pinned, non-summary), oldest first.
+
+        The newest `recency_window - relax_recency` non-pinned non-summary
+        messages are protected; everything older is eligible. Walks from
+        newest backward so the protection count is robust to interleaved
+        pinned/summary messages.
+        """
+        protect = max(0, self.recency_window - relax_recency)
+        candidates_back: list[int] = []
+        for i in range(len(self._messages) - 1, -1, -1):
+            m = self._messages[i]
+            if m.pinned or m.is_summary:
+                continue
+            candidates_back.append(i)
+        # candidates_back is newest-first; protect the first `protect` of them.
+        return sorted(candidates_back[protect:])
+
     async def _evict(self, _depth: int = 0) -> None:
-        evictable = [m for m in self._messages if not m.pinned]
-        if not evictable:
-            return  # all messages pinned — hard budget violation, accept it
+        # Find eligible messages, relaxing recency_window only if necessary.
+        relax = 0
+        eligible_idx = self._eligible_indices(relax)
+        while not eligible_idx and relax <= self.recency_window:
+            relax += 1
+            eligible_idx = self._eligible_indices(relax)
 
-        # take oldest summarize_ratio of evictable messages
-        cutoff = max(1, int(len(evictable) * self.summarize_ratio))
-        to_summarize = evictable[:cutoff]
+        if eligible_idx:
+            cutoff = max(1, int(len(eligible_idx) * self.summarize_ratio))
+            chosen_idx = eligible_idx[:cutoff]
+            to_summarize = [self._messages[i] for i in chosen_idx]
 
-        summary_text = await self._summarize(to_summarize)
-        summary_content = f"[Memory compressed]: {summary_text}"
+            prior_summary = next((m for m in self._messages if m.is_summary), None)
+            if prior_summary is None:
+                summary_text = await self._summarize_initial(to_summarize)
+            else:
+                summary_text = await self._summarize_extend(prior_summary.content, to_summarize)
 
-        # Use the opposite role of the first non-pinned message that follows the
-        # summarized block, so the ReAct alternating user/assistant invariant holds.
-        summarized_ids = set(id(m) for m in to_summarize)
-        remaining = [m for m in self._messages if id(m) not in summarized_ids]
-        first_after = next((m for m in remaining if not m.pinned), None)
-        summary_role = "assistant" if (first_after and first_after.role == "user") else "user"
+            summary_content = (
+                summary_text
+                if summary_text.startswith(SUMMARY_HEADER)
+                else f"{SUMMARY_HEADER}\n{summary_text}"
+            )
 
-        summary_msg = Message(
-            role=summary_role,
-            content=summary_content,
-            token_count=self._count(summary_content),
-        )
+            # Remove the picked messages AND the prior summary (if any); the
+            # new summary replaces both.
+            removed_ids = {id(m) for m in to_summarize}
+            if prior_summary is not None:
+                removed_ids.add(id(prior_summary))
 
-        # remove summarized messages, insert summary in their place
-        insert_idx = next(i for i, m in enumerate(self._messages) if id(m) in summarized_ids)
-        self._messages = [m for m in self._messages if id(m) not in summarized_ids]
-        self._messages.insert(insert_idx, summary_msg)
+            insert_idx = next(i for i, m in enumerate(self._messages) if id(m) in removed_ids)
+            remaining = [m for m in self._messages if id(m) not in removed_ids]
 
-        # recompute token total
-        self._token_total = sum(m.token_count for m in self._messages)
-        self._summarization_count += 1
+            # Role = opposite of the next non-pinned non-summary message so
+            # the ReAct alternating invariant holds. No such message → "user".
+            first_after = next(
+                (m for m in remaining if not m.pinned and not m.is_summary),
+                None,
+            )
+            summary_role = "assistant" if (first_after and first_after.role == "user") else "user"
 
-        # Second-pass summarization before resorting to hard drops (max 2 passes).
+            summary_msg = Message(
+                role=summary_role,
+                content=summary_content,
+                token_count=self._count(summary_content),
+                is_summary=True,
+            )
+
+            self._messages = remaining
+            self._messages.insert(insert_idx, summary_msg)
+            self._token_total = sum(m.token_count for m in self._messages)
+            self._summarization_count += 1
+
+        # Second pass before resorting to hard drops (max 2 passes).
         if self._token_total > self.max_tokens and _depth < 1:
             await self._evict(_depth=_depth + 1)
             return
 
-        # safety valve: if still over budget after both passes, hard FIFO drop
+        # Safety valve: hard FIFO drop. Drops oldest non-pinned non-summary
+        # first; only touches the summary or recency-window messages if
+        # nothing else is left.
         while self._token_total > self.max_tokens:
-            for i, m in enumerate(self._messages):
-                if not m.pinned:
-                    self._token_total -= m.token_count
-                    self._messages.pop(i)
-                    break
-            else:
-                break  # nothing left to drop
+            drop_idx = next(
+                (i for i, m in enumerate(self._messages) if not m.pinned and not m.is_summary),
+                None,
+            )
+            if drop_idx is None:
+                drop_idx = next(
+                    (i for i, m in enumerate(self._messages) if not m.pinned),
+                    None,
+                )
+            if drop_idx is None:
+                break  # only pinned messages remain — accept overshoot
+            self._token_total -= self._messages[drop_idx].token_count
+            self._messages.pop(drop_idx)
 
-    async def _summarize(self, messages: list[Message]) -> str:
+    # ── Summarization helpers ─────────────────────────────────────────────────
+
+    async def _summarize_initial(self, messages: list[Message]) -> str:
         formatted = "\n".join(_format_for_summary(m) for m in messages)
+        return await self._call_llm(SUMMARIZE_SYSTEM, formatted)
+
+    async def _summarize_extend(
+        self,
+        prior_summary_content: str | list,
+        new_messages: list[Message],
+    ) -> str:
+        # prior_summary_content is expected to be a string (summaries are
+        # always text), but defensively handle the list-of-blocks case too.
+        if isinstance(prior_summary_content, list):
+            prior_text = "".join(
+                b.get("text", "") if isinstance(b, dict) and b.get("type") == "text" else "[image]"
+                for b in prior_summary_content
+            )
+        else:
+            prior_text = prior_summary_content
+        new_text = "\n".join(_format_for_summary(m) for m in new_messages)
+        user_content = f"Existing summary:\n{prior_text}\n\nNew messages to fold in:\n{new_text}"
+        return await self._call_llm(EXTEND_SUMMARY_SYSTEM, user_content)
+
+    async def _call_llm(self, system: str, user_content: str) -> str:
         try:
             result = await self._llm.complete(
-                system=SUMMARIZE_SYSTEM,
-                messages=[{"role": "user", "content": formatted}],
+                system=system,
+                messages=[{"role": "user", "content": user_content}],
             )
-            # handle both raw string and dict response
             if isinstance(result, dict):
                 return result.get("text") or result.get("answer") or str(result)
             return str(result)
         except Exception as e:
-            # fallback: truncated concatenation — never let summarization break the agent
-            fallback = formatted[:500]
-            return f"[Summarization failed: {e}] Truncated context: {fallback}"
+            # Fallback: truncated raw context — never let summarization break the agent.
+            fallback = user_content[:500]
+            return f"{SUMMARY_HEADER}\n[Summarization failed: {e}] Truncated context: {fallback}"
