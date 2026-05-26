@@ -38,6 +38,7 @@ harness/events.py           BusEvent + EventType — canonical event vocabulary
 harness/llm/openai.py       OpenAILLM — OpenAI adapter with usage + cost tracking
 harness/annotation.py       Annotation store + AnnotationHook — RLHF trajectory capture
 harness/hitl.py             HITL approval gate — interactive CLI, session-allow list
+harness/steering.py         Async steering — agent.steer(text), StdinRouter pub/sub, FileSteer, factory helpers
 harness/checkpoint.py       CheckpointStore + _ResumeHint + maybe_resume_key — pluggable run-state persistence (file + Redis); auto-resume built into dispatch_stream / run_stream
 harness/otel.py             OTELHook — OpenTelemetry span exporter (opt-in)
 harness/executor_bridge.py  ExecutorBridge + ExecutorTool — controlled subprocess launcher with optional Docker sandboxing
@@ -720,3 +721,94 @@ When the human types a correction instead of y/n:
 
 The `annotation_store` and `checkpoint_store` are independent — both can be
 wired simultaneously for RLHF data collection with HITL review.
+
+## Async steering
+
+HITL is synchronous — it only fires when a gated tool is about to run. For
+out-of-band course-correction (HTTP handler, supervisor agent, file watcher,
+or a human typing in the terminal), each `BaseAgent` exposes a
+non-blocking `steer(text)` method. Items are drained at the **top of each
+ReAct iteration**, before the per-step checkpoint write and before the
+next think, then appended to `WorkingMemory` as a `Human guidance: <text>`
+user message. The LLM sees them on the next think and adjusts. One
+`HUMAN_GUIDANCE` `BusEvent` fires per drained item.
+
+Why a queue instead of writing straight to `WorkingMemory`: `steer()` is
+synchronous and callable from any coroutine; `WorkingMemory.append` is
+async (eviction can call the LLM). The queue is the producer/consumer
+boundary, enforces step-boundary delivery, and keeps WM single-writer.
+
+### Programmatic API (always available)
+
+```python
+agent.steer("skip the legal database, use academic sources only")
+```
+
+Fires immediately; the agent picks it up at the next step boundary.
+Worst-case latency = remaining tool time + next-think time.
+
+### Sources via factory (so orchestrated agents are reachable)
+
+`BaseAgent` and `AgentRuntime` both accept `steering_source_factory` — a
+callable `(agent) -> async ctx mgr`. The agent enters the source on
+`run_stream`, exits on completion. No live-agent registry; agents the
+runtime constructs internally still get steering.
+
+Two built-in factories:
+
+```python
+from harness.steering import file_steering_factory, stdin_steering_factory
+
+# 1. File-based — one file per agent, polled for appends (no shared resource)
+runtime = AgentRuntime(
+    ...,
+    steering_source_factory=file_steering_factory(
+        "/tmp/ah-{run_id}-{agent_id}.steer"
+    ),
+)
+# Steer from any other terminal:
+#   echo "wrap up and synthesise" >> /tmp/ah-<run_id>-researcher.steer
+
+# 2. Stdin-based — single shared StdinRouter with prefix routing
+runtime = AgentRuntime(
+    ...,
+    steering_source_factory=stdin_steering_factory(),
+)
+# At the terminal:
+#   researcher: skip the legal db, focus on academic
+#   writer:     keep the report under 500 words
+#   *:          stop after this step
+```
+
+Single-agent stdin runs accept lines with no prefix. Multi-agent runs
+require `agent_id: text` (or `*: text` for broadcast); unknown or
+unprefixed lines print a stderr hint and are discarded.
+
+The stdin factory's underlying `StdinRouter` is started/stopped
+automatically — the runtime detects the factory's async-context-manager
+shape and wraps `dispatch_stream` / `run_stream` / `run_routed_stream`
+around it. Ref-counted so nested calls (`dispatch_stream → run_stream`)
+don't double-start the router.
+
+### HITL coordination
+
+When a `StdinRouter` is active, HITL calls `router.claim_next_line()`
+**before** printing its approval banner — the next stdin line resolves
+HITL's pending Future and bypasses pub/sub. After resolution, subsequent
+lines route to steering subscribers normally. Non-router HITL falls
+back to the original direct-read path, so existing non-interactive
+scripts and tests are unaffected.
+
+### Constraints
+
+- Steering arrives **between steps**, never mid-tool, never mid-think.
+  Tools that are already running complete; the LLM stream that's
+  already producing completes; guidance lands at the next safe boundary.
+- Guidance queued **after** the LLM emits `action: "finish"` is lost —
+  the agent already decided it's done.
+- Crash between drain and next checkpoint write → the queued items are
+  in the persisted WM. Crash between checkpoint write and next drain →
+  lost; re-steer after `--resume`.
+
+See `examples/complex_sysaudit_demo.py` for stdin steering across three
+agents alongside HITL on the shell tool.
