@@ -145,9 +145,55 @@ class BaseAgent:
         self._task: str = ""
         self._last_think_error: str | None = None
         self._ckp_id: str = ""  # f"{run_id}:{agent_id}" — unique per agent per run
+        # Async steering queue — items drained at the top of each ReAct
+        # step (before checkpoint, before think). Created eagerly so
+        # callers can steer() before run_stream starts.
+        self._steering: asyncio.Queue[str] = asyncio.Queue()
         self._resume_key: str = (
             ""  # key printed in --resume banner; set by orchestrator to outer run_id
         )
+
+    # ── Async steering ────────────────────────────────────────────────────────
+
+    def steer(self, text: str) -> None:
+        """Inject human guidance to be consumed at the next ReAct step boundary.
+
+        Non-blocking and safe to call concurrently from any coroutine in the
+        same event loop. Drained at the top of the next iteration (before
+        the per-step checkpoint write and before the next think call), then
+        appended to WorkingMemory as a user message and emitted as a
+        HUMAN_GUIDANCE BusEvent.
+
+        Worst-case latency = time remaining in the current tool +
+        next-think duration. Guidance arriving after the LLM has already
+        emitted action="finish" is lost — the agent has decided it's done.
+        """
+        if not text or not text.strip():
+            return
+        self._steering.put_nowait(text.strip())
+
+    async def _drain_steering(self, step: int) -> AsyncGenerator[BusEvent, None]:
+        """Drain any queued guidance into WorkingMemory; yield one event each.
+
+        Called at the top of each ReAct iteration. Items are FIFO. Empty
+        queue is a no-op (zero overhead when no one is steering).
+        """
+        while not self._steering.empty():
+            try:
+                text = self._steering.get_nowait()
+            except asyncio.QueueEmpty:
+                break  # defensive — single consumer, should never fire
+            await self._working_memory.append("user", f"Human guidance: {text}")
+            self._tracer.log(
+                "human_guidance",
+                self.config.agent_id,
+                {"step": step, "text": text},
+            )
+            yield BusEvent(
+                type=EventType.HUMAN_GUIDANCE,
+                agent_id=self.config.agent_id,
+                payload={"step": step, "text": text},
+            )
 
     # ── Streaming entry point (canonical) ─────────────────────────────────────
 
@@ -295,6 +341,10 @@ class BaseAgent:
     ) -> AsyncGenerator[BusEvent, None]:
         for step in range(start_step, self.config.max_steps):
             self._guard.check()
+            # Drain steering queue BEFORE the checkpoint write so any
+            # queued guidance is captured by the persisted WM.
+            async for guidance_event in self._drain_steering(step):
+                yield guidance_event
             if (
                 self._checkpoint_store is not None
                 and self.config.checkpoint_every > 0

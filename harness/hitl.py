@@ -176,14 +176,32 @@ async def request_approval(
 
     Holds stdout_lock for the duration so concurrent agent events don't
     interleave with the banner or the input prompt.
+
+    If an async steering router is active (see harness/steering.py), this
+    function claims the next stdin line via the router so steering and
+    HITL share stdin cleanly. Otherwise it falls back to a direct
+    `input()` call — the original behavior, unchanged for non-interactive
+    scripts and existing tests.
     """
+    from harness.steering import get_active_router
+
     async with stdout_lock:
+        router = get_active_router()
+        # Reserve the next stdin line BEFORE printing the banner so any
+        # response the user types after seeing the prompt routes to HITL,
+        # not to the steering callback.
+        hitl_future: Any = router.claim_next_line() if router is not None else None
+
         _print_banner(req)
+        print("  Approve? [y/n/a/correction]: ", end="", flush=True)
 
         guard.suspend()
         try:
-            loop = asyncio.get_running_loop()
-            raw = await loop.run_in_executor(None, input, "  Approve? [y/n/a/correction]: ")
+            if hitl_future is not None:
+                raw = await hitl_future
+            else:
+                loop = asyncio.get_running_loop()
+                raw = await loop.run_in_executor(None, sys.stdin.readline)
         finally:
             guard.resume()
 

@@ -18,6 +18,7 @@ Event lifecycle within a single goal:
   Orchestrated path (run / run_stream):
     PLAN                  — orchestrator emitted a static DAG
     (per task in DAG)
+        HUMAN_GUIDANCE?   — async steering drained at top of step
         THOUGHT           — agent's next-step reasoning
         TOKEN*            — partial LLM output (only when client streams)
         ACTION            — agent chose a tool + args
@@ -46,6 +47,7 @@ class EventType(str, Enum):
     TOKEN = "token"
     ACTION = "action"
     OBSERVATION = "observation"
+    HUMAN_GUIDANCE = "human_guidance"  # async steering injected at step boundary
     TASK_DONE = "task_done"
     REPLAN = "replan"
     SYNTHESIS = "synthesis"
