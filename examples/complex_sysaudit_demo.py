@@ -54,7 +54,7 @@ from harness.events import EventType
 from harness.executor_bridge import ExecutorBridge, ExecutorConfig, ExecutorTool, find_executor
 from harness.llm.openai import OpenAILLM
 from harness.runtime import AgentRegistry, AgentRuntime, GuardrailConfig, ToolRegistry
-from harness.steering import StdinRouter, stdin_steering_factory
+from harness.steering import stdin_steering_factory
 from memory.manager import MemoryManager
 from memory.stores import InMemoryEpisodicStore, InMemorySemanticStore
 from tools.builtin.http_fetch import HTTPFetch
@@ -292,11 +292,12 @@ async def main() -> None:
             llm=llm,
         )
 
-        # Steering: one router shared across both runtimes so the user's
-        # stdin lines reach whichever agent is currently active. Each agent
-        # subscribes under its agent_id at run_stream entry via the factory.
-        steering_router = StdinRouter()
-        steering_factory = stdin_steering_factory(steering_router)
+        # Steering: one factory shared across both runtimes. The factory is
+        # both a per-agent source factory AND an async context manager that
+        # owns the shared StdinRouter — the AgentRuntime enters/exits it
+        # automatically around dispatch_stream, so we don't manage the
+        # router lifecycle here.
+        steering_factory = stdin_steering_factory()
 
         def _make_runtime(registry: AgentRegistry) -> AgentRuntime:
             return AgentRuntime(
@@ -326,12 +327,11 @@ async def main() -> None:
         # ── Pass 1: Full audit (or transparent resume) ────────────────────────
         # dispatch_stream automatically resumes from --resume <key> when a
         # checkpoint store is configured — no special handling needed here.
-        # The steering router runs for the lifetime of both passes (started
-        # here, stopped at the natural end of main()). HITL prompts take
-        # precedence — the next stdin line after a banner is consumed by
-        # HITL; otherwise lines route to the matching agent's steer queue.
-
-        await steering_router.__aenter__()
+        # The runtime auto-wraps dispatch_stream in the steering factory's
+        # lifecycle, so the StdinRouter starts/stops without explicit
+        # management here. HITL prompts take precedence — the next stdin
+        # line after a banner is consumed by HITL; otherwise lines route
+        # to the matching agent's steer queue.
 
         print(f"\nPASS 1 — full audit\nGoal: {_trunc(AUDIT_GOAL, 120)}")
         print(_sep("═"))
@@ -488,9 +488,6 @@ async def main() -> None:
 
             elif event.type == EventType.ERROR:
                 print(f"\n[error]      {event.error}", file=sys.stderr)
-
-        # Stop the steering router started at the top of Pass 1. Run is over.
-        await steering_router.__aexit__(None, None, None)
 
 
 if __name__ == "__main__":

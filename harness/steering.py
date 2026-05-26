@@ -406,22 +406,67 @@ def file_steering_factory(
     return factory
 
 
-def stdin_steering_factory(
-    router: StdinRouter,
-    prefix_template: str = "{agent_id}",
-) -> Callable[[BaseAgent], StdinAgentSource]:
-    """Return a factory that subscribes each agent to a shared StdinRouter.
+class _StdinSteeringFactory:
+    """Callable + async context manager.
 
-    `prefix_template` may reference `{agent_id}`. Default subscribes each
-    agent to its own `agent_id` prefix. The caller is responsible for
-    `router.start()` / `router.stop()` around the run.
+    As a callable: returns a per-agent `StdinAgentSource` subscribed to
+    the agent's `agent_id` prefix on the shared `StdinRouter`.
+
+    As an async context manager: starts the router (and registers it for
+    HITL coordination) on enter, stops it on exit. The AgentRuntime
+    detects this shape and wraps its `dispatch_stream` automatically, so
+    user code doesn't need to manage the router lifecycle.
+
+    Bring-your-own-router: pass `router=...` to skip the lifecycle hooks
+    (you become responsible for start/stop).
     """
 
-    def factory(agent: BaseAgent) -> StdinAgentSource:
-        prefix = prefix_template.format(agent_id=agent.config.agent_id)
-        return StdinAgentSource(agent, router, prefix=prefix)
+    def __init__(
+        self,
+        router: StdinRouter | None = None,
+        prefix_template: str = "{agent_id}",
+    ) -> None:
+        self._router = router or StdinRouter()
+        self._owned = router is None
+        self._prefix_template = prefix_template
+        # Ref-counted lifecycle: nested AgentRuntime wraps (dispatch_stream
+        # → run_stream) re-enter the factory; only the outermost
+        # enter/exit actually starts/stops the router.
+        self._enter_count = 0
 
-    return factory
+    def __call__(self, agent: BaseAgent) -> StdinAgentSource:
+        prefix = self._prefix_template.format(agent_id=agent.config.agent_id)
+        return StdinAgentSource(agent, self._router, prefix=prefix)
+
+    async def __aenter__(self) -> _StdinSteeringFactory:
+        if self._owned and self._enter_count == 0:
+            await self._router.__aenter__()
+        self._enter_count += 1
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        self._enter_count = max(0, self._enter_count - 1)
+        if self._owned and self._enter_count == 0:
+            await self._router.__aexit__(exc_type, exc, tb)
+
+
+def stdin_steering_factory(
+    router: StdinRouter | None = None,
+    prefix_template: str = "{agent_id}",
+) -> _StdinSteeringFactory:
+    """Return a steering factory that lifecycles its own StdinRouter.
+
+    The returned object is both a callable (per-agent source factory)
+    and an async context manager (shared-router lifecycle). When passed
+    to `AgentRuntime(steering_source_factory=...)`, the runtime enters
+    the context manager around `dispatch_stream`/`run_stream` so callers
+    don't manage the router themselves.
+
+    Pass `router=...` to bring your own (caller manages start/stop).
+    `prefix_template` may reference `{agent_id}`; default subscribes
+    each agent to its own `agent_id`.
+    """
+    return _StdinSteeringFactory(router=router, prefix_template=prefix_template)
 
 
 # ── Direct-use shims (no AgentRuntime / no factory) ───────────────────────────
