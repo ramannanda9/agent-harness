@@ -1,35 +1,51 @@
 """
-harness/steering.py — async steering front-ends for BaseAgent.
+harness/steering.py — async steering sources for BaseAgent.
 
-Three pieces, each composable as an async context manager that pushes into
-the agent's `steer()` queue:
+A steering source is any async context manager that, while active, may call
+`agent.steer(text)` to inject guidance into the agent's queue. The agent
+owns the source's lifecycle: it enters the source at the top of
+`run_stream` and exits it when the run finishes. No live-agent registry,
+no shared mutable state.
 
-  StdinSteer(agents)         — interactive terminal use; reads stdin lines
-                               and routes them to the right agent. In
-                               multi-agent mode, requires a `<agent_id>:`
-                               prefix (or `*:` for broadcast).
+Two transport-level pieces:
 
-  FileSteer(agent, path?)    — deployed / headless use; tails an append-only
-                               file and forwards each new line to the
-                               agent's queue.
+  StdinRouter         — process-wide pub/sub over stdin lines. Subscribers
+                        register a prefix and a callback; each line is
+                        parsed as `[prefix:] text` and routed to matching
+                        subscribers. Coordinates with HITL via
+                        `claim_next_line()`.
 
-  StdinRouter                — internal coordinator: a single stdin reader
-                               task that routes lines to either a pending
-                               HITL prompt (when one has claimed the next
-                               line) or the registered steering callback.
+  FileSteer           — per-agent file watcher. Polls an append-only file
+                        and forwards new lines to `agent.steer()`. The
+                        agent never shares this file with another agent.
 
-The agent itself only knows about `agent.steer(text)`. The shims are pure
-adapters. Programmatic callers (HTTP handlers, MCP tools, supervisor
-agents) skip the shims and call `agent.steer()` directly.
+Two agent-bound sources for use with `steering_source_factory`:
 
-HITL coordination
------------------
-`harness/hitl.py:request_approval` queries `get_active_router()`. If a
-router is active, HITL calls `router.claim_next_line()` BEFORE printing
-its banner — this hands the router a Future to fulfill with the next
-stdin line, instead of forwarding to steering. If no router is active,
-HITL falls back to its current `input()` path. Existing non-interactive
-tests are unaffected.
+  FileSteer           — also serves as a per-agent source (constructed by
+                        the factory with the right path / agent pair).
+  StdinAgentSource    — subscribes to one prefix on a shared
+                        `StdinRouter`. Forwards matched lines to the
+                        bound agent's `steer()`.
+
+Two convenience helpers that return factories ready for
+`AgentRuntime(steering_source_factory=...)`:
+
+  file_steering_factory(path_template)
+  stdin_steering_factory(router)
+
+Direct-use shims (for code that holds explicit `BaseAgent` references and
+does not go through `AgentRuntime`):
+
+  StdinSteer(agents)   — wraps a `StdinRouter`, subscribes each agent
+                         with its `agent_id` prefix (or with the empty
+                         prefix when there's only one agent so the user
+                         can skip prefixing entirely).
+
+HITL coordination (unchanged in shape, updated for pub/sub):
+  `harness/hitl.py:request_approval` calls `get_active_router()`. If a
+  router is active, it calls `router.claim_next_line()` BEFORE printing
+  the banner. That line bypasses pub/sub and resolves HITL's Future
+  directly. Subsequent lines return to pub/sub.
 """
 
 from __future__ import annotations
@@ -45,17 +61,13 @@ if TYPE_CHECKING:
     from agents.base import BaseAgent
 
 
-# ── Active-router registry ────────────────────────────────────────────────────
-#
-# StdinSteer registers itself here on enter and clears on exit. HITL reads
-# this to decide whether to claim the next stdin line via the router or
-# fall back to a direct input() call.
+# ── Active-router registry (HITL coordination only) ───────────────────────────
 
 _active_router: StdinRouter | None = None
 
 
 def get_active_router() -> StdinRouter | None:
-    """Return the currently-active StdinRouter, or None if no shim is active."""
+    """Return the active StdinRouter for HITL coordination, or None."""
     return _active_router
 
 
@@ -64,7 +76,7 @@ def _set_active_router(router: StdinRouter | None) -> None:
     _active_router = router
 
 
-# ── Stdin router ──────────────────────────────────────────────────────────────
+# ── Stdin router (process-wide pub/sub) ───────────────────────────────────────
 
 
 async def _default_readline() -> str | None:
@@ -75,18 +87,24 @@ async def _default_readline() -> str | None:
 
 
 class StdinRouter:
-    """Single stdin reader task that routes lines to HITL or steering.
+    """Process-wide stdin reader with prefix-keyed pub/sub.
 
-    Routing rules:
-      - If HITL has claimed the next line (via `claim_next_line()`), that
-        line fulfills HITL's Future and steering is not invoked.
-      - Otherwise the line is dispatched to the registered steering
-        callback, if any.
-      - Empty / whitespace-only lines are skipped.
+    A single background coroutine reads `readline()` in a loop. Each
+    non-empty line is parsed:
 
-    The reader is injectable for testability. Production code constructs
-    the router with no arguments (uses real stdin); tests pass a fake
-    readline that pops from a queue.
+      - `prefix: text`    → delivered to subscribers registered with
+                            that exact prefix, plus any wildcard
+                            subscribers registered with prefix=`*`.
+      - `text` (no colon) → delivered to subscribers registered with
+                            prefix=`None` (catch-all).
+      - leading `*: text` → broadcast to every subscriber.
+
+    HITL claims pre-empt pub/sub: if `claim_next_line()` was called and
+    the Future is unresolved, the next line resolves it and is NOT
+    routed to subscribers.
+
+    Unknown-prefix lines (a `prefix:` that no one is listening for) are
+    surfaced to stderr so the user knows their input was discarded.
     """
 
     def __init__(
@@ -97,25 +115,54 @@ class StdinRouter:
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
         self._hitl_future: asyncio.Future[str] | None = None
-        self._steer_callback: Callable[[str], None] | None = None
+        # subscription_id → (prefix, callback). prefix=None is the catch-all.
+        self._subs: dict[int, tuple[str | None, Callable[[str], None]]] = {}
+        self._next_sub_id: int = 0
 
-    # ── Public API ────────────────────────────────────────────────────────────
+    # ── Pub/sub API ───────────────────────────────────────────────────────────
 
-    def set_steer_callback(self, cb: Callable[[str], None] | None) -> None:
-        """Register (or clear) the callback invoked for non-HITL stdin lines."""
-        self._steer_callback = cb
+    def subscribe(
+        self,
+        prefix: str | None,
+        callback: Callable[[str], None],
+    ) -> int:
+        """Register `callback` to receive text matching `prefix`.
+
+        prefix=None    → catch-all: receives any line that has no `:`.
+        prefix=str     → receives lines `prefix: text` (or `*: text`
+                         broadcasts). Wildcard `*` may not be used as
+                         a subscription prefix (it's reserved for
+                         broadcast sends).
+
+        Returns an integer subscription id for `unsubscribe()`.
+        """
+        if prefix == "*":
+            raise ValueError("'*' is reserved for broadcast sends, not subscription")
+        sid = self._next_sub_id
+        self._next_sub_id += 1
+        self._subs[sid] = (prefix, callback)
+        return sid
+
+    def unsubscribe(self, sub_id: int) -> None:
+        self._subs.pop(sub_id, None)
+
+    def active_prefixes(self) -> list[str]:
+        """Return the list of currently-subscribed prefixes (excludes catch-all)."""
+        return sorted({p for p, _ in self._subs.values() if p is not None})
+
+    def has_catchall(self) -> bool:
+        return any(p is None for p, _ in self._subs.values())
+
+    # ── HITL API ──────────────────────────────────────────────────────────────
 
     def claim_next_line(self) -> asyncio.Future[str]:
-        """Reserve the next stdin line for HITL.
-
-        Returns a Future that resolves with the next line read. HITL must
-        call this BEFORE printing its banner so the router knows to route
-        the user's response to it rather than to steering.
-        """
+        """Reserve the next stdin line for HITL. Resolves the returned Future."""
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[str] = loop.create_future()
         self._hitl_future = fut
         return fut
+
+    # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     async def start(self) -> None:
         if self._task is None:
@@ -129,10 +176,19 @@ class StdinRouter:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._task
             self._task = None
-        # Drop any pending HITL claim — caller is shutting down.
         if self._hitl_future is not None and not self._hitl_future.done():
             self._hitl_future.cancel()
             self._hitl_future = None
+
+    async def __aenter__(self) -> StdinRouter:
+        """Start the reader AND register as active so HITL can coordinate."""
+        await self.start()
+        _set_active_router(self)
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        _set_active_router(None)
+        await self.stop()
 
     # ── Internals ─────────────────────────────────────────────────────────────
 
@@ -143,8 +199,7 @@ class StdinRouter:
             except asyncio.CancelledError:
                 raise
             except Exception:
-                # stdin closed or read failure — stop quietly.
-                return
+                return  # stdin closed / read failure
             if line is None:
                 return  # EOF
             line = line.rstrip("\r\n")
@@ -154,123 +209,106 @@ class StdinRouter:
                 fut, self._hitl_future = self._hitl_future, None
                 fut.set_result(line)
                 continue
-            if self._steer_callback is not None:
-                try:
-                    self._steer_callback(line)
-                except Exception:
-                    # One bad callback shouldn't kill the router.
-                    pass
+            self._dispatch(line)
+
+    def _dispatch(self, line: str) -> None:
+        prefix: str | None
+        text: str
+        if ":" in line:
+            prefix, _, text = line.partition(":")
+            prefix = prefix.strip()
+            text = text.strip()
+            if not text:
+                return
+            if prefix == "*":
+                for p, cb in self._subs.values():
+                    if p is not None:  # broadcasts target prefixed subscribers
+                        self._safe_call(cb, text)
+                return
+        else:
+            prefix = None
+            text = line.strip()
+            if not text:
+                return
+
+        matched = False
+        for p, cb in list(self._subs.values()):
+            if p == prefix:
+                self._safe_call(cb, text)
+                matched = True
+        if not matched:
+            self._warn_unrouted(prefix)
+
+    def _safe_call(self, cb: Callable[[str], None], text: str) -> None:
+        try:
+            cb(text)
+        except Exception:
+            pass  # one bad subscriber must not kill the router
+
+    def _warn_unrouted(self, prefix: str | None) -> None:
+        active = self.active_prefixes()
+        if prefix is None:
+            msg = (
+                "[steering] no catch-all subscriber; line ignored. "
+                f"Active prefixes: {active or '(none)'}"
+            )
+        else:
+            msg = (
+                f"[steering] no subscriber for prefix {prefix!r}; line ignored. "
+                f"Active prefixes: {active or '(none)'}"
+            )
+        print(msg, file=sys.stderr)
 
 
-# ── Stdin shim (interactive) ──────────────────────────────────────────────────
+# ── Per-agent steering sources (used by steering_source_factory) ──────────────
 
 
-class StdinSteer:
-    """Async context manager: forwards stdin lines to agent steering queues.
+class StdinAgentSource:
+    """Async ctx mgr: subscribe one agent to a shared StdinRouter.
 
-    Single agent: every line goes to that agent's queue (no prefix).
-    Multiple agents: each line must begin with `<agent_id>:` to target one
-        agent, or `*:` to broadcast. Unprefixed or unknown-prefix lines
-        print a hint to stdout and are discarded (never silently misrouted).
-
-    HITL prompts still work — see `StdinRouter` for coordination details.
-    Only one StdinSteer should be active at a time per process (stdin is
-    a shared resource); entering a second instance overrides the first.
+    On enter, registers `agent.steer` against the router under `prefix`
+    (defaults to `agent.config.agent_id`). On exit, unsubscribes. The
+    shared router is started/stopped by the caller — usually the
+    `stdin_steering_factory` wrapper or the user's setup code.
     """
 
     def __init__(
         self,
-        agents: BaseAgent | list[BaseAgent],
-        *,
-        router: StdinRouter | None = None,
+        agent: BaseAgent,
+        router: StdinRouter,
+        prefix: str | None = None,
     ) -> None:
-        if not isinstance(agents, list):
-            agents = [agents]
-        if not agents:
-            raise ValueError("StdinSteer requires at least one agent")
-        self._agents: dict[str, BaseAgent] = {a.config.agent_id: a for a in agents}
-        self._router = router or StdinRouter()
-        self._owned_router = router is None
+        self._agent = agent
+        self._router = router
+        self._prefix = prefix if prefix is not None else agent.config.agent_id
+        self._sub_id: int | None = None
 
-    async def __aenter__(self) -> StdinSteer:
-        self._router.set_steer_callback(self._route)
-        if self._owned_router:
-            await self._router.start()
-        _set_active_router(self._router)
+    async def __aenter__(self) -> StdinAgentSource:
+        self._sub_id = self._router.subscribe(self._prefix, self._agent.steer)
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
-        _set_active_router(None)
-        self._router.set_steer_callback(None)
-        if self._owned_router:
-            await self._router.stop()
-
-    # ── Routing ───────────────────────────────────────────────────────────────
-
-    def _route(self, line: str) -> None:
-        # Single-agent: no prefix required, every line goes to the one agent.
-        if len(self._agents) == 1:
-            next(iter(self._agents.values())).steer(line)
-            return
-
-        # Multi-agent: require an explicit "agent_id:" or "*:" prefix.
-        if ":" not in line:
-            self._hint_unprefixed(line)
-            return
-        prefix, _, text = line.partition(":")
-        prefix = prefix.strip()
-        text = text.strip()
-        if not text:
-            return
-
-        if prefix == "*":
-            for agent in self._agents.values():
-                agent.steer(text)
-            return
-
-        agent = self._agents.get(prefix)
-        if agent is None:
-            self._hint_unknown(prefix)
-            return
-        agent.steer(text)
-
-    def _hint_unprefixed(self, line: str) -> None:
-        ids = ", ".join(sorted(self._agents))
-        print(
-            f"[steering] no agent prefix on input; ignored. "
-            f"Use 'agent_id: <text>' or '*: <text>'. Active agents: {ids}",
-            file=sys.stderr,
-        )
-
-    def _hint_unknown(self, prefix: str) -> None:
-        ids = ", ".join(sorted(self._agents))
-        print(
-            f"[steering] unknown agent '{prefix}'; ignored. Active agents: {ids}",
-            file=sys.stderr,
-        )
-
-
-# ── File shim (deployed) ──────────────────────────────────────────────────────
+        if self._sub_id is not None:
+            self._router.unsubscribe(self._sub_id)
+            self._sub_id = None
 
 
 class FileSteer:
-    """Async context manager: tails an append-only file into an agent's queue.
+    """Async ctx mgr: tail an append-only file into agent.steer().
 
     Polls `path` every `interval` seconds. New content (since the last
-    read offset) is split into lines and each non-empty line is forwarded
-    to `agent.steer()`. The file is never mutated — callers can `tail -f`
-    it independently for visibility.
+    read offset) is split into lines; non-empty lines forward to
+    `agent.steer()`. Never mutates the file.
 
     Default path: f"/tmp/ah-{run_id}-{agent.config.agent_id}.steer".
-    Either `path` or `run_id` must be provided.
+    Pass `path` or `run_id` (run_id derives the default path).
 
     Semantics:
-      - On enter: positions at current EOF so pre-existing content is NOT
-        replayed as guidance. Watcher starts fresh.
-      - Missing file: no-op until the file appears.
-      - File truncated or recreated (size < last offset): offset resets
-        to 0 so the new content is read from the beginning.
-      - Stop signal: cancels the polling task; subsequent writes ignored.
+      - On enter: positions at current EOF → pre-existing content is NOT
+        replayed as guidance.
+      - Missing file → no-op until it appears.
+      - Truncation (size < offset) → offset resets to 0.
+      - Stop signal cancels the polling task.
     """
 
     def __init__(
@@ -313,10 +351,7 @@ class FileSteer:
                 await self._task
             self._task = None
 
-    # ── Internals ─────────────────────────────────────────────────────────────
-
     async def _watch(self) -> None:
-        # Loop: poll → wait for either stop or interval to elapse.
         while not self._stop.is_set():
             self._poll_once()
             try:
@@ -324,7 +359,7 @@ class FileSteer:
             except asyncio.TimeoutError:
                 continue
             else:
-                return  # stop signaled
+                return
 
     def _poll_once(self) -> None:
         try:
@@ -332,7 +367,6 @@ class FileSteer:
         except FileNotFoundError:
             return
         if size < self._offset:
-            # Truncated or recreated — restart from the beginning.
             self._offset = 0
         if size == self._offset:
             return
@@ -347,3 +381,99 @@ class FileSteer:
             line = line.strip()
             if line:
                 self._agent.steer(line)
+
+
+# ── Factory helpers (for AgentRuntime(steering_source_factory=...)) ───────────
+
+
+def file_steering_factory(
+    path_template: str = "/tmp/ah-{run_id}-{agent_id}.steer",
+    *,
+    interval: float = 0.25,
+) -> Callable[[BaseAgent], FileSteer]:
+    """Return a factory that builds a per-agent FileSteer source.
+
+    The template may reference `{run_id}` and `{agent_id}`. The factory
+    reads `agent._ckp_id` (set by BaseAgent.run_stream) to extract the
+    run_id.
+    """
+
+    def factory(agent: BaseAgent) -> FileSteer:
+        run_id, _, _ = agent._ckp_id.partition(":")
+        path = path_template.format(run_id=run_id, agent_id=agent.config.agent_id)
+        return FileSteer(agent, path, interval=interval)
+
+    return factory
+
+
+def stdin_steering_factory(
+    router: StdinRouter,
+    prefix_template: str = "{agent_id}",
+) -> Callable[[BaseAgent], StdinAgentSource]:
+    """Return a factory that subscribes each agent to a shared StdinRouter.
+
+    `prefix_template` may reference `{agent_id}`. Default subscribes each
+    agent to its own `agent_id` prefix. The caller is responsible for
+    `router.start()` / `router.stop()` around the run.
+    """
+
+    def factory(agent: BaseAgent) -> StdinAgentSource:
+        prefix = prefix_template.format(agent_id=agent.config.agent_id)
+        return StdinAgentSource(agent, router, prefix=prefix)
+
+    return factory
+
+
+# ── Direct-use shims (no AgentRuntime / no factory) ───────────────────────────
+
+
+class StdinSteer:
+    """Async ctx mgr for direct (non-runtime) stdin steering.
+
+    Wraps a `StdinRouter` and subscribes each agent under its
+    `agent_id` prefix. Single-agent mode also subscribes a catch-all so
+    the user can type lines without any prefix at all.
+
+    For orchestrated runs via `AgentRuntime`, prefer
+    `stdin_steering_factory(router)` so each agent owns its own
+    subscription lifecycle.
+    """
+
+    def __init__(
+        self,
+        agents: BaseAgent | list[BaseAgent],
+        *,
+        router: StdinRouter | None = None,
+    ) -> None:
+        if not isinstance(agents, list):
+            agents = [agents]
+        if not agents:
+            raise ValueError("StdinSteer requires at least one agent")
+        self._agents = agents
+        self._router = router or StdinRouter()
+        self._owned_router = router is None
+        self._sub_ids: list[int] = []
+
+    async def __aenter__(self) -> StdinSteer:
+        if self._owned_router:
+            await self._router.start()
+        # Always register one subscription per agent under its agent_id.
+        for a in self._agents:
+            sid = self._router.subscribe(a.config.agent_id, a.steer)
+            self._sub_ids.append(sid)
+        # Single-agent ergonomics: also register a catch-all so unprefixed
+        # lines work. (Multi-agent: unprefixed lines hit the router's
+        # unrouted-warning path because there's no catch-all subscriber.)
+        if len(self._agents) == 1:
+            sid = self._router.subscribe(None, self._agents[0].steer)
+            self._sub_ids.append(sid)
+        _set_active_router(self._router)
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        _set_active_router(None)
+        for sid in self._sub_ids:
+            self._router.unsubscribe(sid)
+        self._sub_ids.clear()
+        if self._owned_router:
+            await self._router.stop()

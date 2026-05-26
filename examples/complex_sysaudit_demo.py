@@ -19,6 +19,17 @@ If the process is interrupted, the banner prints the exact command to resume:
 
     OPENAI_API_KEY=sk-... python examples/complex_sysaudit_demo.py
 
+Steering: while the audit runs, type guidance for any agent using the
+prefix `<agent_id>: <text>` (or `*: <text>` to broadcast). Examples:
+
+    shell_agent: skip the process list, just do uptime
+    filesystem_agent: also peek at .github/workflows
+    *: wrap up and synthesise what you have
+
+Guidance lands as a `Human guidance:` user message at the next step
+boundary of the targeted agent. HITL prompts still take precedence when
+they fire — the next stdin line after a banner is consumed by HITL.
+
 Requires:
   cargo install --path executor          # shell tool
   pip install -e ".[openai,http,mcp]"    # adapters
@@ -43,6 +54,7 @@ from harness.events import EventType
 from harness.executor_bridge import ExecutorBridge, ExecutorConfig, ExecutorTool, find_executor
 from harness.llm.openai import OpenAILLM
 from harness.runtime import AgentRegistry, AgentRuntime, GuardrailConfig, ToolRegistry
+from harness.steering import StdinRouter, stdin_steering_factory
 from memory.manager import MemoryManager
 from memory.stores import InMemoryEpisodicStore, InMemorySemanticStore
 from tools.builtin.http_fetch import HTTPFetch
@@ -280,6 +292,12 @@ async def main() -> None:
             llm=llm,
         )
 
+        # Steering: one router shared across both runtimes so the user's
+        # stdin lines reach whichever agent is currently active. Each agent
+        # subscribes under its agent_id at run_stream entry via the factory.
+        steering_router = StdinRouter()
+        steering_factory = stdin_steering_factory(steering_router)
+
         def _make_runtime(registry: AgentRegistry) -> AgentRuntime:
             return AgentRuntime(
                 agent_registry=registry,
@@ -293,14 +311,27 @@ async def main() -> None:
                     confidence_threshold=0.5,
                 ),
                 enable_otel=enable_otel,
+                steering_source_factory=steering_factory,
             )
 
         audit_runtime = _make_runtime(audit_agents)
         followup_runtime = _make_runtime(followup_agents)
 
+        active_prefixes = ", ".join(audit_agents.all_ids())
+        print("\n" + _sep("─"))
+        print("STEERING — type `<agent_id>: <text>` or `*: <text>` at any time")
+        print(f"Active agents: {active_prefixes}")
+        print(_sep("─"))
+
         # ── Pass 1: Full audit (or transparent resume) ────────────────────────
         # dispatch_stream automatically resumes from --resume <key> when a
         # checkpoint store is configured — no special handling needed here.
+        # The steering router runs for the lifetime of both passes (started
+        # here, stopped at the natural end of main()). HITL prompts take
+        # precedence — the next stdin line after a banner is consumed by
+        # HITL; otherwise lines route to the matching agent's steer queue.
+
+        await steering_router.__aenter__()
 
         print(f"\nPASS 1 — full audit\nGoal: {_trunc(AUDIT_GOAL, 120)}")
         print(_sep("═"))
@@ -369,6 +400,10 @@ async def main() -> None:
                     f"Cost: ${p.get('cost_usd', 0):.4f}  |  "
                     f"Time: {p.get('elapsed_seconds', 0):.1f}s"
                 )
+
+            elif event.type == EventType.HUMAN_GUIDANCE:
+                p = event.payload
+                print(f"\n[{event.agent_id:<16}] ▶ steered  step={p['step']}  text={p['text']!r}")
 
             elif event.type == EventType.ERROR:
                 print(f"\n[error]      {event.error}", file=sys.stderr)
@@ -447,8 +482,15 @@ async def main() -> None:
                     f"(fewer steps = agent answered from memory, not tools)"
                 )
 
+            elif event.type == EventType.HUMAN_GUIDANCE:
+                p = event.payload
+                print(f"\n[{event.agent_id:<16}] ▶ steered  step={p['step']}  text={p['text']!r}")
+
             elif event.type == EventType.ERROR:
                 print(f"\n[error]      {event.error}", file=sys.stderr)
+
+        # Stop the steering router started at the top of Pass 1. Run is over.
+        await steering_router.__aexit__(None, None, None)
 
 
 if __name__ == "__main__":

@@ -27,6 +27,7 @@ Token management:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import uuid
@@ -132,6 +133,7 @@ class BaseAgent:
         guard,
         llm,
         checkpoint_store: Any | None = None,  # FileCheckpointStore / RedisCheckpointStore
+        steering_source_factory: Any | None = None,  # (BaseAgent) -> async ctx mgr
     ) -> None:
         self.config = config
         self.role = config.role  # exposed for orchestrator planner prompt
@@ -149,6 +151,10 @@ class BaseAgent:
         # step (before checkpoint, before think). Created eagerly so
         # callers can steer() before run_stream starts.
         self._steering: asyncio.Queue[str] = asyncio.Queue()
+        # Optional factory: called once at run_stream entry. Must return an
+        # async context manager that, while active, may call agent.steer().
+        # The agent owns the source's lifecycle — no live-instance registry.
+        self._steering_source_factory = steering_source_factory
         self._resume_key: str = (
             ""  # key printed in --resume banner; set by orchestrator to outer run_id
         )
@@ -216,17 +222,25 @@ class BaseAgent:
         await self._working_memory.append("system", system, pinned=True)
         await self._working_memory.append("user", task)
 
-        async with _ResumeHint(
-            self._resume_key,
-            self._checkpoint_store,
-            f"Agent {self.config.agent_id}",
-            check_key=self._ckp_id,
-        ) as hint:
-            async for event in self._run_stream_internal(run_id):
-                if event.type == EventType.TASK_DONE:
-                    await self._clear_checkpoint(run_id)
-                    hint.done = True
-                yield event
+        # Steering source is owned by the agent for the duration of the run.
+        # nullcontext when no factory is configured — zero overhead.
+        source_cm = (
+            self._steering_source_factory(self)
+            if self._steering_source_factory is not None
+            else contextlib.nullcontext()
+        )
+        async with source_cm:
+            async with _ResumeHint(
+                self._resume_key,
+                self._checkpoint_store,
+                f"Agent {self.config.agent_id}",
+                check_key=self._ckp_id,
+            ) as hint:
+                async for event in self._run_stream_internal(run_id):
+                    if event.type == EventType.TASK_DONE:
+                        await self._clear_checkpoint(run_id)
+                        hint.done = True
+                    yield event
 
     async def _resume_stream(
         self,
@@ -249,17 +263,23 @@ class BaseAgent:
                 yield event
             start_step = pending["step"] + 1
 
-        async with _ResumeHint(
-            self._resume_key,
-            self._checkpoint_store,
-            f"Agent {self.config.agent_id}",
-            check_key=self._ckp_id,
-        ) as hint:
-            async for event in self._run_stream_internal(run_id, start_step=start_step):
-                if event.type == EventType.TASK_DONE:
-                    await self._clear_checkpoint(run_id)
-                    hint.done = True
-                yield event
+        source_cm = (
+            self._steering_source_factory(self)
+            if self._steering_source_factory is not None
+            else contextlib.nullcontext()
+        )
+        async with source_cm:
+            async with _ResumeHint(
+                self._resume_key,
+                self._checkpoint_store,
+                f"Agent {self.config.agent_id}",
+                check_key=self._ckp_id,
+            ) as hint:
+                async for event in self._run_stream_internal(run_id, start_step=start_step):
+                    if event.type == EventType.TASK_DONE:
+                        await self._clear_checkpoint(run_id)
+                        hint.done = True
+                    yield event
 
     async def _run_stream_internal(
         self,

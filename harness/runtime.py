@@ -284,6 +284,7 @@ class AgentRuntime:
         enable_otel: bool = False,
         annotation_store: Any | None = None,  # InMemoryAnnotationStore or compatible
         checkpoint_store: Any | None = None,  # FileCheckpointStore / RedisCheckpointStore
+        steering_source_factory: Any | None = None,  # passed to each spawned BaseAgent
     ) -> None:
         self._agent_registry = agent_registry
         self._tool_registry = tool_registry
@@ -292,6 +293,7 @@ class AgentRuntime:
         self._guardrail_config = guardrail_config or GuardrailConfig()
         self._enable_otel = enable_otel
         self._annotation_store = annotation_store
+        self._steering_source_factory = steering_source_factory
         # Auto-create a FileCheckpointStore if any agent uses hitl_tools or
         # checkpoint_every — zero-dep default, no configuration required.
         if checkpoint_store is None and any(
@@ -337,6 +339,7 @@ class AgentRuntime:
             guard=guard,
             llm=self._llm,
             checkpoint_store=self._checkpoint_store,
+            steering_source_factory=self._steering_source_factory,
         )
         async for event in agent.run_stream(task, run_id=run_id):
             yield event
@@ -386,6 +389,7 @@ class AgentRuntime:
             guard=guard,
             llm=self._llm,
             checkpoint_store=self._checkpoint_store,
+            steering_source_factory=self._steering_source_factory,
         )
         agent._working_memory = wm
         agent._task = checkpoint["task"]
@@ -492,6 +496,7 @@ class AgentRuntime:
                 guard=guard,
                 llm=self._llm,
                 checkpoint_store=self._checkpoint_store,
+                steering_source_factory=self._steering_source_factory,
             )
             agent._working_memory = wm
             agent._task = checkpoint["task"]
@@ -551,6 +556,7 @@ class AgentRuntime:
                 guard=guard,
                 llm=self._llm,
                 checkpoint_store=self._checkpoint_store,
+                steering_source_factory=self._steering_source_factory,
             )
             for agent_id in self._agent_registry.all_ids()
         }
