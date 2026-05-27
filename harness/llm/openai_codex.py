@@ -15,6 +15,7 @@ from collections.abc import AsyncGenerator
 from pathlib import Path
 from typing import Any
 
+from harness.llm._streaming import aiter_sse_events, format_streaming_error, read_error_body
 from harness.llm.auth import AuthFileOAuthProvider, OAuthCredential, OpenAICodexOAuthClient
 
 
@@ -54,15 +55,19 @@ class OpenAICodexLLM:
         messages: list[dict],
         **kwargs: Any,
     ) -> dict:
-        payload = _build_payload(
-            model=self._model,
-            system=system,
-            messages=messages,
-            extra=kwargs,
-        )
-        response = await self._post_with_auth_retry(payload)
-        text, usage = _parse_sse_response(response)
-        self.last_usage = usage
+        """Collect the streaming response into a single text + usage dict.
+
+        Internally consumes the same SSE stream as `stream_complete` —
+        there is no separate non-streaming code path. The Codex backend
+        only returns SSE; we just buffer the deltas before returning.
+        """
+        text_parts: list[str] = []
+        async for delta in self._iter_stream(system, messages, extra=kwargs):
+            text_parts.append(delta)
+        text = "".join(text_parts)
+        usage = self.last_usage or {}
+        if not text:
+            raise RuntimeError("Codex SSE response did not contain output text")
         return {"text": text, "usage": usage}
 
     async def stream_complete(
@@ -70,39 +75,87 @@ class OpenAICodexLLM:
         system: str | None,
         messages: list[dict],
     ) -> AsyncGenerator[str, None]:
-        payload = _build_payload(
-            model=self._model,
-            system=system,
-            messages=messages,
-            extra={},
-        )
-        response = await self._post_with_auth_retry(payload)
-        text, usage = _parse_sse_response(response)
-        self.last_usage = usage
-        yield text
+        """Yield each `response.output_text.delta` token as it arrives."""
+        async for delta in self._iter_stream(system, messages, extra={}):
+            yield delta
 
     async def aclose(self) -> None:
         if self._owns_client and self._client is not None:
             await self._client.aclose()
 
-    async def _post_with_auth_retry(self, payload: dict[str, Any]) -> Any:
-        cred = await self._credentials.get_credential()
-        response = await self._post(payload, cred)
-        if getattr(response, "status_code", None) in (401, 403):
-            cred = await self._credentials.get_credential(force_refresh=True)
-            response = await self._post(payload, cred)
-        if getattr(response, "status_code", 200) >= 400:
-            raise RuntimeError(_format_error_response(response))
-        return response
+    # ── Streaming core ────────────────────────────────────────────────────────
 
-    async def _post(self, payload: dict[str, Any], cred: OAuthCredential) -> Any:
-        client = await self._get_client()
-        headers = _build_headers(cred, originator=self._codex_originator)
-        return await client.post(
-            f"{self._base_url}/codex/responses",
-            headers=headers,
-            json=payload,
+    async def _iter_stream(
+        self,
+        system: str | None,
+        messages: list[dict],
+        *,
+        extra: dict[str, Any],
+    ) -> AsyncGenerator[str, None]:
+        """Single source of truth: open an SSE stream, yield deltas, set
+        `self.last_usage` from the final event. Auth refresh on 401/403
+        happens before any delta is yielded so we never retry mid-stream.
+        """
+        payload = _build_payload(
+            model=self._model,
+            system=system,
+            messages=messages,
+            extra=extra,
         )
+        url = f"{self._base_url}/codex/responses"
+
+        for attempt in range(2):
+            cred = await self._credentials.get_credential(force_refresh=(attempt == 1))
+            client = await self._get_client()
+            headers = _build_headers(cred, originator=self._codex_originator)
+
+            async with client.stream("POST", url, headers=headers, json=payload) as response:
+                status = getattr(response, "status_code", 200)
+                if status in (401, 403) and attempt == 0:
+                    continue  # closes stream, retries with fresh creds
+                if status >= 400:
+                    body = await read_error_body(response)
+                    raise RuntimeError(format_streaming_error(status, body, provider="Codex"))
+
+                final_payload: dict[str, Any] | None = None
+                yielded_any = False
+                async for event_type, data in aiter_sse_events(response):
+                    if not data or data == "[DONE]":
+                        continue
+                    try:
+                        parsed = json.loads(data)
+                    except json.JSONDecodeError:
+                        continue
+                    if event_type == "response.output_text.delta":
+                        delta = parsed.get("delta") if isinstance(parsed, dict) else None
+                        if isinstance(delta, str) and delta:
+                            yielded_any = True
+                            yield delta
+                    elif event_type in {"response.completed", "response.done"}:
+                        if isinstance(parsed, dict):
+                            response_payload = (
+                                parsed.get("response")
+                                if isinstance(parsed.get("response"), dict)
+                                else parsed
+                            )
+                            if isinstance(response_payload, dict):
+                                final_payload = response_payload
+
+                usage: dict = {}
+                if final_payload is not None:
+                    usage = _normalize_usage(final_payload.get("usage"))
+                    if not yielded_any:
+                        # Some backends only emit the full text in the final payload.
+                        try:
+                            text = _extract_output_text(final_payload)
+                        except RuntimeError:
+                            text = ""
+                        if text:
+                            yield text
+                self.last_usage = usage
+                return
+
+        raise RuntimeError("Codex authentication failed after refresh")
 
     async def _get_client(self) -> Any:
         if self._client is None:
@@ -179,104 +232,6 @@ def _content_to_text(content: Any) -> str:
     if isinstance(content, str):
         return content
     return json.dumps(content, default=str)
-
-
-def _parse_response(payload: dict[str, Any]) -> tuple[str, dict]:
-    text = _extract_output_text(payload)
-    usage = _normalize_usage(payload.get("usage"))
-    return text, usage
-
-
-def _parse_sse_response(response: Any) -> tuple[str, dict]:
-    text_parts: list[str] = []
-    usage: dict = {}
-    final_payload: dict[str, Any] | None = None
-    for event in _iter_sse_events(_response_text(response)):
-        event_type = event.get("event")
-        data = event.get("data")
-        if not data or data == "[DONE]":
-            continue
-        try:
-            payload = json.loads(data)
-        except json.JSONDecodeError:
-            continue
-        if event_type == "response.output_text.delta":
-            delta = payload.get("delta")
-            if isinstance(delta, str):
-                text_parts.append(delta)
-        elif event_type in {"response.completed", "response.done"}:
-            response_payload = (
-                payload.get("response") if isinstance(payload.get("response"), dict) else payload
-            )
-            final_payload = response_payload if isinstance(response_payload, dict) else None
-
-    if final_payload is not None:
-        usage = _normalize_usage(final_payload.get("usage"))
-        if not text_parts:
-            try:
-                return _extract_output_text(final_payload), usage
-            except RuntimeError:
-                pass
-    if text_parts:
-        return "".join(text_parts), usage
-    raise RuntimeError("Codex SSE response did not contain output text")
-
-
-def _iter_sse_events(text: str) -> list[dict[str, str]]:
-    events: list[dict[str, str]] = []
-    current_event = "message"
-    data_lines: list[str] = []
-    for raw_line in text.splitlines():
-        line = raw_line.rstrip("\r")
-        if not line:
-            if data_lines:
-                events.append({"event": current_event, "data": "\n".join(data_lines)})
-                current_event = "message"
-                data_lines = []
-            continue
-        if line.startswith("event:"):
-            current_event = line.removeprefix("event:").strip()
-        elif line.startswith("data:"):
-            data_lines.append(line.removeprefix("data:").strip())
-    if data_lines:
-        events.append({"event": current_event, "data": "\n".join(data_lines)})
-    return events
-
-
-def _response_text(response: Any) -> str:
-    text = getattr(response, "text", None)
-    if isinstance(text, str):
-        return text
-    content = getattr(response, "content", None)
-    if isinstance(content, bytes):
-        return content.decode(errors="replace")
-    raise RuntimeError("Codex response did not include SSE text")
-
-
-def _format_error_response(response: Any) -> str:
-    status = getattr(response, "status_code", "unknown")
-    try:
-        data = response.json()
-    except Exception:
-        data = None
-    if isinstance(data, dict):
-        detail = data.get("detail")
-        error = data.get("error")
-        if isinstance(detail, str):
-            return f"Codex backend returned {status}: {detail}"
-        if isinstance(error, dict):
-            message = error.get("message") or error.get("code") or error
-            return f"Codex backend returned {status}: {message}"
-        if error:
-            return f"Codex backend returned {status}: {error}"
-    text = (
-        _response_text(response)
-        if hasattr(response, "text") or hasattr(response, "content")
-        else ""
-    )
-    if text.strip():
-        return f"Codex backend returned {status}: {text.strip()[:500]}"
-    return f"Codex backend returned HTTP {status}"
 
 
 def _extract_output_text(payload: dict[str, Any]) -> str:

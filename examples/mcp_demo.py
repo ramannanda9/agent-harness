@@ -26,6 +26,7 @@ from agents.base import AgentConfig
 from harness.events import EventType
 from harness.llm.openai import OpenAILLM
 from harness.runtime import AgentRegistry, AgentRuntime, GuardrailConfig, ToolRegistry
+from harness.utils import stream_tokens_inline
 from memory.manager import MemoryManager
 from memory.stores import InMemoryEpisodicStore, InMemorySemanticStore
 from tools.mcp import MCPServerConnection
@@ -114,7 +115,7 @@ async def main() -> None:
 
         # ── Run ───────────────────────────────────────────────────────────
         final: dict = {}
-        async for event in runtime.run_stream(goal):
+        async for event in stream_tokens_inline(runtime.run_stream(goal), show_agent_id=True):
             if event.type == EventType.PLAN:
                 for t in event.payload["plan"].get("tasks", []):
                     print(f"[plan]      {t['id']}@{t['agent_id']}: {_truncate(t['instruction'])}")

@@ -121,8 +121,34 @@ agent-harness login claude-code
 agent-harness auth status claude-code
 ```
 
-Direct `openai-codex` OAuth is experimental: it follows the Codex/Pi-style
-ChatGPT subscription route rather than the stable OpenAI Platform API. The
+> **⚠️ Subscription adapters are experimental — use the metered API in production.**
+>
+> `OpenAICodexLLM` and `ClaudeCodeLLM` bridge **ChatGPT / Claude
+> subscription OAuth credentials** into the harness by talking to
+> internal CLI endpoints with CLI-shaped User-Agent and billing headers.
+> This route:
+>
+> - **May violate OpenAI's and Anthropic's Terms of Service.** Both
+>   providers prohibit using subscription accounts (ChatGPT Plus/Pro,
+>   Claude Pro/Max) for arbitrary programmatic access — subscriptions
+>   price for the official CLI's intended use only.
+> - **May result in account suspension** if abuse detection classifies
+>   harness traffic as misuse.
+> - **Depends on undocumented internal endpoints**
+>   (`/backend-api/codex/responses`, the Anthropic Messages API with
+>   `claude-code-*` beta flags) that providers can change or revoke at
+>   any time.
+>
+> **Use these adapters only for personal research on accounts you own.**
+> Do not use them to serve other users. For anything else, prefer the
+> metered API path:
+>
+> - `OpenAILLM` with `OPENAI_API_KEY` (optionally routed through a
+>   gateway like LiteLLM/Helicone for cost headers).
+> - The standard Anthropic Messages API with an Anthropic API key.
+
+Direct `openai-codex` OAuth follows the Codex/Pi-style ChatGPT
+subscription route rather than the stable OpenAI Platform API. The
 Codex OAuth client id can be overridden with
 `AGENT_HARNESS_OPENAI_CODEX_CLIENT_ID`.
 
@@ -164,6 +190,17 @@ Pro/Max extension approach rather than shelling out to the Claude CLI. The
 default model is the current canonical Sonnet release ID, `claude-sonnet-4-6`;
 set `CLAUDE_CODE_MODEL` or pass `model="claude-opus-4-7"` to choose another
 model.
+
+Both adapters stream incrementally — `stream_complete()` yields each
+SSE delta token as it arrives, and `complete()` consumes the same
+stream and returns the concatenated text once finished. Cost / token
+usage is captured from the final stream event into `last_usage`.
+
+The Claude billing header's `cc_version` is read from
+`CLAUDE_CODE_VERSION` (env) or from `claude --version` if the CLI is
+installed; falls back to `unknown` otherwise. Pinning a specific
+version with `CLAUDE_CODE_VERSION=2.1.150` is recommended if you want
+stable behavior across CLI upgrades.
 
 Do not copy browser/app refresh tokens into repo files. Store OAuth auth files
 under `~/.agent-harness/auth` or reuse an existing Pi auth file with private

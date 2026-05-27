@@ -33,6 +33,7 @@ from agents.base import AgentConfig
 from harness.events import EventType
 from harness.llm.openai import OpenAILLM
 from harness.runtime import AgentRegistry, AgentRuntime, GuardrailConfig, ToolRegistry
+from harness.utils import stream_tokens_inline
 from memory.manager import MemoryManager
 from memory.stores import InMemoryEpisodicStore, InMemorySemanticStore
 from tools.builtin.fetch_image import FetchImage
@@ -123,7 +124,7 @@ async def main() -> None:
     print(f"\nGoal: {_trunc(GOAL, 160)}\n" + _sep())
 
     final: dict = {}
-    async for event in runtime.dispatch_stream(GOAL):
+    async for event in stream_tokens_inline(runtime.dispatch_stream(GOAL)):
         if event.type == EventType.DISPATCH:
             print(
                 f"[dispatch]  complexity={event.payload['complexity']}"

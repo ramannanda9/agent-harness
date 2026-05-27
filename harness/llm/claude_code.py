@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -9,6 +10,7 @@ from collections.abc import AsyncGenerator
 from pathlib import Path
 from typing import Any
 
+from harness.llm._streaming import aiter_sse_events, format_streaming_error, read_error_body
 from harness.llm.auth import (
     AnthropicClaudeCodeOAuthClient,
     AuthFileOAuthProvider,
@@ -20,6 +22,11 @@ CLAUDE_CODE_BETAS = os.environ.get(
     "claude-code-20250219,oauth-2025-04-20",
 )
 CLAUDE_CODE_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude."
+
+# Memoized installed CLI version probe — `claude --version` is slow enough that
+# we don't want to re-run it for every request. Env overrides bypass the cache.
+_cached_cli_version: str | None = None
+_cli_version_probed = False
 
 
 class ClaudeCodeLLM:
@@ -67,50 +74,106 @@ class ClaudeCodeLLM:
         messages: list[dict],
         **kwargs: Any,
     ) -> dict:
-        payload = _build_payload(
-            model=self._model,
-            system=system,
-            messages=messages,
-            max_tokens=int(kwargs.pop("max_tokens", self._max_tokens)),
-            extra=kwargs,
-        )
-        response = await self._post_with_auth_retry(payload)
-        text, usage = _parse_response(response)
-        self.last_usage = usage
-        return {"text": text, "usage": usage}
+        """Collect the streaming response into a single text + usage dict.
+
+        Internally consumes the same SSE stream as `stream_complete` —
+        there is no separate non-streaming code path. We pass
+        `stream=true` and accumulate the deltas.
+        """
+        max_tokens = int(kwargs.pop("max_tokens", self._max_tokens))
+        parts: list[str] = []
+        async for delta in self._iter_stream(system, messages, max_tokens=max_tokens, extra=kwargs):
+            parts.append(delta)
+        text = "".join(parts)
+        if not text:
+            raise RuntimeError("Claude Code response did not contain text content")
+        return {"text": text, "usage": self.last_usage or {}}
 
     async def stream_complete(
         self,
         system: str | None,
         messages: list[dict],
     ) -> AsyncGenerator[str, None]:
-        result = await self.complete(system, messages)
-        yield result["text"]
+        async for delta in self._iter_stream(
+            system, messages, max_tokens=self._max_tokens, extra={}
+        ):
+            yield delta
 
     async def aclose(self) -> None:
         if self._owns_client and self._client is not None:
             await self._client.aclose()
 
-    async def _post_with_auth_retry(self, payload: dict[str, Any]) -> dict[str, Any]:
-        cred = await self._credentials.get_credential()
-        response = await self._post(payload, cred)
-        if getattr(response, "status_code", None) in (401, 403):
-            cred = await self._credentials.get_credential(force_refresh=True)
-            response = await self._post(payload, cred)
-        if getattr(response, "status_code", 200) >= 400:
-            raise RuntimeError(_format_error_response(response))
-        data = response.json()
-        if not isinstance(data, dict):
-            raise RuntimeError("Claude Code response was not a JSON object")
-        return data
+    # ── Streaming core ────────────────────────────────────────────────────────
 
-    async def _post(self, payload: dict[str, Any], cred: OAuthCredential) -> Any:
-        client = await self._get_client()
-        return await client.post(
-            f"{self._base_url}/v1/messages",
-            headers=_build_headers(cred, user_agent=self._user_agent, betas=self._betas),
-            json=payload,
+    async def _iter_stream(
+        self,
+        system: str | None,
+        messages: list[dict],
+        *,
+        max_tokens: int,
+        extra: dict[str, Any],
+    ) -> AsyncGenerator[str, None]:
+        """Single source of truth: open Anthropic SSE stream, yield text
+        deltas, populate `self.last_usage`. Auth refresh on 401/403
+        happens before any delta is yielded so we never retry mid-stream.
+        """
+        payload = _build_payload(
+            model=self._model,
+            system=system,
+            messages=messages,
+            max_tokens=max_tokens,
+            extra=extra,
         )
+        payload["stream"] = True
+        url = f"{self._base_url}/v1/messages"
+
+        for attempt in range(2):
+            cred = await self._credentials.get_credential(force_refresh=(attempt == 1))
+            client = await self._get_client()
+            headers = _build_headers(cred, user_agent=self._user_agent, betas=self._betas)
+
+            async with client.stream("POST", url, headers=headers, json=payload) as response:
+                status = getattr(response, "status_code", 200)
+                if status in (401, 403) and attempt == 0:
+                    continue  # closes stream, retries with fresh creds
+                if status >= 400:
+                    body = await read_error_body(response)
+                    raise RuntimeError(format_streaming_error(status, body, provider="Claude Code"))
+
+                tokens_in = 0
+                tokens_out = 0
+                async for _event_type, data in aiter_sse_events(response):
+                    if not data or data == "[DONE]":
+                        continue
+                    try:
+                        obj = json.loads(data)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(obj, dict):
+                        continue
+                    otype = obj.get("type")
+                    if otype == "content_block_delta":
+                        delta = obj.get("delta")
+                        if isinstance(delta, dict) and delta.get("type") == "text_delta":
+                            text = delta.get("text", "")
+                            if isinstance(text, str) and text:
+                                yield text
+                    elif otype == "message_start":
+                        msg_usage = (obj.get("message") or {}).get("usage") or {}
+                        tokens_in = int(msg_usage.get("input_tokens") or 0)
+                    elif otype == "message_delta":
+                        delta_usage = obj.get("usage") or {}
+                        tokens_out = int(delta_usage.get("output_tokens") or 0)
+
+                self.last_usage = {
+                    "tokens_in": tokens_in,
+                    "tokens_out": tokens_out,
+                    "total_tokens": tokens_in + tokens_out,
+                    "provider": "claude-code",
+                }
+                return
+
+        raise RuntimeError("Claude Code authentication failed after refresh")
 
     async def _get_client(self) -> Any:
         if self._client is None:
@@ -140,12 +203,26 @@ def _default_user_agent() -> str:
     configured = os.environ.get("CLAUDE_CODE_USER_AGENT")
     if configured:
         return configured
-    version = os.environ.get("CLAUDE_CODE_VERSION")
-    if not version:
-        version = _installed_claude_version()
-    if version:
-        return f"claude-cli/{version} (external, cli)"
-    return "claude-cli/unknown (external, cli)"
+    return f"claude-cli/{_resolve_cc_version()} (external, cli)"
+
+
+def _resolve_cc_version() -> str:
+    """Resolve the Claude Code CLI version, used in User-Agent + billing header.
+
+    Order:
+      1. `CLAUDE_CODE_VERSION` env (callers can pin a known-good version).
+      2. `claude --version` from the installed CLI (cached for the process —
+         the subprocess probe is too slow to repeat per request).
+      3. `"unknown"` fallback so the header still has a valid shape.
+    """
+    env_version = os.environ.get("CLAUDE_CODE_VERSION")
+    if env_version:
+        return env_version
+    global _cached_cli_version, _cli_version_probed
+    if not _cli_version_probed:
+        _cached_cli_version = _installed_claude_version()
+        _cli_version_probed = True
+    return _cached_cli_version or "unknown"
 
 
 def _installed_claude_version() -> str | None:
@@ -197,10 +274,14 @@ def _build_payload(
 
 
 def _system_blocks(system: str | None) -> list[dict[str, Any]]:
+    cc_version = _resolve_cc_version()
     blocks: list[dict[str, Any]] = [
         {
             "type": "text",
-            "text": "x-anthropic-billing-header: cc_version=2.1.97; cc_entrypoint=cli; cch=00000;",
+            "text": (
+                f"x-anthropic-billing-header: cc_version={cc_version}; "
+                "cc_entrypoint=cli; cch=00000;"
+            ),
         },
         {"type": "text", "text": CLAUDE_CODE_IDENTITY},
     ]
@@ -229,50 +310,3 @@ def _content_to_text(content: Any) -> str:
     if isinstance(content, str):
         return content
     return str(content)
-
-
-def _parse_response(payload: dict[str, Any]) -> tuple[str, dict]:
-    content = payload.get("content")
-    parts: list[str] = []
-    if isinstance(content, list):
-        for block in content:
-            if isinstance(block, dict) and block.get("type") == "text":
-                text = block.get("text")
-                if isinstance(text, str):
-                    parts.append(text)
-    usage = _normalize_usage(payload.get("usage"))
-    if parts:
-        return "".join(parts), usage
-    raise RuntimeError("Claude Code response did not contain text content")
-
-
-def _normalize_usage(raw: Any) -> dict:
-    if not isinstance(raw, dict):
-        return {}
-    tokens_in = int(raw.get("input_tokens") or 0)
-    tokens_out = int(raw.get("output_tokens") or 0)
-    return {
-        "tokens_in": tokens_in,
-        "tokens_out": tokens_out,
-        "total_tokens": tokens_in + tokens_out,
-        "provider": "claude-code",
-    }
-
-
-def _format_error_response(response: Any) -> str:
-    status = getattr(response, "status_code", "unknown")
-    try:
-        data = response.json()
-    except Exception:
-        data = None
-    if isinstance(data, dict):
-        error = data.get("error")
-        if isinstance(error, dict):
-            message = error.get("message") or error.get("type") or error
-            return f"Claude Code backend returned {status}: {message}"
-        if error:
-            return f"Claude Code backend returned {status}: {error}"
-    text = getattr(response, "text", "")
-    if isinstance(text, str) and text.strip():
-        return f"Claude Code backend returned {status}: {text.strip()[:500]}"
-    return f"Claude Code backend returned HTTP {status}"
