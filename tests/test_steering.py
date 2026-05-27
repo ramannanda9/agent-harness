@@ -10,8 +10,11 @@ Four groups:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 
 import pytest
+from prompt_toolkit.input import create_pipe_input
+from prompt_toolkit.output import DummyOutput
 
 from agents.base import AgentConfig, BaseAgent
 from harness.events import EventType
@@ -42,18 +45,26 @@ class _StubAgent:
         self.steered.append(text)
 
 
-class _FakeStdin:
-    """Async readline that pops from a list. Blocks on an event when exhausted."""
+@contextlib.contextmanager
+def _piped_router():
+    """Yield (router, pipe_input). Caller writes via pipe_input.send_text().
 
-    def __init__(self, lines: list[str]):
-        self._lines = list(lines)
-        self._exhausted = asyncio.Event()
+    Submit sequences: "\\r" (Enter). To insert a newline mid-input:
+    "\\n" (Ctrl+J binding) or "\\x1b\\r" (Esc-Enter). patch_stdout is
+    disabled so pytest's stdout capture still works.
+    """
+    with create_pipe_input() as pipe_in:
+        router = StdinRouter(
+            input_=pipe_in,
+            output=DummyOutput(),
+            patch_stdout_=False,
+        )
+        yield router, pipe_in
 
-    async def readline(self) -> str | None:
-        if not self._lines:
-            await self._exhausted.wait()
-            return None
-        return self._lines.pop(0)
+
+async def _drain(timeout: float = 0.1) -> None:
+    """Let the router process pending input. Small await for the read loop."""
+    await asyncio.sleep(timeout)
 
 
 # ── Core: BaseAgent.steer() + drain ───────────────────────────────────────────
@@ -296,134 +307,141 @@ def test_file_steer_requires_path_or_run_id():
         FileSteer(agent)
 
 
-# ── StdinRouter pub/sub ───────────────────────────────────────────────────────
+# ── StdinRouter pub/sub (prompt_toolkit-backed) ──────────────────────────────
 
 
 @pytest.mark.asyncio
 async def test_router_routes_to_catchall_subscriber():
-    fake = _FakeStdin(["plain line\n"])
     received: list[str] = []
-    router = StdinRouter(readline=fake.readline)
-    router.subscribe(None, received.append)
-    await router.start()
-    await asyncio.sleep(0.05)
-    await router.stop()
+    with _piped_router() as (router, pipe_in):
+        router.subscribe(None, received.append)
+        await router.start()
+        pipe_in.send_text("plain line\r")
+        await _drain()
+        await router.stop()
+    assert received == ["plain line"]
+
+
+@pytest.mark.asyncio
+async def test_router_default_patch_stdout_context_starts():
+    """Default patch_stdout path uses a sync context manager but still runs in async loop."""
+    received: list[str] = []
+    with create_pipe_input() as pipe_in:
+        router = StdinRouter(input_=pipe_in, output=DummyOutput())
+        router.subscribe(None, received.append)
+        await router.start()
+        pipe_in.send_text("plain line\r")
+        await _drain()
+        await router.stop()
     assert received == ["plain line"]
 
 
 @pytest.mark.asyncio
 async def test_router_routes_by_prefix():
-    fake = _FakeStdin(["a: hello a\n", "b: hello b\n"])
     a_received: list[str] = []
     b_received: list[str] = []
-    router = StdinRouter(readline=fake.readline)
-    router.subscribe("a", a_received.append)
-    router.subscribe("b", b_received.append)
-    await router.start()
-    await asyncio.sleep(0.05)
-    await router.stop()
+    with _piped_router() as (router, pipe_in):
+        router.subscribe("a", a_received.append)
+        router.subscribe("b", b_received.append)
+        await router.start()
+        pipe_in.send_text("a: hello a\r")
+        await _drain()
+        pipe_in.send_text("b: hello b\r")
+        await _drain()
+        await router.stop()
     assert a_received == ["hello a"]
     assert b_received == ["hello b"]
 
 
 @pytest.mark.asyncio
 async def test_router_broadcast_with_star():
-    fake = _FakeStdin(["*: stop everyone\n"])
     a_received: list[str] = []
     b_received: list[str] = []
-    router = StdinRouter(readline=fake.readline)
-    router.subscribe("a", a_received.append)
-    router.subscribe("b", b_received.append)
-    await router.start()
-    await asyncio.sleep(0.05)
-    await router.stop()
+    with _piped_router() as (router, pipe_in):
+        router.subscribe("a", a_received.append)
+        router.subscribe("b", b_received.append)
+        await router.start()
+        pipe_in.send_text("*: stop everyone\r")
+        await _drain()
+        await router.stop()
     assert a_received == ["stop everyone"]
     assert b_received == ["stop everyone"]
 
 
 @pytest.mark.asyncio
+async def test_router_multiline_input_via_ctrl_j():
+    """Ctrl+J (\\n) inserts a newline; Enter (\\r) submits the whole block."""
+    received: list[str] = []
+    with _piped_router() as (router, pipe_in):
+        router.subscribe("a", received.append)
+        await router.start()
+        # Type "a: line one" + Ctrl+J + "line two" + Enter
+        pipe_in.send_text("a: line one\nline two\r")
+        await _drain()
+        await router.stop()
+    assert received == ["line one\nline two"]
+
+
+@pytest.mark.asyncio
 async def test_router_unknown_prefix_warns(capsys):
-    fake = _FakeStdin(["zzz: nope\n"])
-    router = StdinRouter(readline=fake.readline)
-    router.subscribe("a", lambda _t: None)
-    await router.start()
-    await asyncio.sleep(0.05)
-    await router.stop()
+    with _piped_router() as (router, pipe_in):
+        router.subscribe("a", lambda _t: None)
+        await router.start()
+        pipe_in.send_text("zzz: nope\r")
+        await _drain()
+        await router.stop()
     err = capsys.readouterr().err
     assert "no subscriber for prefix 'zzz'" in err
 
 
 @pytest.mark.asyncio
 async def test_router_unprefixed_with_no_catchall_warns(capsys):
-    fake = _FakeStdin(["no prefix here\n"])
-    router = StdinRouter(readline=fake.readline)
-    router.subscribe("a", lambda _t: None)
-    await router.start()
-    await asyncio.sleep(0.05)
-    await router.stop()
+    with _piped_router() as (router, pipe_in):
+        router.subscribe("a", lambda _t: None)
+        await router.start()
+        pipe_in.send_text("no prefix here\r")
+        await _drain()
+        await router.stop()
     err = capsys.readouterr().err
     assert "no catch-all subscriber" in err
 
 
 @pytest.mark.asyncio
 async def test_router_unsubscribe_removes_subscription():
-    """Unsubscribing while the router is running stops further deliveries."""
-
-    class _GatedStdin:
-        """Returns lines one at a time, gated by per-line release events."""
-
-        def __init__(self, lines: list[str]):
-            self._lines = list(lines)
-            self.gates = [asyncio.Event() for _ in lines]  # keyed by original index
-            self._next = 0
-            self._exhausted = asyncio.Event()
-
-        def release(self, i: int) -> None:
-            self.gates[i].set()
-
-        async def readline(self) -> str | None:
-            if self._next >= len(self._lines):
-                await self._exhausted.wait()
-                return None
-            i = self._next
-            self._next += 1
-            await self.gates[i].wait()
-            return self._lines[i]
-
-    fake = _GatedStdin(["a: first\n", "a: second\n"])
+    """After unsubscribe, further input doesn't reach the old callback."""
     received: list[str] = []
-    router = StdinRouter(readline=fake.readline)
-    sid = router.subscribe("a", received.append)
-    await router.start()
-
-    fake.release(0)
-    await asyncio.sleep(0.05)
-    assert received == ["first"]
-
-    router.unsubscribe(sid)
-    fake.release(1)
-    await asyncio.sleep(0.05)
-
-    await router.stop()
+    with _piped_router() as (router, pipe_in):
+        sid = router.subscribe("a", received.append)
+        await router.start()
+        pipe_in.send_text("a: first\r")
+        await _drain()
+        router.unsubscribe(sid)
+        pipe_in.send_text("a: second\r")
+        await _drain()
+        await router.stop()
     assert received == ["first"]
 
 
 @pytest.mark.asyncio
-async def test_router_routes_to_hitl_when_claimed():
-    fake = _FakeStdin(["yes\n"])
+async def test_router_claim_next_line_resolves_with_typed_answer():
+    """HITL claims pre-empt steering; the typed answer resolves HITL's Future."""
     received: list[str] = []
-    router = StdinRouter(readline=fake.readline)
-    router.subscribe(None, received.append)
-    await router.start()
-    fut = router.claim_next_line()
-    line = await asyncio.wait_for(fut, timeout=0.5)
-    await router.stop()
-    assert line == "yes"
-    assert received == []  # HITL took it, subscriber didn't fire
+    with _piped_router() as (router, pipe_in):
+        router.subscribe(None, received.append)
+        await router.start()
+        # Give the steering prompt a moment to start, then claim for HITL.
+        await asyncio.sleep(0.02)
+        fut = router.claim_next_line(prompt="approve? ")
+        # User types "y" + Enter; HITL gets it, not the catch-all subscriber.
+        pipe_in.send_text("y\r")
+        line = await asyncio.wait_for(fut, timeout=1.0)
+        await router.stop()
+    assert line == "y"
+    assert received == []
 
 
 def test_router_rejects_star_as_subscription_prefix():
-    router = StdinRouter()
+    router = StdinRouter(patch_stdout_=False)
     with pytest.raises(ValueError):
         router.subscribe("*", lambda _t: None)
 
@@ -434,29 +452,28 @@ def test_router_rejects_star_as_subscription_prefix():
 @pytest.mark.asyncio
 async def test_stdin_single_agent_no_prefix_needed():
     a = _StubAgent("a")
-    fake = _FakeStdin(["just do it\n"])
-    router = StdinRouter(readline=fake.readline)
-    await router.start()
-    try:
-        async with StdinSteer(a, router=router):
-            await asyncio.sleep(0.05)
-    finally:
-        await router.stop()
+    with _piped_router() as (router, pipe_in):
+        await router.start()
+        try:
+            async with StdinSteer(a, router=router):
+                pipe_in.send_text("just do it\r")
+                await _drain()
+        finally:
+            await router.stop()
     assert a.steered == ["just do it"]
 
 
 @pytest.mark.asyncio
 async def test_stdin_single_agent_prefix_also_works():
-    """Single-agent also accepts the explicit `agent_id:` form."""
     a = _StubAgent("a")
-    fake = _FakeStdin(["a: explicit\n"])
-    router = StdinRouter(readline=fake.readline)
-    await router.start()
-    try:
-        async with StdinSteer(a, router=router):
-            await asyncio.sleep(0.05)
-    finally:
-        await router.stop()
+    with _piped_router() as (router, pipe_in):
+        await router.start()
+        try:
+            async with StdinSteer(a, router=router):
+                pipe_in.send_text("a: explicit\r")
+                await _drain()
+        finally:
+            await router.stop()
     assert a.steered == ["explicit"]
 
 
@@ -464,14 +481,16 @@ async def test_stdin_single_agent_prefix_also_works():
 async def test_stdin_multi_agent_prefix_routes():
     a = _StubAgent("a")
     b = _StubAgent("b")
-    fake = _FakeStdin(["a: do A\n", "b: do B\n"])
-    router = StdinRouter(readline=fake.readline)
-    await router.start()
-    try:
-        async with StdinSteer([a, b], router=router):
-            await asyncio.sleep(0.05)
-    finally:
-        await router.stop()
+    with _piped_router() as (router, pipe_in):
+        await router.start()
+        try:
+            async with StdinSteer([a, b], router=router):
+                pipe_in.send_text("a: do A\r")
+                await _drain()
+                pipe_in.send_text("b: do B\r")
+                await _drain()
+        finally:
+            await router.stop()
     assert a.steered == ["do A"]
     assert b.steered == ["do B"]
 
@@ -480,14 +499,14 @@ async def test_stdin_multi_agent_prefix_routes():
 async def test_stdin_multi_agent_broadcast():
     a = _StubAgent("a")
     b = _StubAgent("b")
-    fake = _FakeStdin(["*: stop now\n"])
-    router = StdinRouter(readline=fake.readline)
-    await router.start()
-    try:
-        async with StdinSteer([a, b], router=router):
-            await asyncio.sleep(0.05)
-    finally:
-        await router.stop()
+    with _piped_router() as (router, pipe_in):
+        await router.start()
+        try:
+            async with StdinSteer([a, b], router=router):
+                pipe_in.send_text("*: stop now\r")
+                await _drain()
+        finally:
+            await router.stop()
     assert a.steered == ["stop now"]
     assert b.steered == ["stop now"]
 
@@ -495,16 +514,15 @@ async def test_stdin_multi_agent_broadcast():
 @pytest.mark.asyncio
 async def test_stdin_steer_registers_as_active_router():
     a = _StubAgent("a")
-    fake = _FakeStdin([])
-    router = StdinRouter(readline=fake.readline)
-    await router.start()
-    try:
-        assert get_active_router() is None
-        async with StdinSteer(a, router=router):
-            assert get_active_router() is router
-        assert get_active_router() is None
-    finally:
-        await router.stop()
+    with _piped_router() as (router, _pipe_in):
+        await router.start()
+        try:
+            assert get_active_router() is None
+            async with StdinSteer(a, router=router):
+                assert get_active_router() is router
+            assert get_active_router() is None
+        finally:
+            await router.stop()
 
 
 def test_stdin_steer_rejects_empty_agent_list():

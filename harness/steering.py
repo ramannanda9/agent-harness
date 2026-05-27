@@ -7,45 +7,54 @@ owns the source's lifecycle: it enters the source at the top of
 `run_stream` and exits it when the run finishes. No live-agent registry,
 no shared mutable state.
 
-Two transport-level pieces:
+Transport-level pieces:
 
-  StdinRouter         — process-wide pub/sub over stdin lines. Subscribers
-                        register a prefix and a callback; each line is
-                        parsed as `[prefix:] text` and routed to matching
-                        subscribers. Coordinates with HITL via
-                        `claim_next_line()`.
+  StdinRouter         — process-wide pub/sub over stdin, built on
+                        prompt_toolkit. Persistent prompt anchored at the
+                        bottom of the terminal (output scrolls above it
+                        without breaking the input line), multi-line
+                        composition (Enter submits, Ctrl+J or Esc-Enter
+                        insert a newline), in-memory history (up/down),
+                        and tab-completion of active agent prefixes.
+                        Coordinates with HITL via `claim_next_line()`.
 
   FileSteer           — per-agent file watcher. Polls an append-only file
                         and forwards new lines to `agent.steer()`. The
                         agent never shares this file with another agent.
 
-Two agent-bound sources for use with `steering_source_factory`:
+Per-agent sources for `steering_source_factory`:
 
-  FileSteer           — also serves as a per-agent source (constructed by
-                        the factory with the right path / agent pair).
-  StdinAgentSource    — subscribes to one prefix on a shared
-                        `StdinRouter`. Forwards matched lines to the
-                        bound agent's `steer()`.
+  StdinAgentSource    — subscribes to one prefix on a shared StdinRouter
+                        and forwards matched text to the bound agent's
+                        `steer()`. Body may be multi-line if the user
+                        composed it that way.
+  FileSteer           — also serves as a per-agent source (the factory
+                        constructs it with the right path / agent).
 
-Two convenience helpers that return factories ready for
-`AgentRuntime(steering_source_factory=...)`:
+Factory helpers (drop straight into `AgentRuntime(steering_source_factory=…)`):
 
   file_steering_factory(path_template)
-  stdin_steering_factory(router)
+  stdin_steering_factory(router=None)   — returned object is callable AND
+                                          async context manager; runtime
+                                          auto-manages router lifecycle.
 
-Direct-use shims (for code that holds explicit `BaseAgent` references and
-does not go through `AgentRuntime`):
+Direct-use shims (for code that holds explicit BaseAgent references and
+bypasses AgentRuntime):
 
-  StdinSteer(agents)   — wraps a `StdinRouter`, subscribes each agent
-                         with its `agent_id` prefix (or with the empty
-                         prefix when there's only one agent so the user
-                         can skip prefixing entirely).
+  StdinSteer(agents)   — subscribes each agent on a fresh or supplied
+                         router; single-agent mode also subscribes a
+                         catch-all so unprefixed lines work.
 
-HITL coordination (unchanged in shape, updated for pub/sub):
-  `harness/hitl.py:request_approval` calls `get_active_router()`. If a
-  router is active, it calls `router.claim_next_line()` BEFORE printing
-  the banner. That line bypasses pub/sub and resolves HITL's Future
-  directly. Subsequent lines return to pub/sub.
+HITL coordination:
+   `harness/hitl.py:request_approval` calls `get_active_router()`. If a
+   router is active, it calls `router.claim_next_line(prompt)` BEFORE
+   printing the banner. The next text submitted by the user into the
+   already-active steering prompt (`> `) is intercepted by
+   `_serve_steering` and routed to the HITL Future instead of being
+   dispatched to subscribers. If the user submits empty text (or the
+   claim is set between prompt cycles), `_serve_hitl` shows a dedicated
+   HITL prompt as a fallback. No `app.exit()` is used — that caused a
+   race where user input was consumed and lost by the dying prompt.
 """
 
 from __future__ import annotations
@@ -54,8 +63,15 @@ import asyncio
 import contextlib
 import os
 import sys
-from collections.abc import Awaitable, Callable
-from typing import TYPE_CHECKING
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any
+
+from prompt_toolkit import PromptSession
+from prompt_toolkit.completion import Completer, Completion
+from prompt_toolkit.history import InMemoryHistory
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.keys import Keys
+from prompt_toolkit.patch_stdout import patch_stdout
 
 if TYPE_CHECKING:
     from agents.base import BaseAgent
@@ -79,45 +95,97 @@ def _set_active_router(router: StdinRouter | None) -> None:
 # ── Stdin router (process-wide pub/sub) ───────────────────────────────────────
 
 
-async def _default_readline() -> str | None:
-    """Read one line from real stdin in a worker thread. Returns None on EOF."""
-    loop = asyncio.get_running_loop()
-    line = await loop.run_in_executor(None, sys.stdin.readline)
-    return line if line else None
+class _PrefixCompleter(Completer):
+    """Tab-completion for active agent prefixes. Only completes the first
+    word (before any `:`) so completion stops once the user is typing the
+    body of the message.
+    """
+
+    def __init__(self, prefixes_fn: Callable[[], list[str]]) -> None:
+        self._prefixes_fn = prefixes_fn
+
+    def get_completions(self, document, complete_event):
+        text = document.text_before_cursor
+        if ":" in text or "\n" in text:
+            return  # past the prefix; don't suggest anything
+        for prefix in self._prefixes_fn():
+            if prefix.startswith(text):
+                yield Completion(f"{prefix}: ", start_position=-len(text))
+        if "*".startswith(text):
+            yield Completion("*: ", start_position=-len(text))
 
 
 class StdinRouter:
     """Process-wide stdin reader with prefix-keyed pub/sub.
 
-    A single background coroutine reads `readline()` in a loop. Each
-    non-empty line is parsed:
+    Built on prompt_toolkit: persistent prompt anchored at the bottom
+    (agent output scrolls above it via `patch_stdout`), multi-line
+    composition (Enter submits, Ctrl+J or Esc-Enter insert a newline),
+    in-memory history, and tab-completion of currently-active prefixes.
 
-      - `prefix: text`    → delivered to subscribers registered with
-                            that exact prefix, plus any wildcard
-                            subscribers registered with prefix=`*`.
-      - `text` (no colon) → delivered to subscribers registered with
-                            prefix=`None` (catch-all).
-      - leading `*: text` → broadcast to every subscriber.
+    Routing rules — each submitted block parses its FIRST line for a
+    `prefix:` pattern; everything after the colon (plus any further
+    lines) is the body:
 
-    HITL claims pre-empt pub/sub: if `claim_next_line()` was called and
-    the Future is unresolved, the next line resolves it and is NOT
-    routed to subscribers.
+      - `prefix: body`     → delivered to subscribers with that prefix
+                             (or to the `*` broadcast set when
+                             prefix=`*`).
+      - `body` (no colon)  → delivered to catch-all subscribers
+                             (prefix=None).
+      - Unknown prefix     → warned to stderr, dropped.
 
-    Unknown-prefix lines (a `prefix:` that no one is listening for) are
-    surfaced to stderr so the user knows their input was discarded.
+    HITL claims pre-empt pub/sub delivery: when `claim_next_line(prompt)`
+    is called, the next submitted text resolves the HITL Future instead
+    of routing to subscribers. If the router reaches a pending claim
+    between steering prompt cycles, it shows HITL's prompt text directly.
     """
+
+    # Testability: tests construct with custom prompt_toolkit Input/Output
+    # via the input_/output kwargs (prompt_toolkit.input.create_pipe_input
+    # + DummyOutput) so we don't need a real TTY.
 
     def __init__(
         self,
-        readline: Callable[[], Awaitable[str | None]] | None = None,
+        *,
+        input_: Any | None = None,
+        output: Any | None = None,
+        history: Any | None = None,
+        patch_stdout_: bool = True,
     ) -> None:
-        self._readline = readline or _default_readline
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
-        self._hitl_future: asyncio.Future[str] | None = None
-        # subscription_id → (prefix, callback). prefix=None is the catch-all.
+        # HITL claim: (prompt_text, Future) or None.
+        self._hitl_claim: tuple[str, asyncio.Future[str]] | None = None
+        # subscription_id → (prefix, callback). prefix=None is catch-all.
         self._subs: dict[int, tuple[str | None, Callable[[str], None]]] = {}
         self._next_sub_id: int = 0
+        # Tests turn off patch_stdout to avoid interfering with pytest capture.
+        self._patch_stdout = patch_stdout_
+        self._session: PromptSession = PromptSession(
+            history=history or InMemoryHistory(),
+            input=input_,
+            output=output,
+        )
+        self._key_bindings = self._build_key_bindings()
+        self._completer = _PrefixCompleter(self.active_prefixes)
+
+    @staticmethod
+    def _build_key_bindings() -> KeyBindings:
+        kb = KeyBindings()
+
+        @kb.add("enter")
+        def _submit(event):
+            event.current_buffer.validate_and_handle()
+
+        @kb.add("c-j")
+        def _newline_ctrl_j(event):
+            event.current_buffer.insert_text("\n")
+
+        @kb.add(Keys.Escape, "enter")
+        def _newline_alt_enter(event):
+            event.current_buffer.insert_text("\n")
+
+        return kb
 
     # ── Pub/sub API ───────────────────────────────────────────────────────────
 
@@ -128,11 +196,10 @@ class StdinRouter:
     ) -> int:
         """Register `callback` to receive text matching `prefix`.
 
-        prefix=None    → catch-all: receives any line that has no `:`.
-        prefix=str     → receives lines `prefix: text` (or `*: text`
-                         broadcasts). Wildcard `*` may not be used as
-                         a subscription prefix (it's reserved for
-                         broadcast sends).
+        prefix=None  → catch-all (lines with no `:`).
+        prefix=str   → exact prefix match plus `*` broadcasts.
+        `*` is reserved for broadcast SENDS — not a valid subscription
+        prefix.
 
         Returns an integer subscription id for `unsubscribe()`.
         """
@@ -147,7 +214,6 @@ class StdinRouter:
         self._subs.pop(sub_id, None)
 
     def active_prefixes(self) -> list[str]:
-        """Return the list of currently-subscribed prefixes (excludes catch-all)."""
         return sorted({p for p, _ in self._subs.values() if p is not None})
 
     def has_catchall(self) -> bool:
@@ -155,11 +221,29 @@ class StdinRouter:
 
     # ── HITL API ──────────────────────────────────────────────────────────────
 
-    def claim_next_line(self) -> asyncio.Future[str]:
-        """Reserve the next stdin line for HITL. Resolves the returned Future."""
+    def claim_next_line(self, prompt: str | None = None) -> asyncio.Future[str]:
+        """Reserve the next stdin read for HITL.
+
+        Returns a Future that resolves with the user's typed answer.
+        The claim is satisfied in one of two ways:
+
+        1. **Fast path** — the user types their answer into the
+           already-active steering prompt (``> ``).  When the steering
+           prompt returns text while a claim is pending,
+           ``_serve_steering`` routes it to the HITL future instead of
+           dispatching to subscribers.
+        2. **Fallback** — the user submits empty text (or the claim is
+           set between prompt cycles).  The ``_run`` loop sees the
+           still-pending claim and calls ``_serve_hitl``, which shows
+           the dedicated HITL prompt text.
+
+        No ``app.exit()`` is used — that caused a race where input
+        typed between the exit and the new prompt was consumed and lost
+        by the dying steering prompt.
+        """
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[str] = loop.create_future()
-        self._hitl_future = fut
+        self._hitl_claim = (prompt or "> ", fut)
         return fut
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -172,16 +256,21 @@ class StdinRouter:
     async def stop(self) -> None:
         self._stop.set()
         if self._task is not None:
+            # Trigger exit so prompt_async returns; then cancel as backup.
+            app = self._session.app
+            if app is not None and getattr(app, "is_running", False):
+                app.exit()
             self._task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._task
             self._task = None
-        if self._hitl_future is not None and not self._hitl_future.done():
-            self._hitl_future.cancel()
-            self._hitl_future = None
+        if self._hitl_claim is not None:
+            _, fut = self._hitl_claim
+            if not fut.done():
+                fut.cancel()
+            self._hitl_claim = None
 
     async def __aenter__(self) -> StdinRouter:
-        """Start the reader AND register as active so HITL can coordinate."""
         await self.start()
         _set_active_router(self)
         return self
@@ -193,53 +282,114 @@ class StdinRouter:
     # ── Internals ─────────────────────────────────────────────────────────────
 
     async def _run(self) -> None:
-        while not self._stop.is_set():
-            try:
-                line = await self._readline()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                return  # stdin closed / read failure
-            if line is None:
-                return  # EOF
-            line = line.rstrip("\r\n")
-            if not line.strip():
-                continue
-            if self._hitl_future is not None and not self._hitl_future.done():
-                fut, self._hitl_future = self._hitl_future, None
-                fut.set_result(line)
-                continue
-            self._dispatch(line)
+        # patch_stdout makes prints from other tasks scroll above the prompt
+        # instead of corrupting the input line. Tests skip it because it
+        # interferes with pytest's stdout capture.
+        cm = patch_stdout(raw=True) if self._patch_stdout else contextlib.nullcontext()
+        with cm:
+            while not self._stop.is_set():
+                claim = self._hitl_claim
+                if claim is not None:
+                    await self._serve_hitl(*claim)
+                    self._hitl_claim = None
+                else:
+                    await self._serve_steering()
 
-    def _dispatch(self, line: str) -> None:
-        prefix: str | None
-        text: str
-        if ":" in line:
-            prefix, _, text = line.partition(":")
+    async def _serve_steering(self) -> None:
+        try:
+            text = await self._session.prompt_async(
+                "> ",
+                multiline=True,
+                key_bindings=self._key_bindings,
+                completer=self._completer,
+                complete_while_typing=True,
+            )
+        except (KeyboardInterrupt, EOFError):
+            self._stop.set()
+            return
+        except asyncio.CancelledError:
+            # stop() was called.  Just return — loop decides.
+            return
+        if text is None or not text.strip():
+            return
+        # HITL fast-path: if a claim arrived while the steering prompt
+        # was active, the user's typed answer should go to HITL, not to
+        # steering dispatch.  This avoids the app.exit() race where
+        # input was consumed and lost by the dying prompt.
+        claim = self._hitl_claim
+        if claim is not None:
+            _, fut = claim
+            if not fut.done():
+                fut.set_result(text.strip())
+            self._hitl_claim = None
+            return
+        self._dispatch(text)
+
+    async def _serve_hitl(
+        self,
+        prompt_text: str,
+        fut: asyncio.Future[str],
+    ) -> None:
+        try:
+            # Same multiline=True + our Enter-submits / Ctrl+J-newline
+            # bindings as steering so the UX is consistent. Single-token
+            # answers (y/n/a) still submit on a single Enter.
+            text = await self._session.prompt_async(
+                prompt_text,
+                multiline=True,
+                key_bindings=self._key_bindings,
+            )
+        except (KeyboardInterrupt, EOFError) as e:
+            if not fut.done():
+                fut.set_exception(e)
+            self._stop.set()
+            return
+        except asyncio.CancelledError:
+            if not fut.done():
+                fut.cancel()
+            return
+        if not fut.done():
+            fut.set_result(text if text is not None else "")
+
+    def _dispatch(self, text: str) -> None:
+        # Find the prefix by inspecting the FIRST line only.
+        first_line, sep, rest = text.partition("\n")
+        if ":" in first_line:
+            prefix, _, head = first_line.partition(":")
             prefix = prefix.strip()
-            text = text.strip()
-            if not text:
+            body = head.lstrip()
+            if rest:
+                body = f"{body}\n{rest}" if body else rest
+            body = body.strip()
+            if not body:
                 return
             if prefix == "*":
-                for p, cb in self._subs.values():
-                    if p is not None:  # broadcasts target prefixed subscribers
-                        self._safe_call(cb, text)
+                for p, cb in list(self._subs.values()):
+                    if p is not None:
+                        self._safe_call(cb, body)
                 return
-        else:
-            prefix = None
-            text = line.strip()
-            if not text:
-                return
+            matched = False
+            for p, cb in list(self._subs.values()):
+                if p == prefix:
+                    self._safe_call(cb, body)
+                    matched = True
+            if not matched:
+                self._warn_unrouted(prefix)
+            return
 
+        body = text.strip()
+        if not body:
+            return
         matched = False
         for p, cb in list(self._subs.values()):
-            if p == prefix:
-                self._safe_call(cb, text)
+            if p is None:
+                self._safe_call(cb, body)
                 matched = True
         if not matched:
-            self._warn_unrouted(prefix)
+            self._warn_unrouted(None)
 
-    def _safe_call(self, cb: Callable[[str], None], text: str) -> None:
+    @staticmethod
+    def _safe_call(cb: Callable[[str], None], text: str) -> None:
         try:
             cb(text)
         except Exception:
@@ -249,12 +399,12 @@ class StdinRouter:
         active = self.active_prefixes()
         if prefix is None:
             msg = (
-                "[steering] no catch-all subscriber; line ignored. "
+                "[steering] no catch-all subscriber; input ignored. "
                 f"Active prefixes: {active or '(none)'}"
             )
         else:
             msg = (
-                f"[steering] no subscriber for prefix {prefix!r}; line ignored. "
+                f"[steering] no subscriber for prefix {prefix!r}; input ignored. "
                 f"Active prefixes: {active or '(none)'}"
             )
         print(msg, file=sys.stderr)

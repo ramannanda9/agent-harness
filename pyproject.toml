@@ -7,7 +7,12 @@ name = "react-agent-harness"
 version = "0.2.0"
 description = "Multi-agent LLM orchestration: hybrid DAG planning, two-tier memory, streaming"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = [
+    # Rich interactive steering + HITL — multi-line input, history, tab
+    # completion, persistent prompt that survives streaming agent output.
+    # Used by harness.steering and harness.hitl.
+    "prompt_toolkit>=3.0",
+]
 
 [project.optional-dependencies]
 # Real episodic vector store (LanceDB + local embeddings).

@@ -795,9 +795,9 @@ don't double-start the router.
 When a `StdinRouter` is active, HITL calls `router.claim_next_line()`
 **before** printing its approval banner — the next stdin line resolves
 HITL's pending Future and bypasses pub/sub. After resolution, subsequent
-lines route to steering subscribers normally. Non-router HITL falls
-back to the original direct-read path, so existing non-interactive
-scripts and tests are unaffected.
+lines route to steering subscribers normally. When no router is active,
+HITL falls back to a standalone `prompt_toolkit` session, ensuring consistent
+key-bindings (like Enter-submits and Alt-Enter/Ctrl-J-newline) across both paths.
 
 ### Constraints
 
