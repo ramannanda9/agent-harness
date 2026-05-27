@@ -49,8 +49,6 @@ import logging
 from collections.abc import AsyncGenerator, Callable
 from typing import Any
 
-from harness.llm.auth import CredentialProvider
-
 logger = logging.getLogger(__name__)
 
 # Response headers commonly emitted by proxy gateways for per-request cost.
@@ -67,7 +65,6 @@ class OpenAILLM:
         *,
         model: str = "gpt-5.4-mini",
         api_key: str | None = None,  # falls back to OPENAI_API_KEY env
-        credential_provider: CredentialProvider | None = None,
         base_url: str | None = None,  # set when routing through a gateway
         request_timeout_seconds: float = 60.0,
         cost_fn: Callable[[dict], float] | None = None,
@@ -79,14 +76,8 @@ class OpenAILLM:
                 'openai package not installed. Run: pip install -e ".[openai]"'
             ) from e
 
-        self._credential_provider = credential_provider
-        client_api_key = api_key
-        if client_api_key is None and credential_provider is not None:
-            # The SDK validates that an API key exists at construction time.
-            # The real short-lived token is installed immediately before calls.
-            client_api_key = "agent-harness-token-provider"
         self._client = AsyncOpenAI(
-            api_key=client_api_key,
+            api_key=api_key,
             base_url=base_url,
             timeout=request_timeout_seconds,
         )
@@ -125,7 +116,7 @@ class OpenAILLM:
         # with_raw_response gives us response headers (for gateway cost detection)
         # plus the parsed body. Both succeed identically if the gateway header
         # isn't present — there's no extra cost vs the simple .create() path.
-        raw = await self._create_with_auth_retry(request)
+        raw = await self._client.chat.completions.with_raw_response.create(**request)
         resp = raw.parse()
         headers = _headers_dict(raw)
         usage = self._build_usage(resp, headers)
@@ -146,13 +137,11 @@ class OpenAILLM:
         # include_usage adds a final SSE chunk with the same usage block as
         # non-streaming responses. Without it, streaming responses have no
         # per-request token data.
-        raw = await self._create_with_auth_retry(
-            {
-                "model": self._model,
-                "messages": full_messages,
-                "stream": True,
-                "stream_options": {"include_usage": True},
-            }
+        raw = await self._client.chat.completions.with_raw_response.create(
+            model=self._model,
+            messages=full_messages,
+            stream=True,
+            stream_options={"include_usage": True},
         )
         headers = _headers_dict(raw)
         stream = raw.parse()
@@ -171,25 +160,6 @@ class OpenAILLM:
             self.last_usage = usage
 
     # ── Internals ─────────────────────────────────────────────────────────────
-
-    async def _create_with_auth_retry(self, request: dict[str, Any]) -> Any:
-        await self._prepare_auth()
-        try:
-            return await self._client.chat.completions.with_raw_response.create(**request)
-        except Exception as e:
-            if not _is_auth_error(e) or self._credential_provider is None:
-                raise
-            await self._prepare_auth(force_refresh=True)
-            return await self._client.chat.completions.with_raw_response.create(**request)
-
-    async def _prepare_auth(self, *, force_refresh: bool = False) -> None:
-        if self._credential_provider is None:
-            return
-        token = await self._credential_provider.get_token(force_refresh=force_refresh)
-        # OpenAI-compatible SDKs treat api_key as the bearer value used in the
-        # Authorization header. This lets short-lived OAuth tokens plug into the
-        # same request path without agents knowing about auth.
-        self._client.api_key = token.value
 
     def _build_usage(self, resp: Any, headers: dict[str, str] | None) -> dict:
         usage_obj = getattr(resp, "usage", None)
@@ -257,11 +227,3 @@ def _read_gateway_cost(headers: dict[str, str] | None) -> float | None:
                 )
                 return None
     return None
-
-
-def _is_auth_error(exc: Exception) -> bool:
-    status_code = getattr(exc, "status_code", None)
-    if status_code in (401, 403):
-        return True
-    name = exc.__class__.__name__.lower()
-    return "auth" in name or "unauthorized" in name

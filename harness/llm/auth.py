@@ -16,11 +16,11 @@ import json
 import os
 import secrets
 import stat
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse
 
 # Public Codex OAuth client id observed in Codex-compatible tooling. This is
@@ -44,134 +44,6 @@ ANTHROPIC_CLAUDE_CODE_SCOPES = " ".join(
         "user:file_upload",
     ]
 )
-
-
-@dataclass(frozen=True)
-class AccessToken:
-    value: str
-    expires_at: datetime | None = None
-    token_type: str = "Bearer"
-
-    def is_expired(self, *, skew_seconds: int = 60) -> bool:
-        if self.expires_at is None:
-            return False
-        return datetime.now(timezone.utc) + timedelta(seconds=skew_seconds) >= self.expires_at
-
-
-class CredentialProvider(Protocol):
-    async def get_token(self, *, force_refresh: bool = False) -> AccessToken:
-        """Return a usable access token, refreshing if needed."""
-
-
-class StaticTokenProvider:
-    """Credential provider for fixed API keys or bearer tokens."""
-
-    def __init__(
-        self,
-        token: str,
-        *,
-        token_type: str = "Bearer",
-        expires_at: datetime | None = None,
-    ) -> None:
-        if not token or not token.strip():
-            raise ValueError("token must be non-empty")
-        self._token = AccessToken(token.strip(), expires_at=expires_at, token_type=token_type)
-
-    async def get_token(self, *, force_refresh: bool = False) -> AccessToken:
-        return self._token
-
-
-class FileTokenProvider:
-    """Load a token from a JSON file.
-
-    Expected JSON keys:
-      - access_token, token, or api_key
-      - optional token_type
-      - optional expires_at (ISO-8601 or epoch seconds)
-
-    The file is expected to be user-private. On POSIX, group/world-readable
-    files are rejected by default.
-    """
-
-    def __init__(
-        self,
-        path: str | os.PathLike[str],
-        *,
-        require_private_permissions: bool = True,
-    ) -> None:
-        self.path = Path(path).expanduser()
-        self.require_private_permissions = require_private_permissions
-        self._cached: AccessToken | None = None
-
-    async def get_token(self, *, force_refresh: bool = False) -> AccessToken:
-        if self._cached is not None and not force_refresh and not self._cached.is_expired():
-            return self._cached
-        self._validate_permissions()
-        data = json.loads(self.path.read_text())
-        self._cached = _token_from_payload(data)
-        return self._cached
-
-    def _validate_permissions(self) -> None:
-        if not self.path.exists():
-            raise FileNotFoundError(self.path)
-        if os.name == "nt" or not self.require_private_permissions:
-            return
-        mode = stat.S_IMODE(self.path.stat().st_mode)
-        if mode & (stat.S_IRWXG | stat.S_IRWXO):
-            raise PermissionError(f"{self.path} must not be readable or writable by group/other")
-
-
-class CommandTokenProvider:
-    """Run a local command that prints a token payload.
-
-    This is the safest extension point for provider-specific OAuth helpers:
-    the helper owns login, refresh, and token storage; agent-harness only sees
-    a short-lived token. Output may be JSON or a plain token string.
-    """
-
-    def __init__(
-        self,
-        command: Sequence[str],
-        *,
-        timeout_seconds: float = 15.0,
-        env: Mapping[str, str] | None = None,
-    ) -> None:
-        if not command:
-            raise ValueError("command must not be empty")
-        self.command = tuple(command)
-        self.timeout_seconds = timeout_seconds
-        self.env = dict(env or {})
-        self._cached: AccessToken | None = None
-
-    async def get_token(self, *, force_refresh: bool = False) -> AccessToken:
-        if self._cached is not None and not force_refresh and not self._cached.is_expired():
-            return self._cached
-
-        proc = await asyncio.create_subprocess_exec(
-            *self.command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env={**os.environ, **self.env},
-        )
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(),
-                timeout=self.timeout_seconds,
-            )
-        except TimeoutError:
-            proc.kill()
-            await proc.wait()
-            raise TimeoutError(f"token command timed out: {self.command[0]}") from None
-
-        if proc.returncode != 0:
-            err = stderr.decode(errors="replace").strip()
-            raise RuntimeError(f"token command failed ({proc.returncode}): {err}")
-
-        text = stdout.decode(errors="replace").strip()
-        if not text:
-            raise RuntimeError("token command produced no output")
-        self._cached = parse_token_output(text)
-        return self._cached
 
 
 @dataclass(frozen=True)
@@ -229,10 +101,6 @@ class AuthFileOAuthProvider:
             self._write_credential(cred)
         self._cached = cred
         return cred
-
-    async def get_token(self, *, force_refresh: bool = False) -> AccessToken:
-        cred = await self.get_credential(force_refresh=force_refresh)
-        return AccessToken(cred.access, expires_at=cred.expires_at)
 
     def _read_credential(self) -> OAuthCredential:
         _validate_private_file(
@@ -572,17 +440,6 @@ class AnthropicClaudeCodeOAuthClient:
         return self._client
 
 
-def parse_token_output(text: str) -> AccessToken:
-    """Parse JSON token helper output, falling back to a plain token string."""
-    try:
-        payload = json.loads(text)
-    except json.JSONDecodeError:
-        return AccessToken(text.strip())
-    if not isinstance(payload, dict):
-        raise ValueError("token command JSON output must be an object")
-    return _token_from_payload(payload)
-
-
 def parse_authorization_callback(text: str) -> tuple[str, str] | None:
     value = text.strip()
     if not value:
@@ -609,12 +466,10 @@ def parse_authorization_callback(text: str) -> tuple[str, str] | None:
     return None
 
 
-def default_auth_dir() -> Path:
-    return Path(os.environ.get("AGENT_HARNESS_AUTH_DIR", "~/.agent-harness/auth")).expanduser()
-
-
 def default_auth_file() -> Path:
-    return default_auth_dir() / "auth.json"
+    return Path(
+        os.environ.get("AGENT_HARNESS_AUTH_FILE", "~/.agent-harness/auth/auth.json")
+    ).expanduser()
 
 
 def extract_openai_account_id(access_token: str) -> str | None:
@@ -644,15 +499,6 @@ def decode_jwt_payload(token: str) -> dict[str, Any]:
     except Exception:
         return {}
     return decoded if isinstance(decoded, dict) else {}
-
-
-def _token_from_payload(payload: dict[str, Any]) -> AccessToken:
-    value = payload.get("access_token") or payload.get("token") or payload.get("api_key")
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError("token payload must include access_token, token, or api_key")
-    token_type = str(payload.get("token_type") or "Bearer")
-    expires_at = _parse_expires_at(payload)
-    return AccessToken(value.strip(), expires_at=expires_at, token_type=token_type)
 
 
 def _validate_private_file(

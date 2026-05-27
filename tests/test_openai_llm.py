@@ -77,13 +77,9 @@ class _FakeRawCreate:
         self.next_body = None
         self.next_headers: dict[str, str] = {}
         self.next_stream_chunks: list = []
-        self.failures: list[Exception] = []
-        self.client = None
 
     async def create(self, **kwargs):
         self.calls.append(kwargs)
-        if self.failures:
-            raise self.failures.pop(0)
         if kwargs.get("stream"):
             return _FakeRawResponse(body=self._make_stream(), headers=self.next_headers)
         return _FakeRawResponse(body=self.next_body, headers=self.next_headers)
@@ -104,9 +100,7 @@ def _build(monkeypatch, **kwargs):
 
     class _FakeClient:
         def __init__(self, *a, **kw):
-            self.api_key = kw.get("api_key")
             self.chat = types.SimpleNamespace(completions=completions)
-            completions.with_raw_response.client = self
 
     monkeypatch.setattr("openai.AsyncOpenAI", _FakeClient)
     return OpenAILLM(model="gpt-test", **kwargs), completions.with_raw_response
@@ -182,44 +176,6 @@ async def test_complete_forwards_response_format(monkeypatch):
         response_format={"type": "json_object"},
     )
     assert raw.calls[0]["response_format"] == {"type": "json_object"}
-
-
-async def test_complete_uses_credential_provider(monkeypatch):
-    from harness.llm.auth import StaticTokenProvider
-
-    llm, raw = _build(monkeypatch, credential_provider=StaticTokenProvider("oauth-token"))
-    raw.next_body = _fake_response("ok")
-
-    await llm.complete(system=None, messages=[])
-
-    assert raw.client.api_key == "oauth-token"
-
-
-async def test_complete_refreshes_credential_once_on_auth_error(monkeypatch):
-    from harness.llm.auth import AccessToken
-
-    class _AuthError(Exception):
-        status_code = 401
-
-    class _Provider:
-        def __init__(self):
-            self.calls = 0
-
-        async def get_token(self, *, force_refresh=False):
-            self.calls += 1
-            return AccessToken("fresh-token" if force_refresh else "stale-token")
-
-    provider = _Provider()
-    llm, raw = _build(monkeypatch, credential_provider=provider)
-    raw.failures = [_AuthError()]
-    raw.next_body = _fake_response("ok")
-
-    out = await llm.complete(system=None, messages=[])
-
-    assert out["text"] == "ok"
-    assert provider.calls == 2
-    assert raw.client.api_key == "fresh-token"
-    assert len(raw.calls) == 2
 
 
 # ── cost: gateway header takes precedence ────────────────────────────────────

@@ -10,32 +10,14 @@ from harness.llm.auth import (
     AnthropicClaudeCodeOAuthClient,
     AuthFileOAuthProvider,
     AuthorizationCodeLogin,
-    CommandTokenProvider,
     DeviceCode,
-    FileTokenProvider,
     OAuthCredential,
     OAuthPending,
     OpenAICodexOAuthClient,
-    StaticTokenProvider,
     decode_jwt_payload,
     extract_openai_account_id,
     parse_authorization_callback,
-    parse_token_output,
 )
-
-
-def test_parse_token_output_accepts_plain_token():
-    token = parse_token_output("abc123")
-    assert token.value == "abc123"
-    assert token.token_type == "Bearer"
-    assert token.expires_at is None
-
-
-def test_parse_token_output_accepts_json_with_expires_in():
-    token = parse_token_output('{"access_token":"abc","expires_in":120,"token_type":"Bearer"}')
-    assert token.value == "abc"
-    assert token.expires_at is not None
-    assert token.expires_at > datetime.now(timezone.utc)
 
 
 def test_parse_authorization_callback_accepts_url_and_code_state():
@@ -43,50 +25,6 @@ def test_parse_authorization_callback_accepts_url_and_code_state():
     assert parse_authorization_callback("abc#def") == ("abc", "def")
     assert parse_authorization_callback("code=abc&state=def") == ("abc", "def")
     assert parse_authorization_callback("nope") is None
-
-
-async def test_static_token_provider_returns_fixed_token():
-    provider = StaticTokenProvider("fixed")
-    assert (await provider.get_token()).value == "fixed"
-    assert (await provider.get_token(force_refresh=True)).value == "fixed"
-
-
-async def test_file_token_provider_requires_private_permissions(tmp_path):
-    path = tmp_path / "token.json"
-    path.write_text(json.dumps({"access_token": "secret"}))
-    if os.name != "nt":
-        path.chmod(0o644)
-        with pytest.raises(PermissionError):
-            await FileTokenProvider(path).get_token()
-
-        path.chmod(0o600)
-
-    token = await FileTokenProvider(path).get_token()
-    assert token.value == "secret"
-
-
-async def test_command_token_provider_caches_until_expired(monkeypatch):
-    calls = {"n": 0}
-
-    class _Proc:
-        returncode = 0
-
-        async def communicate(self):
-            calls["n"] += 1
-            expires_at = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
-            return json.dumps(
-                {"access_token": f"tok-{calls['n']}", "expires_at": expires_at}
-            ).encode(), b""
-
-    async def fake_exec(*_args, **_kwargs):
-        return _Proc()
-
-    monkeypatch.setattr("asyncio.create_subprocess_exec", fake_exec)
-    provider = CommandTokenProvider(["helper", "token"])
-
-    assert (await provider.get_token()).value == "tok-1"
-    assert (await provider.get_token()).value == "tok-1"
-    assert (await provider.get_token(force_refresh=True)).value == "tok-2"
 
 
 def test_decode_jwt_payload_and_extract_account_id():
@@ -130,7 +68,6 @@ async def test_auth_file_oauth_provider_reads_pi_shaped_entry(tmp_path):
     assert cred.access == "access-token"
     assert cred.refresh == "refresh-token"
     assert cred.account_id == "acct_123"
-    assert (await provider.get_token()).value == "access-token"
 
 
 async def test_auth_file_oauth_provider_refreshes_and_persists(tmp_path):
