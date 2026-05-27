@@ -74,6 +74,7 @@ explicit control.
 | `examples/executor_bridge_demo.py` | `ExecutorBridge` backends side-by-side: allowlist, env scrubbing, Docker network/fs isolation, timeout, positional-arg tools. | `ah-executor` and/or Docker |
 | `examples/durable_memory_demo.py` | Redis (semantic) + LanceDB (episodic) memory persistence across two related goals. | `OPENAI_API_KEY`, `[openai,redis,lance]`, Redis reachable |
 | `examples/mcp_demo.py` | Connects to an MCP filesystem server and gives the agent its tools. | `OPENAI_API_KEY`, `[openai,mcp]`, `npx` |
+| `examples/subscription_auth_demo.py` | Runs an agent through subscription-backed providers: direct `openai-codex` OAuth or direct `claude-code` OAuth. | `agent-harness login openai-codex` or `agent-harness login claude-code` |
 
 ## Adding a new domain (3 steps)
 
@@ -108,6 +109,65 @@ from harness.llm.openai import OpenAILLM
 llm = OpenAILLM(model="gpt-4o-mini")                # reads OPENAI_API_KEY from env
 runtime = AgentRuntime(..., llm=llm)
 ```
+
+Credential-backed adapters can also plug into the same contract. This is the
+shape used for provider-specific subscription or OAuth flows without teaching
+agents about auth:
+
+```bash
+agent-harness login openai-codex
+agent-harness auth status openai-codex
+agent-harness login claude-code
+agent-harness auth status claude-code
+```
+
+Direct `openai-codex` OAuth is experimental: it follows the Codex/Pi-style
+ChatGPT subscription route rather than the stable OpenAI Platform API. The
+Codex OAuth client id can be overridden with
+`AGENT_HARNESS_OPENAI_CODEX_CLIENT_ID`.
+
+```python
+from harness.llm.openai_codex import OpenAICodexLLM
+
+llm = OpenAICodexLLM(
+    model="gpt-5.5",
+    auth_file="~/.agent-harness/auth/auth.json",  # Pi-shaped openai-codex OAuth entry
+)
+runtime = AgentRuntime(..., llm=llm)
+```
+
+`OpenAICodexLLM` calls the Codex backend directly
+(`https://chatgpt.com/backend-api/codex/responses`) with OAuth credentials.
+The stable fallback remains `OpenAILLM` with `OPENAI_API_KEY`.
+
+For Claude Code-style setups, use `ClaudeCodeLLM` with Claude Pro/Max OAuth
+credentials stored in the same auth file. It calls the Anthropic Messages API
+directly with Claude-Code-compatible OAuth headers:
+
+```bash
+agent-harness login claude-code
+python examples/subscription_auth_demo.py claude-code
+```
+
+```python
+from harness.llm.claude_code import ClaudeCodeLLM
+
+llm = ClaudeCodeLLM(
+    model="claude-sonnet-4-6",
+    auth_file="~/.agent-harness/auth/auth.json",
+)
+```
+
+`ClaudeCodeLLM` reads a `claude-code` OAuth entry, refreshes it automatically
+when expired, and retries once after `401`/`403`. This mirrors Pi's Claude
+Pro/Max extension approach rather than shelling out to the Claude CLI. The
+default model is the current canonical Sonnet release ID, `claude-sonnet-4-6`;
+set `CLAUDE_CODE_MODEL` or pass `model="claude-opus-4-7"` to choose another
+model.
+
+Do not copy browser/app refresh tokens into repo files. Store OAuth auth files
+under `~/.agent-harness/auth` or reuse an existing Pi auth file with private
+file permissions (`0600`).
 
 To use Anthropic / Gemini / Ollama / a local SGLang or vLLM server / anything
 else — write a 30-line adapter implementing those two methods. See
