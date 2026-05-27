@@ -176,14 +176,48 @@ async def request_approval(
 
     Holds stdout_lock for the duration so concurrent agent events don't
     interleave with the banner or the input prompt.
+
+    Input always goes through prompt_toolkit:
+      - If a steering router is active, HITL claims the next stdin read
+        via the router. Text submitted at the active steering prompt is
+        routed to HITL instead of subscribers; if the router reaches a
+        pending claim between steering prompt cycles, it shows HITL's
+        approval prompt directly.
+      - If no router is active, HITL spins up a one-shot PromptSession
+        for the approval prompt. Same UX either way.
     """
+    from harness.steering import get_active_router
+
     async with stdout_lock:
+        router = get_active_router()
+        approve_prompt = "  Approve? [y/n/a/correction]: "
+        # If a router is active, reserve the next stdin read BEFORE printing
+        # the banner so the user's typed answer routes to HITL (not steering).
+        hitl_future: Any = (
+            router.claim_next_line(prompt=approve_prompt) if router is not None else None
+        )
+
         _print_banner(req)
 
         guard.suspend()
         try:
-            loop = asyncio.get_running_loop()
-            raw = await loop.run_in_executor(None, input, "  Approve? [y/n/a/correction]: ")
+            if hitl_future is not None:
+                raw = await hitl_future
+            else:
+                # Standalone: one-shot prompt_toolkit session with the same
+                # Enter-submits / Ctrl+J-newline bindings as steering so
+                # single-token answers (y/n/a) and multi-line corrections
+                # both compose naturally.
+                from prompt_toolkit import PromptSession
+
+                from harness.steering import StdinRouter
+
+                session: PromptSession = PromptSession()
+                raw = await session.prompt_async(
+                    approve_prompt,
+                    multiline=True,
+                    key_bindings=StdinRouter._build_key_bindings(),
+                )
         finally:
             guard.resume()
 

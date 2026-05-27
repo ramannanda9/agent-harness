@@ -284,6 +284,7 @@ class AgentRuntime:
         enable_otel: bool = False,
         annotation_store: Any | None = None,  # InMemoryAnnotationStore or compatible
         checkpoint_store: Any | None = None,  # FileCheckpointStore / RedisCheckpointStore
+        steering_source_factory: Any | None = None,  # passed to each spawned BaseAgent
     ) -> None:
         self._agent_registry = agent_registry
         self._tool_registry = tool_registry
@@ -292,6 +293,7 @@ class AgentRuntime:
         self._guardrail_config = guardrail_config or GuardrailConfig()
         self._enable_otel = enable_otel
         self._annotation_store = annotation_store
+        self._steering_source_factory = steering_source_factory
         # Auto-create a FileCheckpointStore if any agent uses hitl_tools or
         # checkpoint_every — zero-dep default, no configuration required.
         if checkpoint_store is None and any(
@@ -303,6 +305,21 @@ class AgentRuntime:
 
             checkpoint_store = FileCheckpointStore()
         self._checkpoint_store = checkpoint_store
+
+    def _steering_lifecycle(self):
+        """Wrap the dispatch in the steering factory's lifecycle if it has one.
+
+        Factories with shared resources (e.g. a StdinRouter) expose
+        `__aenter__/__aexit__`. File-based factories don't. We detect at
+        runtime and use nullcontext for the latter so the wrapping is
+        always safe.
+        """
+        import contextlib
+
+        f = self._steering_source_factory
+        if f is not None and hasattr(f, "__aenter__") and hasattr(f, "__aexit__"):
+            return f
+        return contextlib.nullcontext()
 
     def _make_tracer(self) -> Tracer:
         """Create a fresh Tracer, attaching configured hooks."""
@@ -337,6 +354,7 @@ class AgentRuntime:
             guard=guard,
             llm=self._llm,
             checkpoint_store=self._checkpoint_store,
+            steering_source_factory=self._steering_source_factory,
         )
         async for event in agent.run_stream(task, run_id=run_id):
             yield event
@@ -386,6 +404,7 @@ class AgentRuntime:
             guard=guard,
             llm=self._llm,
             checkpoint_store=self._checkpoint_store,
+            steering_source_factory=self._steering_source_factory,
         )
         agent._working_memory = wm
         agent._task = checkpoint["task"]
@@ -492,6 +511,7 @@ class AgentRuntime:
                 guard=guard,
                 llm=self._llm,
                 checkpoint_store=self._checkpoint_store,
+                steering_source_factory=self._steering_source_factory,
             )
             agent._working_memory = wm
             agent._task = checkpoint["task"]
@@ -551,6 +571,7 @@ class AgentRuntime:
                 guard=guard,
                 llm=self._llm,
                 checkpoint_store=self._checkpoint_store,
+                steering_source_factory=self._steering_source_factory,
             )
             for agent_id in self._agent_registry.all_ids()
         }
@@ -603,50 +624,58 @@ class AgentRuntime:
         Auto-resume: when --resume <key> is in sys.argv and a checkpoint store is
         configured, the saved run is transparently restored and streamed — callers
         need no resume-specific handling.
+
+        Steering: if `steering_source_factory` exposes async context manager
+        methods (e.g. `stdin_steering_factory()` which owns a shared
+        StdinRouter), this method wraps the entire dispatch in that
+        lifecycle so callers don't manage the shared resource themselves.
         """
         from harness.events import BusEvent, EventType
 
-        if self._checkpoint_store is not None:
-            from harness.checkpoint import maybe_resume_key
+        async with self._steering_lifecycle():
+            if self._checkpoint_store is not None:
+                from harness.checkpoint import maybe_resume_key
 
-            resume_key = maybe_resume_key()
-            if resume_key:
-                async for event in self.resume_stream(resume_key):
+                resume_key = maybe_resume_key()
+                if resume_key:
+                    async for event in self.resume_stream(resume_key):
+                        yield event
+                    return
+
+            complexity = await self._classify(goal)
+            path = "routed" if complexity == "simple" else "orchestrated"
+            yield BusEvent(
+                type=EventType.DISPATCH,
+                agent_id="orchestrator",
+                payload={"complexity": complexity, "path": path},
+            )
+
+            if complexity == "simple":
+                # Own the full OTEL lifecycle for the simple path so dispatch + route
+                # events appear in the same trace as the agent work.
+                tracer = self._make_tracer()
+                run_id = str(uuid.uuid4())
+                tracer.start_run(run_id, goal)
+                try:
+                    tracer.log("dispatch", "orchestrator", {"complexity": complexity, "path": path})
+                    agent_id, rationale = await self.route(goal)
+                    logger.info("Router → %s (%s)", agent_id, rationale)
+                    tracer.log("route", agent_id, {"agent_id": agent_id, "rationale": rationale})
+                    yield BusEvent(
+                        type=EventType.ROUTE,
+                        agent_id=agent_id,
+                        payload={"agent_id": agent_id, "rationale": rationale},
+                    )
+                    async for event in self._run_agent_with_tracer(agent_id, goal, tracer, run_id):
+                        yield event
+                finally:
+                    tracer.end_run()
+            else:
+                # Orchestrated path owns its own trace via _build_orchestrator.
+                # run_stream re-enters _steering_lifecycle as nullcontext when
+                # the factory is already active (idempotent), so no double-start.
+                async for event in self.run_stream(goal):
                     yield event
-                return
-
-        complexity = await self._classify(goal)
-        path = "routed" if complexity == "simple" else "orchestrated"
-        yield BusEvent(
-            type=EventType.DISPATCH,
-            agent_id="orchestrator",
-            payload={"complexity": complexity, "path": path},
-        )
-
-        if complexity == "simple":
-            # Own the full OTEL lifecycle for the simple path so dispatch + route
-            # events appear in the same trace as the agent work.
-            tracer = self._make_tracer()
-            run_id = str(uuid.uuid4())
-            tracer.start_run(run_id, goal)
-            try:
-                tracer.log("dispatch", "orchestrator", {"complexity": complexity, "path": path})
-                agent_id, rationale = await self.route(goal)
-                logger.info("Router → %s (%s)", agent_id, rationale)
-                tracer.log("route", agent_id, {"agent_id": agent_id, "rationale": rationale})
-                yield BusEvent(
-                    type=EventType.ROUTE,
-                    agent_id=agent_id,
-                    payload={"agent_id": agent_id, "rationale": rationale},
-                )
-                async for event in self._run_agent_with_tracer(agent_id, goal, tracer, run_id):
-                    yield event
-            finally:
-                tracer.end_run()
-        else:
-            # Orchestrated path owns its own trace via _build_orchestrator.
-            async for event in self.run_stream(goal):
-                yield event
 
     async def dispatch(self, goal: str) -> dict:
         """Blocking dispatch. Returns TASK_DONE payload for simple goals,
@@ -707,22 +736,23 @@ class AgentRuntime:
         """
         from harness.events import BusEvent, EventType
 
-        tracer = self._make_tracer()
-        run_id = str(uuid.uuid4())
-        tracer.start_run(run_id, goal)
-        try:
-            agent_id, rationale = await self.route(goal)
-            logger.info("Router → %s (%s)", agent_id, rationale)
-            tracer.log("route", agent_id, {"agent_id": agent_id, "rationale": rationale})
-            yield BusEvent(
-                type=EventType.ROUTE,
-                agent_id=agent_id,
-                payload={"agent_id": agent_id, "rationale": rationale},
-            )
-            async for event in self._run_agent_with_tracer(agent_id, goal, tracer, run_id):
-                yield event
-        finally:
-            tracer.end_run()
+        async with self._steering_lifecycle():
+            tracer = self._make_tracer()
+            run_id = str(uuid.uuid4())
+            tracer.start_run(run_id, goal)
+            try:
+                agent_id, rationale = await self.route(goal)
+                logger.info("Router → %s (%s)", agent_id, rationale)
+                tracer.log("route", agent_id, {"agent_id": agent_id, "rationale": rationale})
+                yield BusEvent(
+                    type=EventType.ROUTE,
+                    agent_id=agent_id,
+                    payload={"agent_id": agent_id, "rationale": rationale},
+                )
+                async for event in self._run_agent_with_tracer(agent_id, goal, tracer, run_id):
+                    yield event
+            finally:
+                tracer.end_run()
 
     async def run_routed(self, goal: str) -> dict:
         """Blocking routed run. Returns the TASK_DONE payload dict."""
@@ -793,17 +823,18 @@ class AgentRuntime:
         Auto-resume: when --resume <key> is in sys.argv and a checkpoint store is
         configured, the saved run is transparently restored and streamed.
         """
-        if self._checkpoint_store is not None:
-            from harness.checkpoint import maybe_resume_key
+        async with self._steering_lifecycle():
+            if self._checkpoint_store is not None:
+                from harness.checkpoint import maybe_resume_key
 
-            resume_key = maybe_resume_key()
-            if resume_key:
-                async for event in self.resume_stream(resume_key):
-                    yield event
-                return
-        orchestrator, _tracer, _guard = self._build_orchestrator()
-        async for event in orchestrator.run_stream(goal):
-            yield event
+                resume_key = maybe_resume_key()
+                if resume_key:
+                    async for event in self.resume_stream(resume_key):
+                        yield event
+                    return
+            orchestrator, _tracer, _guard = self._build_orchestrator()
+            async for event in orchestrator.run_stream(goal):
+                yield event
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
