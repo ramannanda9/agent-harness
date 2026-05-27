@@ -64,18 +64,22 @@ class OpenAILLM:
         self,
         *,
         model: str = "gpt-5.4-mini",
-        api_key: str | None = None,           # falls back to OPENAI_API_KEY env
-        base_url: str | None = None,          # set when routing through a gateway
+        api_key: str | None = None,  # falls back to OPENAI_API_KEY env
+        base_url: str | None = None,  # set when routing through a gateway
         request_timeout_seconds: float = 60.0,
         cost_fn: Callable[[dict], float] | None = None,
     ) -> None:
         try:
             from openai import AsyncOpenAI
         except ImportError as e:
-            raise ImportError('openai package not installed. Run: pip install -e ".[openai]"') from e
+            raise ImportError(
+                'openai package not installed. Run: pip install -e ".[openai]"'
+            ) from e
 
         self._client = AsyncOpenAI(
-            api_key=api_key, base_url=base_url, timeout=request_timeout_seconds,
+            api_key=api_key,
+            base_url=base_url,
+            timeout=request_timeout_seconds,
         )
         self._model = model
         self._cost_fn = cost_fn
@@ -218,6 +222,8 @@ def _read_gateway_cost(headers: dict[str, str] | None) -> float | None:
             try:
                 return float(headers[name])
             except (ValueError, TypeError):
-                logger.warning("gateway cost header %s present but unparseable: %r", name, headers[name])
+                logger.warning(
+                    "gateway cost header %s present but unparseable: %r", name, headers[name]
+                )
                 return None
     return None

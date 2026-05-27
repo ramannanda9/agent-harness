@@ -161,7 +161,8 @@ async def test_complete_prepends_system(monkeypatch):
     llm, raw = _build(monkeypatch)
     raw.next_body = _fake_response("ok")
     await llm.complete(
-        system="be helpful", messages=[{"role": "user", "content": "hi"}],
+        system="be helpful",
+        messages=[{"role": "user", "content": "hi"}],
     )
     assert raw.calls[0]["messages"][0] == {"role": "system", "content": "be helpful"}
 
@@ -211,7 +212,7 @@ async def test_cost_fn_exception_swallowed(monkeypatch):
     raw.next_body = _fake_response("ok", p=10, c=5)
 
     out = await llm.complete(system=None, messages=[])
-    assert "cost_usd" not in out["usage"]   # we still return usage, just no cost
+    assert "cost_usd" not in out["usage"]  # we still return usage, just no cost
     assert out["text"] == "ok"
 
 

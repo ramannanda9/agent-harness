@@ -32,6 +32,7 @@ from harness.events import EventType
 from harness.executor_bridge import ExecutorBridge, ExecutorConfig, ExecutorTool, find_executor
 from harness.llm.openai import OpenAILLM
 from harness.runtime import AgentRegistry, AgentRuntime, GuardrailConfig, ToolRegistry
+from harness.utils import stream_tokens_inline
 from memory.manager import MemoryManager
 from memory.stores import InMemoryEpisodicStore, InMemorySemanticStore
 from tools.builtin.http_fetch import HTTPFetch
@@ -128,8 +129,10 @@ async def main() -> None:
 
     # dispatch_stream: classifier decides simple→routed or complex→orchestrated.
     # User only provides a goal — routing and planning happen automatically.
+    # stream_tokens_inline drains TOKEN events to stdout live so we never see
+    # them in the loop below.
     final: dict = {}
-    async for event in runtime.dispatch_stream(GOAL):
+    async for event in stream_tokens_inline(runtime.dispatch_stream(GOAL)):
         if event.type == EventType.DISPATCH:
             print(
                 f"[dispatch]  complexity={event.payload['complexity']} path={event.payload['path']}"

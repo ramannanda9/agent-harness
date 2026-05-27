@@ -1,0 +1,137 @@
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import os
+import sys
+from pathlib import Path
+
+from harness.llm.auth import (
+    AnthropicClaudeCodeOAuthClient,
+    AuthFileOAuthProvider,
+    OAuthCredential,
+    OpenAICodexOAuthClient,
+    default_auth_file,
+)
+
+PROVIDERS = ["openai-codex", "claude-code"]
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="agent-harness", description="agent-harness utilities")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    login = sub.add_parser("login", help="log in to a provider")
+    login.add_argument("provider", choices=PROVIDERS)
+    login.add_argument("--auth-file", default=str(default_auth_file()))
+
+    status = sub.add_parser("auth", help="inspect or clear provider auth")
+    status_sub = status.add_subparsers(dest="auth_command", required=True)
+    status_cmd = status_sub.add_parser("status", help="show auth status")
+    status_cmd.add_argument("provider", choices=PROVIDERS)
+    status_cmd.add_argument("--auth-file", default=str(default_auth_file()))
+    logout_cmd = status_sub.add_parser("logout", help="remove auth credentials")
+    logout_cmd.add_argument("provider", choices=PROVIDERS)
+    logout_cmd.add_argument("--auth-file", default=str(default_auth_file()))
+
+    args = parser.parse_args()
+    try:
+        if args.command == "login":
+            if args.provider == "openai-codex":
+                return asyncio.run(_login_openai_codex(Path(args.auth_file).expanduser()))
+            if args.provider == "claude-code":
+                return asyncio.run(_login_claude_code(Path(args.auth_file).expanduser()))
+        if args.command == "auth" and args.auth_command == "status":
+            if args.provider == "openai-codex":
+                return _status_oauth_provider(Path(args.auth_file).expanduser(), "openai-codex")
+            if args.provider == "claude-code":
+                return _status_oauth_provider(Path(args.auth_file).expanduser(), "claude-code")
+        if args.command == "auth" and args.auth_command == "logout":
+            if args.provider == "openai-codex":
+                return _logout_oauth_provider(Path(args.auth_file).expanduser(), "openai-codex")
+            if args.provider == "claude-code":
+                return _logout_oauth_provider(Path(args.auth_file).expanduser(), "claude-code")
+    except Exception as e:
+        print(f"agent-harness: {e}", file=sys.stderr)
+        return 1
+    parser.error("unsupported command")
+    return 2
+
+
+async def _login_openai_codex(path: Path) -> int:
+    client = OpenAICodexOAuthClient()
+    try:
+        device = await client.request_device_code()
+        print("OpenAI Codex login")
+        print(f"Open: {device.verification_uri}")
+        print(f"Code: {device.user_code}")
+        print("Waiting for authorization...")
+        cred = await client.poll_device_code(device)
+    finally:
+        await client.aclose()
+    _write_oauth_credential(path, cred)
+    print(f"Logged in to openai-codex. Credentials saved to {path}")
+    return 0
+
+
+async def _login_claude_code(path: Path) -> int:
+    client = AnthropicClaudeCodeOAuthClient()
+    try:
+        login = client.begin_login()
+        print("Claude Code login")
+        print(f"Open: {login.url}")
+        print("Paste the final callback URL, or the code#state value.")
+        callback_input = input("Callback: ")
+        cred = await client.finish_login(login, callback_input)
+    finally:
+        await client.aclose()
+    _write_oauth_credential(path, cred)
+    print(f"Logged in to claude-code. Credentials saved to {path}")
+    return 0
+
+
+def _status_oauth_provider(path: Path, provider_name: str) -> int:
+    provider = AuthFileOAuthProvider(path, provider=provider_name)
+    try:
+        cred = provider._read_credential()
+    except FileNotFoundError:
+        print(f"Not logged in: {path} does not exist")
+        return 1
+    except Exception as e:
+        print(f"Not logged in: {e}")
+        return 1
+    status = {
+        "provider": provider_name,
+        "auth_file": str(path),
+        "account_id": cred.account_id,
+        "expires_at": cred.expires_at.isoformat() if cred.expires_at else None,
+        "expired": cred.is_expired(),
+    }
+    print(json.dumps(status, indent=2))
+    return 0
+
+
+def _logout_oauth_provider(path: Path, provider_name: str) -> int:
+    provider = AuthFileOAuthProvider(
+        path, provider=provider_name, require_private_permissions=False
+    )
+    provider.clear()
+    print(f"Removed {provider_name} credentials from {path}")
+    return 0
+
+
+def _write_oauth_credential(path: Path, cred: OAuthCredential) -> None:
+    provider = AuthFileOAuthProvider(
+        path, provider=cred.provider, require_private_permissions=False
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        path.write_text("{}")
+        if os.name != "nt":
+            path.chmod(0o600)
+    provider._write_credential(cred)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
