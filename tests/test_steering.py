@@ -18,7 +18,14 @@ from prompt_toolkit.output import DummyOutput
 
 from agents.base import AgentConfig, BaseAgent
 from harness.events import EventType
-from harness.runtime import BudgetGuard, GuardrailConfig, Tracer
+from harness.runtime import (
+    AgentRegistry,
+    AgentRuntime,
+    BudgetGuard,
+    GuardrailConfig,
+    ToolRegistry,
+    Tracer,
+)
 from harness.steering import (
     FileSteer,
     StdinAgentSource,
@@ -661,3 +668,62 @@ async def test_stdin_steering_factory_subscribes_each_agent():
         # Verify it actually subscribed.
         assert "a" in router.active_prefixes()
     assert "a" not in router.active_prefixes()
+
+
+# ── AgentRuntime.run_agent_stream steering lifecycle ─────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_run_agent_stream_starts_steering_lifecycle(llm, memory):
+    """run_agent_stream must enter the steering lifecycle so the factory's
+    __aenter__/__aexit__ are called — regression test for the single-agent
+    steering bug where the lifecycle wrapper was missing."""
+    llm.routes = {
+        "react": lambda *_: {
+            "thought": "done",
+            "action": "finish",
+            "answer": "ok",
+            "confidence": 1.0,
+        }
+    }
+
+    entered = False
+    exited = False
+
+    class _LifecycleFactory:
+        """Looks like a stdin_steering_factory — has both lifecycle and per-agent call."""
+
+        async def __aenter__(self):
+            nonlocal entered
+            entered = True
+            return self
+
+        async def __aexit__(self, *exc):
+            nonlocal exited
+            exited = True
+
+        def __call__(self, agent: BaseAgent):
+            import contextlib
+
+            @contextlib.asynccontextmanager
+            async def _noop():
+                yield
+
+            return _noop()
+
+    config = AgentConfig(agent_id="solo", role="r", system_prompt="react", allowed_tools=[])
+    agent_reg = AgentRegistry()
+    agent_reg.register(config)
+
+    runtime = AgentRuntime(
+        agent_registry=agent_reg,
+        tool_registry=ToolRegistry(),
+        memory=memory,
+        llm=llm,
+        steering_source_factory=_LifecycleFactory(),
+    )
+
+    events = [ev async for ev in runtime.run_agent_stream("solo", "test task")]
+    assert any(ev.type == EventType.TASK_DONE for ev in events)
+    assert entered, "steering lifecycle __aenter__ was never called"
+    assert exited, "steering lifecycle __aexit__ was never called"
