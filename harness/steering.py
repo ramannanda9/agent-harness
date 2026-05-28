@@ -150,7 +150,6 @@ class StdinRouter:
         input_: Any | None = None,
         output: Any | None = None,
         history: Any | None = None,
-        patch_stdout_: bool = True,
     ) -> None:
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
@@ -159,8 +158,6 @@ class StdinRouter:
         # subscription_id → (prefix, callback). prefix=None is catch-all.
         self._subs: dict[int, tuple[str | None, Callable[[str], None]]] = {}
         self._next_sub_id: int = 0
-        # Tests turn off patch_stdout to avoid interfering with pytest capture.
-        self._patch_stdout = patch_stdout_
         self._session: PromptSession = PromptSession(
             history=history or InMemoryHistory(),
             input=input_,
@@ -282,18 +279,13 @@ class StdinRouter:
     # ── Internals ─────────────────────────────────────────────────────────────
 
     async def _run(self) -> None:
-        # patch_stdout makes prints from other tasks scroll above the prompt
-        # instead of corrupting the input line. Tests skip it because it
-        # interferes with pytest's stdout capture.
-        cm = patch_stdout(raw=True) if self._patch_stdout else contextlib.nullcontext()
-        with cm:
-            while not self._stop.is_set():
-                claim = self._hitl_claim
-                if claim is not None:
-                    await self._serve_hitl(*claim)
-                    self._hitl_claim = None
-                else:
-                    await self._serve_steering()
+        while not self._stop.is_set():
+            claim = self._hitl_claim
+            if claim is not None:
+                await self._serve_hitl(*claim)
+                self._hitl_claim = None
+            else:
+                await self._serve_steering()
 
     async def _serve_steering(self) -> None:
         try:
@@ -575,10 +567,13 @@ class _StdinSteeringFactory:
         self,
         router: StdinRouter | None = None,
         prefix_template: str = "{agent_id}",
+        patch_stdout_: bool = True,
     ) -> None:
         self._router = router or StdinRouter()
         self._owned = router is None
         self._prefix_template = prefix_template
+        self._patch_stdout = patch_stdout_ and router is None  # only patch when we own the router
+        self._patch_stdout_cm: Any | None = None
         # Ref-counted lifecycle: nested AgentRuntime wraps (dispatch_stream
         # → run_stream) re-enter the factory; only the outermost
         # enter/exit actually starts/stops the router.
@@ -590,6 +585,9 @@ class _StdinSteeringFactory:
 
     async def __aenter__(self) -> _StdinSteeringFactory:
         if self._owned and self._enter_count == 0:
+            if self._patch_stdout:
+                self._patch_stdout_cm = patch_stdout(raw=True)
+                self._patch_stdout_cm.__enter__()
             await self._router.__aenter__()
         self._enter_count += 1
         return self
@@ -598,11 +596,15 @@ class _StdinSteeringFactory:
         self._enter_count = max(0, self._enter_count - 1)
         if self._owned and self._enter_count == 0:
             await self._router.__aexit__(exc_type, exc, tb)
+            if self._patch_stdout_cm is not None:
+                self._patch_stdout_cm.__exit__(exc_type, exc, tb)
+                self._patch_stdout_cm = None
 
 
 def stdin_steering_factory(
     router: StdinRouter | None = None,
     prefix_template: str = "{agent_id}",
+    patch_stdout_: bool = True,
 ) -> _StdinSteeringFactory:
     """Return a steering factory that lifecycles its own StdinRouter.
 
@@ -616,7 +618,9 @@ def stdin_steering_factory(
     `prefix_template` may reference `{agent_id}`; default subscribes
     each agent to its own `agent_id`.
     """
-    return _StdinSteeringFactory(router=router, prefix_template=prefix_template)
+    return _StdinSteeringFactory(
+        router=router, prefix_template=prefix_template, patch_stdout_=patch_stdout_
+    )
 
 
 # ── Direct-use shims (no AgentRuntime / no factory) ───────────────────────────
@@ -639,6 +643,7 @@ class StdinSteer:
         agents: BaseAgent | list[BaseAgent],
         *,
         router: StdinRouter | None = None,
+        patch_stdout_: bool = True,
     ) -> None:
         if not isinstance(agents, list):
             agents = [agents]
@@ -647,9 +652,14 @@ class StdinSteer:
         self._agents = agents
         self._router = router or StdinRouter()
         self._owned_router = router is None
+        self._patch_stdout = patch_stdout_
+        self._patch_stdout_cm: Any | None = None
         self._sub_ids: list[int] = []
 
     async def __aenter__(self) -> StdinSteer:
+        if self._patch_stdout:
+            self._patch_stdout_cm = patch_stdout(raw=True)
+            self._patch_stdout_cm.__enter__()
         if self._owned_router:
             await self._router.start()
         # Always register one subscription per agent under its agent_id.
@@ -672,3 +682,6 @@ class StdinSteer:
         self._sub_ids.clear()
         if self._owned_router:
             await self._router.stop()
+        if self._patch_stdout_cm is not None:
+            self._patch_stdout_cm.__exit__(exc_type, exc, tb)
+            self._patch_stdout_cm = None
