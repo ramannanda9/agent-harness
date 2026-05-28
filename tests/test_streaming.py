@@ -5,6 +5,7 @@ Verifies that BaseAgent.run_stream() and Orchestrator.run_stream() yield the
 expected BusEvent sequence, and that the blocking run() drains to the same
 result the stream's DONE event carries.
 """
+
 from __future__ import annotations
 
 from agents.base import AgentConfig
@@ -20,8 +21,11 @@ from tests.conftest import EchoTool, ScriptedLLM
 async def test_agent_run_stream_finish_yields_task_done(agent_factory):
     """Finish on first step → just one TASK_DONE event (no THOUGHT/ACTION pairs)."""
     cfg = AgentConfig(
-        agent_id="a", role="r", system_prompt="finish.",
-        allowed_tools=[], working_memory_max_tokens=2000,
+        agent_id="a",
+        role="r",
+        system_prompt="finish.",
+        allowed_tools=[],
+        working_memory_max_tokens=2000,
     )
     agent = agent_factory(cfg)
     events = [e async for e in agent.run_stream("hi")]
@@ -34,7 +38,8 @@ async def test_agent_run_stream_finish_yields_task_done(agent_factory):
 
 
 async def test_agent_run_stream_tool_call_yields_action_and_observation(
-    agent_factory, llm: ScriptedLLM,
+    agent_factory,
+    llm: ScriptedLLM,
 ):
     """A tool-using step should yield THOUGHT → ACTION → OBSERVATION → ... → TASK_DONE."""
     step = {"n": 0}
@@ -47,7 +52,9 @@ async def test_agent_run_stream_tool_call_yields_action_and_observation(
 
     llm.routes = {"react": react}
     cfg = AgentConfig(
-        agent_id="a", role="r", system_prompt="ReAct format.",
+        agent_id="a",
+        role="r",
+        system_prompt="ReAct format.",
         allowed_tools=["echo"],
     )
     agent = agent_factory(cfg, tools={"echo": EchoTool()})
@@ -68,7 +75,10 @@ async def test_agent_run_stream_tool_call_yields_action_and_observation(
 async def test_agent_run_is_drain_of_run_stream(agent_factory):
     """run() and the TASK_DONE payload from run_stream() must agree."""
     cfg = AgentConfig(
-        agent_id="a", role="r", system_prompt="finish.", allowed_tools=[],
+        agent_id="a",
+        role="r",
+        system_prompt="finish.",
+        allowed_tools=[],
     )
     agent = agent_factory(cfg)
 
@@ -98,7 +108,11 @@ async def test_agent_forwards_token_events_when_llm_streams(agent_factory):
                 yield tok
 
     cfg = AgentConfig(
-        agent_id="a", role="r", system_prompt="ReAct.", allowed_tools=[],
+        agent_id="a",
+        role="r",
+        system_prompt="ReAct.",
+        allowed_tools=[],
+        stream_tokens=True,
     )
     agent = agent_factory(cfg)
     agent._llm = StreamingLLM()
@@ -119,10 +133,20 @@ def _orchestrator_routes():
     def planner(system, messages, kwargs):
         return {
             "tasks": [
-                {"id": "t1", "agent_id": "analyst", "instruction": "do x",
-                 "depends_on": [], "on_failure": "skip"},
-                {"id": "t2", "agent_id": "reporter", "instruction": "do y",
-                 "depends_on": ["t1"], "on_failure": "skip"},
+                {
+                    "id": "t1",
+                    "agent_id": "analyst",
+                    "instruction": "do x",
+                    "depends_on": [],
+                    "on_failure": "skip",
+                },
+                {
+                    "id": "t2",
+                    "agent_id": "reporter",
+                    "instruction": "do y",
+                    "depends_on": ["t1"],
+                    "on_failure": "skip",
+                },
             ],
             "rationale": "two tasks",
         }
@@ -132,8 +156,10 @@ def _orchestrator_routes():
 
     def extract(system, messages, kwargs):
         return {
-            "semantic_facts": {}, "episodic_summary": "ok",
-            "metadata": {}, "ttl_seconds": None,
+            "semantic_facts": {},
+            "episodic_summary": "ok",
+            "metadata": {},
+            "ttl_seconds": None,
         }
 
     return {
@@ -147,14 +173,24 @@ def _build_runtime(llm):
     tools = ToolRegistry().register(EchoTool())
     agents = (
         AgentRegistry()
-        .register(AgentConfig(
-            agent_id="analyst", role="r", system_prompt="ReAct.",
-            allowed_tools=["echo"], max_steps=2,
-        ))
-        .register(AgentConfig(
-            agent_id="reporter", role="r", system_prompt="ReAct.",
-            allowed_tools=["echo"], max_steps=2,
-        ))
+        .register(
+            AgentConfig(
+                agent_id="analyst",
+                role="r",
+                system_prompt="ReAct.",
+                allowed_tools=["echo"],
+                max_steps=2,
+            )
+        )
+        .register(
+            AgentConfig(
+                agent_id="reporter",
+                role="r",
+                system_prompt="ReAct.",
+                allowed_tools=["echo"],
+                max_steps=2,
+            )
+        )
     )
     memory = MemoryManager(
         semantic_store=InMemorySemanticStore(),
@@ -162,10 +198,15 @@ def _build_runtime(llm):
         llm=llm,
     )
     return AgentRuntime(
-        agent_registry=agents, tool_registry=tools, memory=memory, llm=llm,
+        agent_registry=agents,
+        tool_registry=tools,
+        memory=memory,
+        llm=llm,
         guardrail_config=GuardrailConfig(
-            max_total_cost_usd=5.0, max_wall_time_seconds=30,
-            max_replan_count=1, confidence_threshold=0.5,
+            max_total_cost_usd=5.0,
+            max_wall_time_seconds=30,
+            max_replan_count=1,
+            confidence_threshold=0.5,
         ),
     )
 
