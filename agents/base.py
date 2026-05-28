@@ -61,6 +61,7 @@ class AgentConfig:
     max_steps: int = 10
     memory_context_enabled: bool = True
     confidence_from_llm: bool = True  # if False, confidence=1.0 on success
+    stream_tokens: bool = False  # if True, TOKEN events are emitted as the LLM streams
     working_memory_max_tokens: int = 8000  # WorkingMemory eviction threshold; tune per agent
     hitl_tools: list[str] = None  # tools requiring human approval; None = no HITL
     checkpoint_every: int = 0  # write a resumable checkpoint every N steps; 0 = disabled
@@ -649,11 +650,12 @@ class BaseAgent:
                     messages=messages,
                 ):
                     accumulated += token
-                    yield BusEvent(
-                        type=EventType.TOKEN,
-                        agent_id=self.config.agent_id,
-                        token=token,
-                    )
+                    if self.config.stream_tokens:
+                        yield BusEvent(
+                            type=EventType.TOKEN,
+                            agent_id=self.config.agent_id,
+                            token=token,
+                        )
                 response = _parse_action_json(accumulated)
                 if response is None:
                     logger.warning(

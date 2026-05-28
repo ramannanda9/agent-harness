@@ -909,3 +909,20 @@ key-bindings (like Enter-submits and Alt-Enter/Ctrl-J-newline) across both paths
 
 See `examples/complex_sysaudit_demo.py` for stdin steering across three
 agents alongside HITL on the shell tool.
+
+## AgentConfig reference
+
+| Field | Default | Description |
+|---|---|---|
+| `agent_id` | required | Unique identifier for the agent |
+| `role` | required | Plain-English description used by the planner for agent selection |
+| `system_prompt` | required | Base system prompt for the agent |
+| `allowed_tools` | required | Tool names the agent may call |
+| `max_steps` | `10` | Maximum ReAct iterations before the run is terminated |
+| `max_wall_time_seconds` | (guardrail) | See `GuardrailConfig` |
+| `memory_context_enabled` | `True` | Prepend relevant long-term memory to the system prompt |
+| `confidence_from_llm` | `True` | Use the `confidence` field from the LLM response; set `False` to always return `1.0` |
+| `working_memory_max_tokens` | `8000` | Token budget for in-context working memory before rolling summarisation kicks in |
+| `hitl_tools` | `[]` | Tool names that require human approval before execution |
+| `checkpoint_every` | `0` | Write a crash-resumable checkpoint every N steps; `0` disables periodic checkpoints |
+| `stream_tokens` | `False` | Emit `TOKEN` events as the LLM streams. Disabled by default — enable if you want to render partial output in real time: `AgentConfig(..., stream_tokens=True)` |
