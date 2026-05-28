@@ -64,7 +64,6 @@ def _piped_router():
         router = StdinRouter(
             input_=pipe_in,
             output=DummyOutput(),
-            patch_stdout_=False,
         )
         yield router, pipe_in
 
@@ -330,20 +329,6 @@ async def test_router_routes_to_catchall_subscriber():
 
 
 @pytest.mark.asyncio
-async def test_router_default_patch_stdout_context_starts():
-    """Default patch_stdout path uses a sync context manager but still runs in async loop."""
-    received: list[str] = []
-    with create_pipe_input() as pipe_in:
-        router = StdinRouter(input_=pipe_in, output=DummyOutput())
-        router.subscribe(None, received.append)
-        await router.start()
-        pipe_in.send_text("plain line\r")
-        await _drain()
-        await router.stop()
-    assert received == ["plain line"]
-
-
-@pytest.mark.asyncio
 async def test_router_routes_by_prefix():
     a_received: list[str] = []
     b_received: list[str] = []
@@ -448,7 +433,7 @@ async def test_router_claim_next_line_resolves_with_typed_answer():
 
 
 def test_router_rejects_star_as_subscription_prefix():
-    router = StdinRouter(patch_stdout_=False)
+    router = StdinRouter()
     with pytest.raises(ValueError):
         router.subscribe("*", lambda _t: None)
 
@@ -462,7 +447,7 @@ async def test_stdin_single_agent_no_prefix_needed():
     with _piped_router() as (router, pipe_in):
         await router.start()
         try:
-            async with StdinSteer(a, router=router):
+            async with StdinSteer(a, router=router, patch_stdout_=False):
                 pipe_in.send_text("just do it\r")
                 await _drain()
         finally:
@@ -476,7 +461,7 @@ async def test_stdin_single_agent_prefix_also_works():
     with _piped_router() as (router, pipe_in):
         await router.start()
         try:
-            async with StdinSteer(a, router=router):
+            async with StdinSteer(a, router=router, patch_stdout_=False):
                 pipe_in.send_text("a: explicit\r")
                 await _drain()
         finally:
@@ -491,7 +476,7 @@ async def test_stdin_multi_agent_prefix_routes():
     with _piped_router() as (router, pipe_in):
         await router.start()
         try:
-            async with StdinSteer([a, b], router=router):
+            async with StdinSteer([a, b], router=router, patch_stdout_=False):
                 pipe_in.send_text("a: do A\r")
                 await _drain()
                 pipe_in.send_text("b: do B\r")
@@ -509,7 +494,7 @@ async def test_stdin_multi_agent_broadcast():
     with _piped_router() as (router, pipe_in):
         await router.start()
         try:
-            async with StdinSteer([a, b], router=router):
+            async with StdinSteer([a, b], router=router, patch_stdout_=False):
                 pipe_in.send_text("*: stop now\r")
                 await _drain()
         finally:
@@ -525,7 +510,7 @@ async def test_stdin_steer_registers_as_active_router():
         await router.start()
         try:
             assert get_active_router() is None
-            async with StdinSteer(a, router=router):
+            async with StdinSteer(a, router=router, patch_stdout_=False):
                 assert get_active_router() is router
             assert get_active_router() is None
         finally:
