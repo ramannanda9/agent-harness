@@ -781,8 +781,9 @@ class AgentRuntime:
         run_id = str(uuid.uuid4())
         tracer.start_run(run_id, task)
         try:
-            async for event in self._run_agent_with_tracer(agent_id, task, tracer, run_id):
-                yield event
+            async with self._steering_lifecycle():
+                async for event in self._run_agent_with_tracer(agent_id, task, tracer, run_id):
+                    yield event
         finally:
             tracer.end_run()
 
