@@ -18,24 +18,21 @@ Usage:
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import sys
 
 from agents.base import AgentConfig
+from harness.console import ConsoleRenderer
 from harness.events import EventType
 from harness.llm.openai import OpenAILLM
 from harness.runtime import AgentRegistry, AgentRuntime, GuardrailConfig, ToolRegistry
-from harness.utils import stream_tokens_inline
 from memory.manager import MemoryManager
 from memory.stores import InMemoryEpisodicStore, InMemorySemanticStore
 from tools.mcp import MCPServerConnection
 
 DEFAULT_GOAL = "List the files in the current directory and summarise what you find."
 
-
-def _truncate(s: str, n: int = 140) -> str:
-    return s if len(s) <= n else s[:n] + "…"
+_renderer = ConsoleRenderer()
 
 
 async def main() -> None:
@@ -115,30 +112,11 @@ async def main() -> None:
 
         # ── Run ───────────────────────────────────────────────────────────
         final: dict = {}
-        async for event in stream_tokens_inline(runtime.run_stream(goal), show_agent_id=True):
-            if event.type == EventType.PLAN:
-                for t in event.payload["plan"].get("tasks", []):
-                    print(f"[plan]      {t['id']}@{t['agent_id']}: {_truncate(t['instruction'])}")
-            elif event.type == EventType.THOUGHT:
-                thought = event.payload.get("thought", "")
-                if thought:
-                    print(f"[thought]   {event.agent_id}: {_truncate(thought)}")
-            elif event.type == EventType.ACTION:
-                args = json.dumps(event.payload["args"], default=str)
-                print(f"[action]    {event.agent_id}: {event.payload['tool']}({_truncate(args)})")
-            elif event.type == EventType.OBSERVATION:
-                obs = event.payload.get("observation", "")
-                print(f"[observe]   {event.agent_id}: {_truncate(obs)}")
-            elif event.type == EventType.TASK_DONE:
-                print(
-                    f"[task_done] {event.agent_id} "
-                    f"success={event.payload['success']} "
-                    f"confidence={event.payload['confidence']}"
-                )
-            elif event.type == EventType.DONE:
+        async for event in runtime.run_stream(goal):
+            if event.type == EventType.DONE:
                 final = event.payload
-            elif event.type == EventType.ERROR:
-                print(f"[error]     {event.agent_id}: {event.error}", file=sys.stderr)
+            else:
+                _renderer.render(event)
 
         print("─" * 60)
         print(f"Final answer:\n{final.get('answer', '(no answer)')}")

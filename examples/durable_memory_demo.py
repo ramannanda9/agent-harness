@@ -35,14 +35,10 @@ import os
 import sys
 
 from agents.base import AgentConfig
+from harness.console import trunc
 from harness.llm.openai import OpenAILLM
 from harness.runtime import AgentRegistry, AgentRuntime, GuardrailConfig, ToolRegistry
 from memory.manager import MemoryManager
-
-
-def _truncate(s: str, n: int = 80) -> str:
-    s = str(s)
-    return s if len(s) <= n else s[:n] + "…"
 
 
 async def _check_or_die_redis(redis_url: str):
@@ -85,13 +81,13 @@ async def _dump_memory_state(semantic, episodic, query: str | None = None):
     keys = await semantic.search_prefix("")
     print(f"  semantic keys: {len(keys)}")
     for k, v in list(keys.items())[:5]:
-        print(f"    {k}: {_truncate(v, 70)}")
+        print(f"    {k}: {trunc(str(v), 70)}")
     if query:
         hits = await episodic.search(query, top_k=3)
         print(f"  episodic hits for {query!r}: {len(hits)}")
         for h in hits:
             ts = h.get("metadata", {}).get("timestamp", "?")
-            print(f"    [{ts[:19]}] {_truncate(h['text'], 70)}")
+            print(f"    [{ts[:19]}] {trunc(h['text'], 70)}")
 
 
 async def main() -> None:
@@ -159,7 +155,7 @@ async def main() -> None:
     print(f"RUN 1  (cold memory): {goal1}")
     print("─" * 64)
     result = await runtime.run(goal1)
-    print(f"answer:     {_truncate(result['answer'], 200)}")
+    print(f"answer:     {trunc(result['answer'], 200)}")
     print(f"confidence: {result['confidence']}")
     await _dump_memory_state(semantic, episodic, query=goal1)
 
@@ -177,7 +173,7 @@ async def main() -> None:
     print(f"RUN 2  (warm — episodic memory from run 1 is in scope): {goal2}")
     print("─" * 64)
     result = await runtime.run(goal2)
-    print(f"answer:     {_truncate(result['answer'], 200)}")
+    print(f"answer:     {trunc(result['answer'], 200)}")
     print(f"confidence: {result['confidence']}")
     await _dump_memory_state(semantic, episodic, query=goal2)
 
