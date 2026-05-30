@@ -38,6 +38,8 @@ harness/events.py           BusEvent + EventType — canonical event vocabulary
 harness/llm/openai.py       OpenAILLM — OpenAI adapter with usage + cost tracking
 harness/annotation.py       Annotation store + AnnotationHook — RLHF trajectory capture
 harness/hitl.py             HITL approval gate — interactive CLI, session-allow list
+harness/tool_policy.py      Persistent tool policy — user-scoped allow rules, CLI management
+harness/console.py          ConsoleRenderer — centralised BusEvent formatting for CLI apps
 harness/steering.py         Async steering — agent.steer(text), StdinRouter pub/sub, FileSteer, factory helpers
 harness/checkpoint.py       CheckpointStore + _ResumeHint + maybe_resume_key — pluggable run-state persistence (file + Redis); auto-resume built into dispatch_stream / run_stream
 harness/otel.py             OTELHook — OpenTelemetry span exporter (opt-in)
@@ -338,21 +340,95 @@ async for event in runtime.run_stream("investigate GPU spike on worker-07"):
         print(event.payload["answer"])
 ```
 
+### 4. Pre-built — `run_with_plan` / `run_with_plan_stream`
+
+Supply a hand-written `Plan` and bypass the LLM planner entirely. Use
+this for deterministic, repeatable workflows where the decomposition is
+known upfront — CI pipelines, ETL jobs, scheduled tasks. The plan is
+validated against registered agents before execution; everything
+downstream (parallel batches, replan-on-failure, synthesis, memory
+writes, steering) is identical to `run_stream`.
+
+```python
+from orchestrator.planner import Plan, Task
+
+plan = Plan([
+    Task("t1", "analyst",  "Analyse error logs from the last hour"),
+    Task("t2", "reporter", "Write an incident summary", depends_on=["t1"]),
+])
+
+# streaming
+async for event in runtime.run_with_plan_stream(plan, goal="Incident report"):
+    if event.type == EventType.DONE:
+        print(event.payload["answer"])
+
+# blocking
+result = await runtime.run_with_plan(plan, goal="Incident report")
+```
+
+The `goal` string is passed to the synthesiser and used for memory
+context injection into agents — even though the plan shape is fixed, the
+agents themselves still read from memory.
+
+If a task fails mid-run and `on_failure="replan"`, the replan call does
+go to the LLM — the bypass is for the *initial* plan only.
+
+---
+
 Event types by path:
 
-| Event | Dispatch | Routed | Direct | Orchestrated |
-|---|---|---|---|---|
-| `DISPATCH` | ✓ | — | — | — |
-| `ROUTE` | ✓ (simple) | ✓ | — | — |
-| `THOUGHT` / `TOKEN` / `ACTION` / `OBSERVATION` | ✓ | ✓ | ✓ | ✓ |
-| `TASK_DONE` | ✓ | ✓ | ✓ | ✓ |
-| `PLAN` / `REPLAN` / `SYNTHESIS` / `DONE` | ✓ (complex) | — | — | ✓ |
-| `ERROR` | ✓ | ✓ | ✓ | ✓ |
+| Event | Dispatch | Routed | Direct | Orchestrated | Pre-built |
+|---|---|---|---|---|---|
+| `DISPATCH` | ✓ | — | — | — | — |
+| `ROUTE` | ✓ (simple) | ✓ | — | — | — |
+| `THOUGHT` / `TOKEN` / `ACTION` / `OBSERVATION` | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `TASK_DONE` | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `PLAN` / `REPLAN` / `SYNTHESIS` / `DONE` | ✓ (complex) | — | — | ✓ | ✓ |
+| `ERROR` | ✓ | ✓ | ✓ | ✓ | ✓ |
 
 `TOKEN` events fire only when your LLM client exposes
 `async def stream_complete(system, messages) -> AsyncGenerator[str, None]`.
 Non-streaming clients still work — they emit the full response in one
 `THOUGHT` event per step.
+
+## Console rendering
+
+`ConsoleRenderer` handles all `BusEvent` types with consistent label
+and truncation formatting so event-loop boilerplate stays out of your
+scripts.
+
+```python
+from harness.console import ConsoleRenderer, trunc
+
+renderer = ConsoleRenderer(
+    truncate=140,          # max chars for long text fields
+    sep_char="─",          # separator character
+    sep_width=72,          # separator width
+    agent_label_width=16,  # width of [agent_id] column
+    show_tokens=False,     # True to print TOKEN events inline
+)
+
+async for event in runtime.dispatch_stream(goal):
+    renderer.render(event)   # handles every EventType
+```
+
+For events with custom section headers (e.g. a "PROJECT HEALTH REPORT"
+block), handle that event yourself and skip `render` for it — the
+renderer is additive:
+
+```python
+async for event in runtime.run_stream(goal):
+    if event.type == EventType.DONE:
+        renderer.sep("═")
+        print("MY CUSTOM HEADER")
+        renderer.sep("═")
+        print(event.payload["answer"])
+    else:
+        renderer.render(event)
+```
+
+`trunc(s, n)` is exported for standalone use when you need to truncate
+a string to `n` characters with a trailing `…`.
 
 ## Working memory budget
 
