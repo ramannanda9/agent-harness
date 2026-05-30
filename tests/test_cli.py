@@ -67,3 +67,32 @@ def test_cli_writes_claude_code_login(monkeypatch, tmp_path):
     assert cli.main() == 0
     data = json.loads(path.read_text())
     assert data["claude-code"]["access"] == "access"
+
+
+def test_cli_policy_list_revoke_and_clear(monkeypatch, tmp_path, capsys):
+    path = tmp_path / "tool_policy.json"
+    store = cli.ToolPolicyStore(path)
+    rule = store.add_allow_rule(tool="shell", args={"cmd": "git status"})
+
+    monkeypatch.setattr(
+        "sys.argv",
+        ["agent-harness", "policy", "list", "--policy-file", str(path)],
+    )
+    assert cli.main() == 0
+    listed = json.loads(capsys.readouterr().out)
+    assert listed["rules"][0]["id"] == rule.id
+
+    monkeypatch.setattr(
+        "sys.argv",
+        ["agent-harness", "policy", "revoke", rule.id, "--policy-file", str(path)],
+    )
+    assert cli.main() == 0
+    assert "Removed policy rule" in capsys.readouterr().out
+
+    store.add_allow_rule(tool="shell", args={"cmd": "git status"})
+    monkeypatch.setattr(
+        "sys.argv",
+        ["agent-harness", "policy", "clear", "--policy-file", str(path)],
+    )
+    assert cli.main() == 0
+    assert "Removed 1 policy rule" in capsys.readouterr().out

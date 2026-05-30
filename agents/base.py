@@ -738,10 +738,10 @@ class BaseAgent:
         if not (self._checkpoint_store and tool_name in self.config.hitl_tools):
             return None
 
-        from harness.hitl import ApprovalRequest, is_session_allowed, request_approval
+        from harness.hitl import ApprovalRequest, is_allowed, request_approval
 
-        if is_session_allowed(tool_name, tool_args):
-            return None  # fast-path: human already allowed this tool/prefix for session
+        if is_allowed(tool_name, tool_args):
+            return None  # fast-path: human already allowed this tool/prefix
 
         approval_id = str(uuid.uuid4())
         await self._checkpoint_store.write(
@@ -842,33 +842,35 @@ class BaseAgent:
         pending: dict,
     ) -> AsyncGenerator[BusEvent, None]:
         """Re-prompt approval for a step interrupted by a crash, then complete it."""
-        from harness.hitl import ApprovalRequest, request_approval
+        from harness.hitl import ApprovalRequest, is_allowed, request_approval
 
         tool_name = pending["tool"]
         tool_args = pending["args"]
         step = pending["step"]
         llm_response = pending["llm_response"]
 
-        approval = await request_approval(
-            ApprovalRequest(
-                approval_id=pending["approval_id"],
-                run_id=self._resume_key,  # standalone: ckp_id; orchestrated: outer run_id
-                agent_id=self.config.agent_id,
-                tool=tool_name,
-                args=tool_args,
-                step=step,
-                timestamp=datetime.now(timezone.utc).isoformat(),
-            ),
-            self._guard,
-        )
+        approval = None
+        if not is_allowed(tool_name, tool_args):
+            approval = await request_approval(
+                ApprovalRequest(
+                    approval_id=pending["approval_id"],
+                    run_id=self._resume_key,  # standalone: ckp_id; orchestrated: outer run_id
+                    agent_id=self.config.agent_id,
+                    tool=tool_name,
+                    args=tool_args,
+                    step=step,
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                ),
+                self._guard,
+            )
 
-        if approval.correction:
+        if approval is not None and approval.correction:
             await self._inject_human_guidance(llm_response, approval.correction, run_id, step)
             return
 
         observation = (
             await self._execute_tool(tool_name, tool_args)
-            if approval.approved
+            if approval is None or approval.approved
             else f"Tool rejected by human: {approval.correction or 'no reason given'}"
         )
         obs_display = "[image]" if _is_image_block(observation) else str(observation)[:500]

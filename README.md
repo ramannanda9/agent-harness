@@ -741,10 +741,10 @@ When the agent calls `write_file` or `delete_file` a prompt appears:
   Run:   3f7a1b2c-...:file_agent
   ID:    a1b2-c3d4
 ────────────────────────────────────────────────────────────
-  y = approve once  |  a = allow 'delete_file' for session  |  n = reject  |  <text> = steer
+  y = approve once  |  a = allow 'delete_file' for session  |  A = always allow 'delete_file'  |  n = reject  |  <text> = steer
   Ctrl-C to pause. Resume: python my_script.py --resume 3f7a1b2c-...:file_agent
 ────────────────────────────────────────────────────────────
-  Approve? [y/n/a/correction]:
+  Approve? [y/n/a/A/correction]:
 ```
 
 **Prompt semantics:**
@@ -754,11 +754,19 @@ When the agent calls `write_file` or `delete_file` a prompt appears:
 | `y` / `yes` | Tool runs once |
 | `n` / `no` | Tool skipped; agent sees a rejection observation |
 | `a` / `allow` | Tool runs **and** added to session allow-list; no further prompts for this tool (or command prefix for shell-like tools) |
+| `A` / `always` | Tool runs **and** a user-scoped allow rule is stored in `~/.agent-harness/policies/tool_policy.json` |
 | any other text | Correction: tool skipped, text injected into `WorkingMemory` as a user message; LLM self-corrects on the next step |
 
-For shell-like tools (`shell`, `bash`, `run`, `exec`), `a` allows the **first
-word** of the command — e.g. typing `a` when approving `shell git commit ...`
-allows all `git` commands for the session but still prompts for `shell rm ...`.
+For shell-like tools (`shell`, `bash`, `run`, `exec`), `a` and `A` allow the
+**first word** of the command — e.g. approving `shell git commit ...` allows
+all `git` commands in that scope but still prompts for `shell rm ...`.
+Persistent rules are user-local, not repo files. Manage them with:
+
+```bash
+agent-harness policy list
+agent-harness policy revoke <rule-id>
+agent-harness policy clear
+```
 
 **Wall-time budget** is suspended while waiting for input — human think-time
 does not count against `max_wall_time_seconds`.

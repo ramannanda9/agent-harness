@@ -14,6 +14,7 @@ from harness.llm.auth import (
     OpenAICodexOAuthClient,
     default_auth_file,
 )
+from harness.tool_policy import ToolPolicyStore, default_policy_file
 
 PROVIDERS = ["openai-codex", "claude-code"]
 
@@ -35,6 +36,16 @@ def main() -> int:
     logout_cmd.add_argument("provider", choices=PROVIDERS)
     logout_cmd.add_argument("--auth-file", default=str(default_auth_file()))
 
+    policy = sub.add_parser("policy", help="manage persistent tool policy")
+    policy_sub = policy.add_subparsers(dest="policy_command", required=True)
+    policy_list = policy_sub.add_parser("list", help="list persistent policy rules")
+    policy_list.add_argument("--policy-file", default=str(default_policy_file()))
+    policy_revoke = policy_sub.add_parser("revoke", help="remove one policy rule")
+    policy_revoke.add_argument("rule_id")
+    policy_revoke.add_argument("--policy-file", default=str(default_policy_file()))
+    policy_clear = policy_sub.add_parser("clear", help="remove all policy rules")
+    policy_clear.add_argument("--policy-file", default=str(default_policy_file()))
+
     args = parser.parse_args()
     try:
         if args.command == "login":
@@ -52,6 +63,14 @@ def main() -> int:
                 return _logout_oauth_provider(Path(args.auth_file).expanduser(), "openai-codex")
             if args.provider == "claude-code":
                 return _logout_oauth_provider(Path(args.auth_file).expanduser(), "claude-code")
+        if args.command == "policy":
+            path = Path(args.policy_file).expanduser()
+            if args.policy_command == "list":
+                return _policy_list(path)
+            if args.policy_command == "revoke":
+                return _policy_revoke(path, args.rule_id)
+            if args.policy_command == "clear":
+                return _policy_clear(path)
     except Exception as e:
         print(f"agent-harness: {e}", file=sys.stderr)
         return 1
@@ -131,6 +150,27 @@ def _write_oauth_credential(path: Path, cred: OAuthCredential) -> None:
         if os.name != "nt":
             path.chmod(0o600)
     provider._write_credential(cred)
+
+
+def _policy_list(path: Path) -> int:
+    store = ToolPolicyStore(path)
+    rules = [rule.to_dict() for rule in store.list_rules()]
+    print(json.dumps({"policy_file": str(path), "rules": rules}, indent=2))
+    return 0
+
+
+def _policy_revoke(path: Path, rule_id: str) -> int:
+    if not ToolPolicyStore(path).revoke(rule_id):
+        print(f"Policy rule not found: {rule_id}", file=sys.stderr)
+        return 1
+    print(f"Removed policy rule: {rule_id}")
+    return 0
+
+
+def _policy_clear(path: Path) -> int:
+    count = ToolPolicyStore(path).clear()
+    print(f"Removed {count} policy rule(s)")
+    return 0
 
 
 if __name__ == "__main__":
