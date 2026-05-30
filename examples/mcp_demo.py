@@ -11,10 +11,9 @@ Usage:
     # Custom MCP server
     OPENAI_API_KEY=sk-... MCP_COMMAND="python my_server.py" python examples/mcp_demo.py
 
-    # Remote Datadog MCP with API/application-key headers
+    # Remote MCP with a bearer token
     OPENAI_API_KEY=sk-... \
-      MCP_URL="https://mcp.datadoghq.com/api/unstable/mcp-server/mcp" \
-      DD_API_KEY=... DD_APPLICATION_KEY=... \
+      MCP_URL="https://example.com/mcp/sse" MCP_BEARER_TOKEN=... \
       python examples/mcp_demo.py
 
     # Remote MCP with OAuth bearer token read from auth.json
@@ -57,10 +56,6 @@ def _build_mcp_auth():
     headers = {}
     if os.environ.get("MCP_BEARER_TOKEN"):
         headers["Authorization"] = f"Bearer {os.environ['MCP_BEARER_TOKEN']}"
-    if os.environ.get("DD_API_KEY"):
-        headers["DD_API_KEY"] = os.environ["DD_API_KEY"]
-    if os.environ.get("DD_APPLICATION_KEY"):
-        headers["DD_APPLICATION_KEY"] = os.environ["DD_APPLICATION_KEY"]
 
     return StaticMCPAuth(headers=headers) if headers else None
 
