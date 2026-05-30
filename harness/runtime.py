@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from harness.utils import parse_llm_json
+from orchestrator.planner import Plan
 
 logger = logging.getLogger(__name__)
 
@@ -836,6 +837,42 @@ class AgentRuntime:
             orchestrator, _tracer, _guard = self._build_orchestrator()
             async for event in orchestrator.run_stream(goal):
                 yield event
+
+    async def run_with_plan_stream(self, plan: Plan, goal: str):
+        """Stream a pre-built plan, bypassing the LLM planner entirely.
+
+        Use this for deterministic, repeatable workflows where the task
+        decomposition is known upfront (CI pipelines, ETL, scheduled jobs).
+        The plan is validated against the registered agents before execution;
+        everything downstream — parallel execution, replan-on-failure,
+        synthesis, memory writes — is identical to ``run_stream``.
+
+        Args:
+            plan: A ``Plan`` instance, e.g.
+                  ``Plan([Task("t1", "analyst", "Analyse X"),
+                          Task("t2", "reporter", "Report Y", depends_on=["t1"])])``
+            goal: Goal text for memory context injection and synthesis prompt.
+        """
+        async with self._steering_lifecycle():
+            orchestrator, _tracer, _guard = self._build_orchestrator()
+            async for event in orchestrator.run_with_plan_stream(plan, goal):
+                yield event
+
+    async def run_with_plan(self, plan: Plan, goal: str) -> dict:
+        """Run a pre-built plan and return the DONE payload.
+
+        Blocking version of ``run_with_plan_stream()``.
+        """
+        from harness.events import EventType
+
+        orchestrator, tracer, guard = self._build_orchestrator()
+        result: dict = {}
+        async for event in orchestrator.run_with_plan_stream(plan, goal):
+            if event.type == EventType.DONE:
+                result = event.payload
+        result["trace"] = tracer.dump()
+        result["budget"] = {"elapsed_seconds": guard.elapsed, "cost_usd": guard.cost}
+        return result
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

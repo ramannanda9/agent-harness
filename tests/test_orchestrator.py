@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from agents.base import AgentConfig
+from harness.events import EventType
 from harness.runtime import AgentRegistry, AgentRuntime, GuardrailConfig, ToolRegistry
 from memory.manager import MemoryManager
 from memory.stores import InMemoryEpisodicStore, InMemorySemanticStore
@@ -558,3 +559,100 @@ async def test_runtime_handles_unknown_agent_in_plan():
     assert EventType.ERROR in types
     error_evt = next(e for e in events if e.type == EventType.ERROR)
     assert "ghost" in error_evt.error
+
+
+# ── run_with_plan / run_with_plan_stream ──────────────────────────────────────
+
+
+def _pre_built_plan() -> Plan:
+    """Two-task sequential plan using the agents registered in _build_runtime."""
+    return Plan(
+        tasks=[
+            Task(
+                id="t1",
+                agent_id="analyst",
+                instruction="analyse the situation",
+                depends_on=[],
+            ),
+            Task(
+                id="t2",
+                agent_id="reporter",
+                instruction="write a report based on t1 findings",
+                depends_on=["t1"],
+            ),
+        ],
+        rationale="pre-built: analyse then report",
+    )
+
+
+async def test_run_with_plan_stream_yields_plan_event_pre_built():
+    """PLAN event must have pre_built=True — no LLM planner was invoked."""
+    llm = ScriptedLLM(routes=_routes_for_runtime())
+    runtime, _ = _build_runtime(llm)
+    plan = _pre_built_plan()
+
+    events = [e async for e in runtime.run_with_plan_stream(plan, "test goal")]
+    plan_evt = next(e for e in events if e.type == EventType.PLAN)
+    assert plan_evt.payload.get("pre_built") is True
+
+
+async def test_run_with_plan_stream_full_lifecycle():
+    """Pre-built plan must produce the same PLAN→TASK_DONE×2→SYNTHESIS→DONE lifecycle."""
+    llm = ScriptedLLM(routes=_routes_for_runtime())
+    runtime, _ = _build_runtime(llm)
+    plan = _pre_built_plan()
+
+    events = [e async for e in runtime.run_with_plan_stream(plan, "test goal")]
+    types = [e.type for e in events]
+
+    assert types[0] == EventType.PLAN
+    assert types.count(EventType.TASK_DONE) == 2
+    assert EventType.SYNTHESIS in types
+    assert types[-1] == EventType.DONE
+
+
+async def test_run_with_plan_skips_planner_llm_call():
+    """The planner route must never be called when a plan is supplied."""
+    planner_called = {"called": False}
+
+    def spy_planner(system, messages, kwargs):
+        planner_called["called"] = True
+        return {"tasks": [], "rationale": ""}
+
+    routes = _routes_for_runtime()
+    routes["decomposes goals"] = spy_planner
+    llm = ScriptedLLM(routes=routes)
+    runtime, _ = _build_runtime(llm)
+
+    async for _ in runtime.run_with_plan_stream(_pre_built_plan(), "test goal"):
+        pass
+
+    assert not planner_called["called"], "LLM planner should not be called for pre-built plans"
+
+
+async def test_run_with_plan_blocking_returns_answer():
+    """run_with_plan() must return the DONE payload with answer + trace + budget."""
+    llm = ScriptedLLM(routes=_routes_for_runtime())
+    runtime, _ = _build_runtime(llm)
+
+    result = await runtime.run_with_plan(_pre_built_plan(), "test goal")
+
+    assert "answer" in result
+    assert "trace" in result
+    assert "budget" in result
+
+
+async def test_run_with_plan_stream_invalid_plan_yields_error():
+    """A plan referencing an unknown agent must yield ERROR without executing."""
+    llm = ScriptedLLM(routes=_routes_for_runtime())
+    runtime, _ = _build_runtime(llm)
+
+    bad_plan = Plan(
+        tasks=[Task(id="t1", agent_id="nobody", instruction="x", depends_on=[])],
+        rationale="bad",
+    )
+
+    events = [e async for e in runtime.run_with_plan_stream(bad_plan, "goal")]
+    types = [e.type for e in events]
+    assert types == [EventType.ERROR]
+    assert "nobody" in events[0].error
