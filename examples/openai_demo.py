@@ -23,21 +23,21 @@ Install ah-executor to enable the shell tool (optional):
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import sys
 
 from agents.base import AgentConfig
+from harness.console import ConsoleRenderer
 from harness.events import EventType
 from harness.executor_bridge import ExecutorBridge, ExecutorConfig, ExecutorTool, find_executor
 from harness.llm.openai import OpenAILLM
 from harness.runtime import AgentRegistry, AgentRuntime, GuardrailConfig, ToolRegistry
-from harness.utils import stream_tokens_inline
 from memory.manager import MemoryManager
 from memory.stores import InMemoryEpisodicStore, InMemorySemanticStore
 from tools.builtin.http_fetch import HTTPFetch
 
 _EXECUTOR = find_executor()
+_renderer = ConsoleRenderer()
 
 GOAL = (
     "What OS and kernel version is this machine running, and what UUID does "
@@ -47,10 +47,6 @@ GOAL = (
     else "Fetch https://httpbin.org/json and report the slideshow title and author "
     "from the JSON response."
 )
-
-
-def _truncate(s: str, n: int = 140) -> str:
-    return s if len(s) <= n else s[:n] + "…"
 
 
 async def main() -> None:
@@ -129,32 +125,14 @@ async def main() -> None:
 
     # dispatch_stream: classifier decides simple→routed or complex→orchestrated.
     # User only provides a goal — routing and planning happen automatically.
-    # stream_tokens_inline drains TOKEN events to stdout live so we never see
-    # them in the loop below.
     final: dict = {}
-    async for event in stream_tokens_inline(runtime.dispatch_stream(GOAL)):
-        if event.type == EventType.DISPATCH:
-            print(
-                f"[dispatch]  complexity={event.payload['complexity']} path={event.payload['path']}"
-            )
-        elif event.type == EventType.ROUTE:
-            print(f"[route]     → {event.payload['agent_id']}: {event.payload['rationale']}")
-        elif event.type == EventType.THOUGHT:
-            thought = event.payload.get("thought", "")
-            if thought:
-                print(f"[thought]   {_truncate(thought)}")
-        elif event.type == EventType.ACTION:
-            args = json.dumps(event.payload["args"], default=str)
-            print(f"[action]    {event.payload['tool']}({_truncate(args)})")
-        elif event.type == EventType.OBSERVATION:
-            obs = event.payload.get("observation", "")
-            print(f"[observe]   {_truncate(obs)}")
-        elif event.type == EventType.TASK_DONE:
+    async for event in runtime.dispatch_stream(GOAL):
+        if event.type == EventType.TASK_DONE:
             final = event.payload
-        elif event.type == EventType.ERROR:
-            print(f"[error]     {event.error}", file=sys.stderr)
+        else:
+            _renderer.render(event)
 
-    print("─" * 60)
+    _renderer.sep()
     print(f"Final answer:\n{final.get('answer', '(no answer)')}")
     print(f"Confidence:  {final.get('confidence')}")
     print(f"Steps:       {final.get('steps')}")

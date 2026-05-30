@@ -44,12 +44,12 @@ Optional:
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import sys
 from pathlib import Path
 
 from agents.base import AgentConfig
+from harness.console import ConsoleRenderer, trunc
 from harness.events import EventType
 from harness.executor_bridge import ExecutorBridge, ExecutorConfig, ExecutorTool, find_executor
 from harness.llm.openai import OpenAILLM
@@ -96,15 +96,10 @@ FOLLOWUP_GOAL = (
 )
 
 
+_renderer = ConsoleRenderer()
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
-
-
-def _sep(char: str = "─", w: int = 72) -> str:
-    return char * w
-
-
-def _trunc(s: str, n: int = 140) -> str:
-    return s if len(s) <= n else s[:n] + "…"
 
 
 async def _build_stores(llm):
@@ -188,14 +183,14 @@ async def main() -> None:
 
     checkpoint_dir = FileCheckpointStore()._dir
 
-    print(_sep("═"))
+    _renderer.sep("═")
     print(f"Model:      {MODEL}")
     print(f"Project:    {PROJECT_DIR}")
     print(f"PyPI pkg:   {PYPI_PACKAGE}")
     print(f"OTEL:       {'enabled' if enable_otel else 'disabled'}")
     print(f"Memory:     {store_label}")
     print(f"HITL:       shell commands gated  (checkpoints → {checkpoint_dir})")
-    print(_sep("═"))
+    _renderer.sep("═")
 
     llm = OpenAILLM(model=MODEL)
 
@@ -319,10 +314,11 @@ async def main() -> None:
         followup_runtime = _make_runtime(followup_agents)
 
         active_prefixes = ", ".join(audit_agents.all_ids())
-        print("\n" + _sep("─"))
+        print("\n")
+        _renderer.sep()
         print("STEERING — type `<agent_id>: <text>` or `*: <text>` at any time")
         print(f"Active agents: {active_prefixes}")
-        print(_sep("─"))
+        _renderer.sep()
 
         # ── Pass 1: Full audit (or transparent resume) ────────────────────────
         # dispatch_stream automatically resumes from --resume <key> when a
@@ -333,66 +329,20 @@ async def main() -> None:
         # line after a banner is consumed by HITL; otherwise lines route
         # to the matching agent's steer queue.
 
-        print(f"\nPASS 1 — full audit\nGoal: {_trunc(AUDIT_GOAL, 120)}")
-        print(_sep("═"))
+        print(f"\nPASS 1 — full audit\nGoal: {trunc(AUDIT_GOAL, 120)}")
+        _renderer.sep("═")
 
         task_results: list[dict] = []
 
         async for event in audit_runtime.dispatch_stream(AUDIT_GOAL):
-            if event.type == EventType.DISPATCH:
-                print(
-                    f"\n[dispatch]   complexity={event.payload['complexity']}"
-                    f"  path={event.payload['path']}"
-                )
-
-            elif event.type == EventType.PLAN:
-                tasks = event.payload.get("plan", {}).get("tasks", [])
-                print(f"\n[plan]       {len(tasks)} tasks")
-                for t in tasks:
-                    deps = f"  ← {t['depends_on']}" if t.get("depends_on") else ""
-                    print(
-                        f"             {t['id']}@{t['agent_id']}: "
-                        f"{_trunc(t['instruction'], 70)}{deps}"
-                    )
-
-            elif event.type == EventType.THOUGHT:
-                thought = event.payload.get("thought", "")
-                if thought:
-                    print(f"[{event.agent_id:<16}] think   {_trunc(thought, 110)}")
-
-            elif event.type == EventType.ACTION:
-                args = json.dumps(event.payload["args"], default=str)
-                print(f"[{event.agent_id:<16}] action  {event.payload['tool']}({_trunc(args, 90)})")
-
-            elif event.type == EventType.OBSERVATION:
-                obs = event.payload.get("observation", "")
-                print(f"[{event.agent_id:<16}] obs     {_trunc(obs, 110)}")
-
-            elif event.type == EventType.TASK_DONE:
+            if event.type == EventType.DONE:
                 p = event.payload
-                task_results.append(p)
-                print(
-                    f"[{event.agent_id:<16}] ✓ done  "
-                    f"confidence={p.get('confidence', 0):.2f}  "
-                    f"steps={p.get('steps', '?')}"
-                )
-
-            elif event.type == EventType.REPLAN:
-                print(
-                    f"\n[replan]     #{event.payload.get('replan_count')} — "
-                    f"trigger={event.payload.get('trigger_task', '?')}"
-                )
-
-            elif event.type == EventType.SYNTHESIS:
-                print(f"\n[synthesis]  confidence={event.payload.get('confidence', 0):.2f}")
-
-            elif event.type == EventType.DONE:
-                p = event.payload
-                print("\n" + _sep("═"))
+                print()
+                _renderer.sep("═")
                 print("PROJECT HEALTH REPORT")
-                print(_sep("═"))
+                _renderer.sep("═")
                 print(p.get("answer", "(no answer)"))
-                print(_sep())
+                _renderer.sep()
                 print(
                     f"Confidence: {p.get('confidence', 0):.2f}  |  "
                     f"Tasks: {len(task_results)}  |  "
@@ -400,21 +350,20 @@ async def main() -> None:
                     f"Cost: ${p.get('cost_usd', 0):.4f}  |  "
                     f"Time: {p.get('elapsed_seconds', 0):.1f}s"
                 )
-
-            elif event.type == EventType.HUMAN_GUIDANCE:
-                p = event.payload
-                print(f"\n[{event.agent_id:<16}] ▶ steered  step={p['step']}  text={p['text']!r}")
-
-            elif event.type == EventType.ERROR:
-                print(f"\n[error]      {event.error}", file=sys.stderr)
+            elif event.type == EventType.TASK_DONE:
+                task_results.append(event.payload)
+                _renderer.render(event)
+            else:
+                _renderer.render(event)
 
         # ── Memory inspection ─────────────────────────────────────────────────
         # Show exactly what was extracted and stored so the second pass is
         # transparent — you can see what the agent will read from memory.
 
-        print("\n" + _sep("─"))
+        print()
+        _renderer.sep()
         print("MEMORY WRITTEN AFTER PASS 1")
-        print(_sep("─"))
+        _renderer.sep()
 
         all_semantic = await semantic_store.search_prefix("")
         global_facts = {
@@ -424,7 +373,7 @@ async def main() -> None:
         }
         print(f"Semantic facts ({len(global_facts)}):")
         for k, v in global_facts.items():
-            print(f"  {k}: {_trunc(str(v), 100)}")
+            print(f"  {k}: {trunc(str(v), 100)}")
 
         # Episodic search works across both in-memory and LanceDB stores.
         recent_episodes = await episodic_store.search(AUDIT_GOAL, top_k=5)
@@ -432,62 +381,34 @@ async def main() -> None:
         for ep in recent_episodes:
             ts = ep.get("metadata", {}).get("timestamp", "?")
             print(f"  [{ts}]")
-            print(f"  {_trunc(ep['text'], 200)}")
+            print(f"  {trunc(ep['text'], 200)}")
 
         # ── Pass 2: Follow-up from memory ─────────────────────────────────────
         # Memory is injected into the agent's system prompt via build_context.
         # Watch the thought: the agent should reason from stored facts rather
         # than calling tools again.
 
-        print("\n" + _sep("═"))
+        print()
+        _renderer.sep("═")
         print(f"PASS 2 — follow-up (memory recall)\nGoal: {FOLLOWUP_GOAL}")
-        print(_sep("═"))
+        _renderer.sep("═")
 
         async for event in followup_runtime.dispatch_stream(FOLLOWUP_GOAL):
-            if event.type == EventType.DISPATCH:
-                print(
-                    f"\n[dispatch]   complexity={event.payload['complexity']}"
-                    f"  path={event.payload['path']}"
-                )
-
-            elif event.type == EventType.ROUTE:
-                print(
-                    f"[route]      → {event.payload['agent_id']}: "
-                    f"{_trunc(event.payload['rationale'], 90)}"
-                )
-
-            elif event.type == EventType.THOUGHT:
-                thought = event.payload.get("thought", "")
-                if thought:
-                    print(f"[{event.agent_id:<16}] think   {_trunc(thought, 110)}")
-
-            elif event.type == EventType.ACTION:
-                args = json.dumps(event.payload["args"], default=str)
-                print(f"[{event.agent_id:<16}] action  {event.payload['tool']}({_trunc(args, 90)})")
-
-            elif event.type == EventType.OBSERVATION:
-                obs = event.payload.get("observation", "")
-                print(f"[{event.agent_id:<16}] obs     {_trunc(obs, 110)}")
-
-            elif event.type == EventType.TASK_DONE:
+            if event.type == EventType.TASK_DONE:
                 p = event.payload
-                print("\n" + _sep("═"))
+                print()
+                _renderer.sep("═")
                 print("PRIORITISED ACTION LIST (from memory)")
-                print(_sep("═"))
+                _renderer.sep("═")
                 print(p.get("answer", "(no answer)"))
-                print(_sep())
+                _renderer.sep()
                 print(
                     f"Confidence: {p.get('confidence', 0):.2f}  |  "
                     f"Steps: {p.get('steps', '?')}  "
                     f"(fewer steps = agent answered from memory, not tools)"
                 )
-
-            elif event.type == EventType.HUMAN_GUIDANCE:
-                p = event.payload
-                print(f"\n[{event.agent_id:<16}] ▶ steered  step={p['step']}  text={p['text']!r}")
-
-            elif event.type == EventType.ERROR:
-                print(f"\n[error]      {event.error}", file=sys.stderr)
+            else:
+                _renderer.render(event)
 
 
 if __name__ == "__main__":
