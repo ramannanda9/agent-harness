@@ -8,7 +8,7 @@ Same-session flow:
   2. A checkpoint is written to the CheckpointStore (step + WorkingMemory +
      pending tool).  BudgetGuard clock suspends.
   3. Approval banner is printed to the terminal.
-  4. Human types  y / n / a / <correction>  in the terminal.
+  4. Human types  y / n / a / A / <correction>  in the terminal.
   5. Guard resumes; agent continues (or injects correction and skips the tool).
 
 Crash / Ctrl-C / kill flow:
@@ -22,7 +22,7 @@ Crash / Ctrl-C / kill flow:
 The UUID printed at the prompt is an audit reference only.
 
 Correction steering:
-  Any text that isn't y/yes/a/allow/n/no is treated as a correction.
+  Any text that isn't y/yes/a/allow/A/always/n/no is treated as a correction.
   The gated tool is skipped and the text is injected into WorkingMemory
   as a user message, so the LLM sees it on the next think step.
 
@@ -32,6 +32,11 @@ Session allow:
   first word of the command arg (e.g. 'git'), so allowing 'git' doesn't also
   allow 'rm'.  Subsequent calls matching the key skip checkpoint + banner.
   Use is_session_allowed(tool, args) to query the list from outside.
+
+Persistent allow:
+  Typing  A  or  always  approves the current call and writes a user-scoped
+  allow rule to ~/.agent-harness/policies/tool_policy.json. Rules are narrow:
+  shell-like tools are scoped by first command word, other tools by tool name.
 """
 
 from __future__ import annotations
@@ -71,6 +76,18 @@ def _session_key(tool: str, args: dict) -> tuple[str, str | None]:
 def is_session_allowed(tool: str, args: dict) -> bool:
     """True if this tool+args combination has been session-allowed by the human."""
     return _session_key(tool, args) in _session_allowed
+
+
+def is_persistently_allowed(tool: str, args: dict) -> bool:
+    """True if this tool+args combination is allowed by the user policy file."""
+    from harness.tool_policy import ToolPolicyStore
+
+    return ToolPolicyStore().is_allowed(tool, args)
+
+
+def is_allowed(tool: str, args: dict) -> bool:
+    """True if this tool+args combination is session- or user-policy allowed."""
+    return is_session_allowed(tool, args) or is_persistently_allowed(tool, args)
 
 
 def _session_label(tool: str, args: dict) -> str:
@@ -122,6 +139,7 @@ class ApprovalResponse:
     approved: bool
     correction: str | None = None  # non-None → steering; tool is skipped
     session_allow: bool = False  # True → add (tool, prefix) to _session_allowed
+    persistent_allow: bool = False  # True → write a user-scoped allow rule
 
 
 # ── CLI gate ──────────────────────────────────────────────────────────────────
@@ -140,21 +158,29 @@ def _print_banner(req: ApprovalRequest) -> None:
     print(f"  ID:    {req.approval_id}")
     print(_SEP)
     print(
-        f"  y = approve once  |  a = allow '{label}' for session  |  n = reject  |  <text> = steer"
+        "  y = approve once  |  "
+        f"a = allow '{label}' for session  |  "
+        f"A = always allow '{label}'  |  "
+        "n = reject  |  <text> = steer"
     )
     print(f"  Ctrl-C to pause. Resume: python {script} --resume {req.run_id}")
     print(_SEP)
 
 
 def _parse_stdin(approval_id: str, raw: str) -> ApprovalResponse:
-    lo = raw.strip().lower()
+    stripped = raw.strip()
+    if stripped == "A":
+        return ApprovalResponse(approval_id=approval_id, approved=True, persistent_allow=True)
+    lo = stripped.lower()
     if lo in ("y", "yes"):
         return ApprovalResponse(approval_id=approval_id, approved=True)
     if lo in ("a", "allow"):
         return ApprovalResponse(approval_id=approval_id, approved=True, session_allow=True)
+    if lo in ("always", "allow always"):
+        return ApprovalResponse(approval_id=approval_id, approved=True, persistent_allow=True)
     if lo in ("n", "no"):
         return ApprovalResponse(approval_id=approval_id, approved=False)
-    return ApprovalResponse(approval_id=approval_id, approved=True, correction=raw.strip() or None)
+    return ApprovalResponse(approval_id=approval_id, approved=True, correction=stripped or None)
 
 
 async def request_approval(
@@ -172,6 +198,7 @@ async def request_approval(
       y / yes     → approved, tool runs
       n / no      → rejected, tool skipped (error observation returned)
       a / allow   → approved + session-allow registered; tool runs
+      A / always  → approved + user policy allow registered; tool runs
       <any text>  → correction injected into WorkingMemory; tool skipped
 
     Holds stdout_lock for the duration so concurrent agent events don't
@@ -190,7 +217,7 @@ async def request_approval(
 
     async with stdout_lock:
         router = get_active_router()
-        approve_prompt = "  Approve? [y/n/a/correction]: "
+        approve_prompt = "  Approve? [y/n/a/A/correction]: "
         # If a router is active, reserve the next stdin read BEFORE printing
         # the banner so the user's typed answer routes to HITL (not steering).
         hitl_future: Any = (
@@ -226,4 +253,9 @@ async def request_approval(
         if resp.session_allow:
             _session_allowed.add(_session_key(req.tool, req.args))
             print(f"  ✓ '{_session_label(req.tool, req.args)}' allowed for this session\n")
+        if resp.persistent_allow:
+            from harness.tool_policy import ToolPolicyStore
+
+            rule = ToolPolicyStore().add_allow_rule(tool=req.tool, args=req.args)
+            print(f"  ✓ '{_session_label(req.tool, req.args)}' always allowed ({rule.id})\n")
         return resp
