@@ -215,7 +215,12 @@ class Orchestrator:
         self._tracer.start_run(self._run_id, goal)
 
         # ── 1. Plan ────────────────────────────────────────────────────────────
-        plan = await self._plan(goal)
+        try:
+            plan = await self._plan(goal)
+        except PlanValidationError as exc:
+            logger.error("Plan validation failed: %s", exc)
+            yield BusEvent(type=EventType.ERROR, agent_id="orchestrator", error=str(exc))
+            return
         plan_dict = _plan_to_dict(plan)
         self._tracer.log("plan", "orchestrator", {"plan": plan_dict})
         fire(self._memory.write_semantic_fact("orchestrator:last_plan_rationale", plan.rationale))
@@ -350,12 +355,19 @@ class Orchestrator:
                     continue
 
                 # REPLAN — rebuild remaining DAG from current state
-                new_plan = await self._replan(
-                    goal=goal,
-                    completed=list(completed.values()),
-                    failed_result=result,
-                    remaining_tasks=pending,
-                )
+                try:
+                    new_plan = await self._replan(
+                        goal=goal,
+                        completed=list(completed.values()),
+                        failed_result=result,
+                        remaining_tasks=pending,
+                    )
+                except PlanValidationError as exc:
+                    logger.warning(
+                        "Replan produced an invalid plan (%s) — continuing with existing tasks",
+                        exc,
+                    )
+                    continue
                 pending = list(new_plan.tasks)
                 replan_count += 1
                 self._tracer.log(
@@ -502,7 +514,9 @@ class Orchestrator:
             messages=[{"role": "user", "content": prompt}],
             response_format={"type": "json_object"},
         )
-        return _parse_plan(response)
+        plan = _parse_plan(response)
+        validate_plan(plan, set(self._agents.keys()))
+        return plan
 
     async def _replan(
         self,
@@ -547,7 +561,9 @@ class Orchestrator:
             messages=[{"role": "user", "content": replan_prompt}],
             response_format={"type": "json_object"},
         )
-        return _parse_plan(response)
+        plan = _parse_plan(response)
+        validate_plan(plan, set(self._agents.keys()))
+        return plan
 
     # ── Execution: parallel batch with fan-in ─────────────────────────────────
 
@@ -709,6 +725,95 @@ class Orchestrator:
                 "conflicts": [],
                 "unknowns": [f"Synthesis failed: {e}"],
             }
+
+
+# ── Plan validation ───────────────────────────────────────────────────────────
+
+
+class PlanValidationError(ValueError):
+    """Raised when a plan fails structural validation before execution."""
+
+
+def validate_plan(plan: Plan, known_agent_ids: set[str]) -> None:
+    """Validate *plan* against the set of registered agent ids.
+
+    Checks performed (all errors collected before raising):
+      - At least one task
+      - No duplicate task ids
+      - Every agent_id exists in *known_agent_ids*
+      - Every depends_on entry references a known task id
+      - No dependency cycles
+    """
+    errors: list[str] = []
+
+    if not plan.tasks:
+        raise PlanValidationError("Plan has no tasks")
+
+    task_ids = [t.id for t in plan.tasks]
+
+    seen: set[str] = set()
+    for tid in task_ids:
+        if tid in seen:
+            errors.append(f"duplicate task id {tid!r}")
+        seen.add(tid)
+
+    known_ids = set(task_ids)
+
+    for task in plan.tasks:
+        if task.agent_id not in known_agent_ids:
+            errors.append(
+                f"task {task.id!r} references unknown agent {task.agent_id!r}; "
+                f"known: {', '.join(sorted(known_agent_ids))}"
+            )
+        for dep in task.depends_on:
+            if dep not in known_ids:
+                errors.append(
+                    f"task {task.id!r} depends on unknown task {dep!r}; "
+                    f"known task ids: {', '.join(sorted(known_ids))}"
+                )
+
+    # Only check for cycles once structure is otherwise valid.
+    if not errors:
+        cycle = _detect_cycle(plan.tasks)
+        if cycle:
+            errors.append(f"dependency cycle: {' → '.join(cycle)}")
+
+    if errors:
+        raise PlanValidationError(
+            f"Plan validation failed ({len(errors)} error(s)):\n"
+            + "\n".join(f"  • {e}" for e in errors)
+        )
+
+
+def _detect_cycle(tasks: list[Task]) -> list[str] | None:
+    """Return the task ids forming a cycle, or None if the DAG is acyclic."""
+    graph = {t.id: list(t.depends_on) for t in tasks}
+    # 0=unvisited, 1=in-stack, 2=done
+    state: dict[str, int] = {tid: 0 for tid in graph}
+    stack: list[str] = []
+
+    def visit(node: str) -> list[str] | None:
+        state[node] = 1
+        stack.append(node)
+        for dep in graph.get(node, []):
+            if dep not in state:
+                continue
+            if state[dep] == 1:
+                return stack[stack.index(dep) :]
+            if state[dep] == 0:
+                result = visit(dep)
+                if result is not None:
+                    return result
+        stack.pop()
+        state[node] = 2
+        return None
+
+    for tid in list(graph):
+        if state[tid] == 0:
+            result = visit(tid)
+            if result is not None:
+                return result
+    return None
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
