@@ -518,6 +518,46 @@ async with MCPServerConnection(params, server_name="filesystem") as conn:
 Supports **stdio** and **SSE** transports. The `MCPServerConnection` context
 manager handles the full lifecycle — connect, discover, and cleanup.
 
+Remote MCP servers can receive static headers or bearer tokens through an auth
+provider:
+
+```python
+import os
+from tools.mcp import MCPServerConnection, StaticMCPAuth
+
+auth = StaticMCPAuth(
+    headers={
+        "DD_API_KEY": os.environ["DD_API_KEY"],
+        "DD_APPLICATION_KEY": os.environ["DD_APPLICATION_KEY"],
+    }
+)
+
+async with MCPServerConnection(
+    {"url": "https://mcp.datadoghq.com/api/unstable/mcp-server/mcp"},
+    server_name="datadog",
+    auth=auth,
+) as conn:
+    conn.register_tools(tool_registry)
+```
+
+OAuth-style auth files can be reused for MCP bearer auth:
+
+```python
+from tools.mcp import MCPServerConnection, OAuthMCPAuth
+
+auth = OAuthMCPAuth.from_auth_file(
+    "~/.agent-harness/auth/auth.json",
+    provider="datadog-mcp",
+)
+
+async with MCPServerConnection(
+    {"url": "https://mcp.datadoghq.com/api/unstable/mcp-server/mcp"},
+    server_name="datadog",
+    auth=auth,
+) as conn:
+    conn.register_tools(tool_registry)
+```
+
 See `examples/mcp_demo.py` for a runnable example.
 
 ## OpenTelemetry Tracing

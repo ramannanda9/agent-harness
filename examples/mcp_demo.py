@@ -11,6 +11,17 @@ Usage:
     # Custom MCP server
     OPENAI_API_KEY=sk-... MCP_COMMAND="python my_server.py" python examples/mcp_demo.py
 
+    # Remote Datadog MCP with API/application-key headers
+    OPENAI_API_KEY=sk-... \
+      MCP_URL="https://mcp.datadoghq.com/api/unstable/mcp-server/mcp" \
+      DD_API_KEY=... DD_APPLICATION_KEY=... \
+      python examples/mcp_demo.py
+
+    # Remote MCP with OAuth bearer token read from auth.json
+    OPENAI_API_KEY=sk-... \
+      MCP_URL="https://example.com/mcp/sse" MCP_AUTH_PROVIDER="datadog-mcp" \
+      python examples/mcp_demo.py
+
     # Override the goal
     OPENAI_API_KEY=sk-... MCP_GOAL="list files in /tmp" python examples/mcp_demo.py
 """
@@ -29,10 +40,29 @@ from harness.runtime import AgentRegistry, AgentRuntime, GuardrailConfig, ToolRe
 from memory.manager import MemoryManager
 from memory.stores import InMemoryEpisodicStore, InMemorySemanticStore
 from tools.mcp import MCPServerConnection
+from tools.mcp.auth import OAuthMCPAuth, StaticMCPAuth
 
 DEFAULT_GOAL = "List the files in the current directory and summarise what you find."
 
 _renderer = ConsoleRenderer()
+
+
+def _build_mcp_auth():
+    if os.environ.get("MCP_AUTH_PROVIDER"):
+        return OAuthMCPAuth.from_auth_file(
+            os.environ.get("MCP_AUTH_FILE", "~/.agent-harness/auth/auth.json"),
+            provider=os.environ["MCP_AUTH_PROVIDER"],
+        )
+
+    headers = {}
+    if os.environ.get("MCP_BEARER_TOKEN"):
+        headers["Authorization"] = f"Bearer {os.environ['MCP_BEARER_TOKEN']}"
+    if os.environ.get("DD_API_KEY"):
+        headers["DD_API_KEY"] = os.environ["DD_API_KEY"]
+    if os.environ.get("DD_APPLICATION_KEY"):
+        headers["DD_APPLICATION_KEY"] = os.environ["DD_APPLICATION_KEY"]
+
+    return StaticMCPAuth(headers=headers) if headers else None
 
 
 async def main() -> None:
@@ -45,26 +75,33 @@ async def main() -> None:
 
     # MCP server command — default to the filesystem server
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    mcp_command = os.environ.get("MCP_COMMAND", "npx")
-    mcp_args = os.environ.get(
-        "MCP_ARGS",
-        f"-y @modelcontextprotocol/server-filesystem {project_root}",
-    ).split()
+    mcp_url = os.environ.get("MCP_URL")
+    if mcp_url:
+        server_params = {"url": mcp_url}
+        mcp_label = mcp_url
+    else:
+        mcp_command = os.environ.get("MCP_COMMAND", "npx")
+        mcp_args = os.environ.get(
+            "MCP_ARGS",
+            f"-y @modelcontextprotocol/server-filesystem {project_root}",
+        ).split()
+        from mcp import StdioServerParameters
+
+        server_params = StdioServerParameters(
+            command=mcp_command,
+            args=mcp_args,
+        )
+        mcp_label = f"{mcp_command} {' '.join(mcp_args)}"
+    mcp_auth = _build_mcp_auth()
 
     print(f"Model:      {model}")
-    print(f"MCP server: {mcp_command} {' '.join(mcp_args)}")
+    print(f"MCP server: {mcp_label}")
+    print(f"MCP auth:   {'configured' if mcp_auth else 'none'}")
     print(f"Goal:       {goal}")
     print("─" * 60)
 
     # ── Connect to MCP server ─────────────────────────────────────────────
-    from mcp import StdioServerParameters
-
-    server_params = StdioServerParameters(
-        command=mcp_command,
-        args=mcp_args,
-    )
-
-    async with MCPServerConnection(server_params, server_name="demo") as conn:
+    async with MCPServerConnection(server_params, server_name="demo", auth=mcp_auth) as conn:
         print(f"MCP tools:  {conn.tool_names}")
         print("─" * 60)
 
