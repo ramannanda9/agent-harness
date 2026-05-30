@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from agents.base import AgentConfig
 from harness.runtime import AgentRegistry, AgentRuntime, GuardrailConfig, ToolRegistry
 from memory.manager import MemoryManager
@@ -10,9 +12,13 @@ from orchestrator.planner import (
     EvalConfig,
     OnFailure,
     Plan,
+    PlanValidationError,
+    Task,
     TaskResult,
+    _detect_cycle,
     _parse_plan,
     should_replan,
+    validate_plan,
 )
 from tests.conftest import EchoTool, ScriptedLLM
 
@@ -60,6 +66,146 @@ def test_parse_plan_from_json_string():
     raw = '{"tasks": [{"id": "t1", "agent_id": "a", "instruction": "x"}], "rationale": ""}'
     plan = _parse_plan(raw)
     assert plan.tasks[0].id == "t1"
+
+
+# ── validate_plan ─────────────────────────────────────────────────────────────
+
+
+def _task(id: str, agent_id: str = "a", depends_on: list[str] | None = None) -> Task:
+    return Task(id=id, agent_id=agent_id, instruction="x", depends_on=depends_on or [])
+
+
+def test_validate_plan_ok():
+    plan = Plan(tasks=[_task("t1"), _task("t2", depends_on=["t1"])])
+    validate_plan(plan, {"a"})  # must not raise
+
+
+def test_validate_plan_empty():
+    with pytest.raises(PlanValidationError, match="no tasks"):
+        validate_plan(Plan(tasks=[]), {"a"})
+
+
+def test_validate_plan_unknown_agent():
+    plan = Plan(tasks=[_task("t1", agent_id="ghost")])
+    with pytest.raises(PlanValidationError, match="unknown agent 'ghost'"):
+        validate_plan(plan, {"analyst", "reporter"})
+
+
+def test_validate_plan_duplicate_id():
+    plan = Plan(tasks=[_task("t1"), _task("t1")])
+    with pytest.raises(PlanValidationError, match="duplicate task id"):
+        validate_plan(plan, {"a"})
+
+
+def test_validate_plan_unknown_dep():
+    plan = Plan(tasks=[_task("t1", depends_on=["t99"])])
+    with pytest.raises(PlanValidationError, match="unknown task 't99'"):
+        validate_plan(plan, {"a"})
+
+
+def test_validate_plan_multiple_errors_in_one_raise():
+    plan = Plan(tasks=[_task("t1", agent_id="ghost", depends_on=["t99"])])
+    with pytest.raises(PlanValidationError) as exc_info:
+        validate_plan(plan, {"a"})
+    msg = str(exc_info.value)
+    assert "2 error" in msg
+    assert "ghost" in msg
+    assert "t99" in msg
+
+
+def test_validate_plan_self_loop_cycle():
+    plan = Plan(tasks=[_task("t1", depends_on=["t1"])])
+    with pytest.raises(PlanValidationError, match="cycle"):
+        validate_plan(plan, {"a"})
+
+
+def test_validate_plan_two_node_cycle():
+    plan = Plan(tasks=[_task("t1", depends_on=["t2"]), _task("t2", depends_on=["t1"])])
+    with pytest.raises(PlanValidationError, match="cycle"):
+        validate_plan(plan, {"a"})
+
+
+def test_validate_plan_three_node_cycle():
+    plan = Plan(
+        tasks=[
+            _task("t1", depends_on=["t3"]),
+            _task("t2", depends_on=["t1"]),
+            _task("t3", depends_on=["t2"]),
+        ]
+    )
+    with pytest.raises(PlanValidationError, match="cycle"):
+        validate_plan(plan, {"a"})
+
+
+def test_detect_cycle_linear_dag_returns_none():
+    tasks = [_task("t1"), _task("t2", depends_on=["t1"]), _task("t3", depends_on=["t2"])]
+    assert _detect_cycle(tasks) is None
+
+
+def test_detect_cycle_diamond_returns_none():
+    tasks = [
+        _task("root"),
+        _task("left", depends_on=["root"]),
+        _task("right", depends_on=["root"]),
+        _task("merge", depends_on=["left", "right"]),
+    ]
+    assert _detect_cycle(tasks) is None
+
+
+def test_detect_cycle_returns_cycle_nodes():
+    tasks = [_task("a", depends_on=["b"]), _task("b", depends_on=["a"])]
+    cycle = _detect_cycle(tasks)
+    assert cycle is not None
+    assert set(cycle) == {"a", "b"}
+
+
+# ── End-to-end: plan validation error surfaces as ERROR event ─────────────────
+
+
+async def test_plan_validation_error_yields_error_event():
+    """When the LLM returns a plan with an unknown agent, an ERROR event fires."""
+
+    def bad_plan(system, messages, kwargs):
+        return {
+            "tasks": [{"id": "t1", "agent_id": "ghost", "instruction": "x", "depends_on": []}],
+            "rationale": "bad",
+        }
+
+    llm = ScriptedLLM(routes={"decomposes goals": bad_plan})
+    tools = ToolRegistry()
+    agents = AgentRegistry().register(
+        AgentConfig(
+            agent_id="analyst",
+            role="analyses",
+            system_prompt="ReAct.",
+            allowed_tools=[],
+        )
+    )
+    memory = MemoryManager(
+        semantic_store=InMemorySemanticStore(),
+        episodic_store=InMemoryEpisodicStore(),
+        llm=llm,
+    )
+    runtime = AgentRuntime(
+        agent_registry=agents,
+        tool_registry=tools,
+        memory=memory,
+        llm=llm,
+        guardrail_config=GuardrailConfig(
+            max_total_cost_usd=1.0,
+            max_wall_time_seconds=30,
+            max_replan_count=1,
+            confidence_threshold=0.5,
+        ),
+    )
+
+    from harness.events import EventType
+
+    events = [e async for e in runtime.run_stream("goal")]
+    types = [e.type for e in events]
+    assert EventType.ERROR in types
+    error_evt = next(e for e in events if e.type == EventType.ERROR)
+    assert "ghost" in error_evt.error
 
 
 # ── End-to-end via AgentRuntime ───────────────────────────────────────────────
@@ -384,7 +530,9 @@ async def test_dispatch_unknown_complexity_defaults_to_simple():
 
 
 async def test_runtime_handles_unknown_agent_in_plan():
-    """Planner emits a task for an unregistered agent — should not crash, task fails."""
+    """Planner emits a task for an unregistered agent — validator catches it as ERROR."""
+    from harness.events import EventType
+
     routes = _routes_for_runtime()
 
     def planner(system, messages, kwargs):
@@ -405,8 +553,8 @@ async def test_runtime_handles_unknown_agent_in_plan():
     llm = ScriptedLLM(routes=routes)
     runtime, _ = _build_runtime(llm)
 
-    result = await runtime.run("ghost goal")
-
-    assert result["task_results"][0]["success"] is False
-    # synthesis still runs
-    assert "answer" in result
+    events = [e async for e in runtime.run_stream("ghost goal")]
+    types = [e.type for e in events]
+    assert EventType.ERROR in types
+    error_evt = next(e for e in events if e.type == EventType.ERROR)
+    assert "ghost" in error_evt.error
