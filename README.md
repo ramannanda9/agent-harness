@@ -74,6 +74,7 @@ explicit control.
 | `examples/executor_bridge_demo.py` | `ExecutorBridge` backends side-by-side: allowlist, env scrubbing, Docker network/fs isolation, timeout, positional-arg tools. | `ah-executor` and/or Docker |
 | `examples/durable_memory_demo.py` | Redis (semantic) + LanceDB (episodic) memory persistence across two related goals. | `OPENAI_API_KEY`, `[openai,redis,lance]`, Redis reachable |
 | `examples/mcp_demo.py` | Connects to an MCP filesystem server and gives the agent its tools. | `OPENAI_API_KEY`, `[openai,mcp]`, `npx` |
+| `examples/mcp_auth_demo.py` | Connects to an authenticated remote MCP server using bearer or auth-file credentials. | `OPENAI_API_KEY`, `[openai,mcp]`, `MCP_URL`, `MCP_BEARER_TOKEN` or `MCP_AUTH_PROVIDER` |
 | `examples/subscription_auth_demo.py` | Runs an agent through subscription-backed providers: direct `openai-codex` OAuth or direct `claude-code` OAuth. | `agent-harness login openai-codex` or `agent-harness login claude-code` |
 
 ## Adding a new domain (3 steps)
@@ -518,7 +519,48 @@ async with MCPServerConnection(params, server_name="filesystem") as conn:
 Supports **stdio** and **SSE** transports. The `MCPServerConnection` context
 manager handles the full lifecycle — connect, discover, and cleanup.
 
-See `examples/mcp_demo.py` for a runnable example.
+Remote MCP servers can receive static headers or bearer tokens through an auth
+provider:
+
+```python
+import os
+from tools.mcp import MCPServerConnection, StaticMCPAuth
+
+auth = StaticMCPAuth(
+    headers={
+        "DD_API_KEY": os.environ["DD_API_KEY"],
+        "DD_APPLICATION_KEY": os.environ["DD_APPLICATION_KEY"],
+    }
+)
+
+async with MCPServerConnection(
+    {"url": "https://mcp.datadoghq.com/api/unstable/mcp-server/mcp"},
+    server_name="datadog",
+    auth=auth,
+) as conn:
+    conn.register_tools(tool_registry)
+```
+
+OAuth-style auth files can be reused for MCP bearer auth:
+
+```python
+from tools.mcp import MCPServerConnection, OAuthMCPAuth
+
+auth = OAuthMCPAuth.from_auth_file(
+    "~/.agent-harness/auth/auth.json",
+    provider="datadog-mcp",
+)
+
+async with MCPServerConnection(
+    {"url": "https://mcp.datadoghq.com/api/unstable/mcp-server/mcp"},
+    server_name="datadog",
+    auth=auth,
+) as conn:
+    conn.register_tools(tool_registry)
+```
+
+See `examples/mcp_demo.py` for local stdio MCP and `examples/mcp_auth_demo.py`
+for authenticated remote MCP.
 
 ## OpenTelemetry Tracing
 

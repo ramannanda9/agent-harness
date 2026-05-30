@@ -3,6 +3,7 @@ Tests for tools.mcp — MCP adapter, content extraction, and registry integratio
 
 All tests mock the MCP session/transport so no real MCP server is needed.
 """
+
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -10,8 +11,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from tools.mcp.adapter import MCPServerConnection, MCPToolAdapter, _extract_content
+from tools.mcp.auth import StaticMCPAuth
 
 # ── Fake MCP types (mirrors mcp SDK shapes) ──────────────────────────────────
+
 
 class FakeTextContent:
     def __init__(self, text: str):
@@ -45,6 +48,7 @@ class FakeListToolsResult:
 
 # ── _extract_content ─────────────────────────────────────────────────────────
 
+
 class TestExtractContent:
     def test_single_text_plain(self):
         result = FakeCallToolResult([FakeTextContent("hello world")])
@@ -55,9 +59,7 @@ class TestExtractContent:
         assert _extract_content(result) == {"key": "value"}
 
     def test_error_result(self):
-        result = FakeCallToolResult(
-            [FakeTextContent("something went wrong")], isError=True
-        )
+        result = FakeCallToolResult([FakeTextContent("something went wrong")], isError=True)
         extracted = _extract_content(result)
         assert extracted == {"error": "something went wrong"}
 
@@ -71,10 +73,12 @@ class TestExtractContent:
         assert _extract_content(result) == {"result": "no content returned"}
 
     def test_multiple_text_items(self):
-        result = FakeCallToolResult([
-            FakeTextContent("line 1"),
-            FakeTextContent("line 2"),
-        ])
+        result = FakeCallToolResult(
+            [
+                FakeTextContent("line 1"),
+                FakeTextContent("line 2"),
+            ]
+        )
         extracted = _extract_content(result)
         assert len(extracted) == 2
         assert extracted[0] == {"type": "text", "content": "line 1"}
@@ -86,10 +90,12 @@ class TestExtractContent:
         assert extracted == [{"type": "image", "size": 4}]
 
     def test_mixed_content(self):
-        result = FakeCallToolResult([
-            FakeTextContent("caption"),
-            FakeBinaryContent(b"\x00\x01"),
-        ])
+        result = FakeCallToolResult(
+            [
+                FakeTextContent("caption"),
+                FakeBinaryContent(b"\x00\x01"),
+            ]
+        )
         extracted = _extract_content(result)
         assert len(extracted) == 2
         assert extracted[0]["type"] == "text"
@@ -97,6 +103,7 @@ class TestExtractContent:
 
 
 # ── MCPToolAdapter ───────────────────────────────────────────────────────────
+
 
 class TestMCPToolAdapter:
     @pytest.fixture()
@@ -117,13 +124,9 @@ class TestMCPToolAdapter:
         assert adapter.name == "test_tool"
 
     async def test_execute_calls_session(self, adapter, mock_session):
-        mock_session.call_tool.return_value = FakeCallToolResult(
-            [FakeTextContent("result")]
-        )
+        mock_session.call_tool.return_value = FakeCallToolResult([FakeTextContent("result")])
         result = await adapter.execute(x="hello")
-        mock_session.call_tool.assert_awaited_once_with(
-            "test_tool", arguments={"x": "hello"}
-        )
+        mock_session.call_tool.assert_awaited_once_with("test_tool", arguments={"x": "hello"})
         assert result == "result"
 
     async def test_execute_passes_kwargs(self, adapter, mock_session):
@@ -142,15 +145,20 @@ class TestMCPToolAdapter:
 
 # ── MCPServerConnection ─────────────────────────────────────────────────────
 
+
 class TestMCPServerConnection:
     async def test_connect_discovers_tools(self):
         """Verify connect() discovers tools and creates adapters."""
         fake_session = AsyncMock()
         fake_session.initialize = AsyncMock()
-        fake_session.list_tools = AsyncMock(return_value=FakeListToolsResult([
-            FakeTool("read_file", "Read a file", {"type": "object"}),
-            FakeTool("write_file", "Write a file", {"type": "object"}),
-        ]))
+        fake_session.list_tools = AsyncMock(
+            return_value=FakeListToolsResult(
+                [
+                    FakeTool("read_file", "Read a file", {"type": "object"}),
+                    FakeTool("write_file", "Write a file", {"type": "object"}),
+                ]
+            )
+        )
 
         # We need to mock the entire import chain for the mcp client.
         # Patch at the module level where MCPServerConnection imports from.
@@ -191,10 +199,16 @@ class TestMCPServerConnection:
         conn = MCPServerConnection(MagicMock(), server_name="test")
         conn._tools = [
             MCPToolAdapter(
-                name="tool_a", description="", input_schema={}, session=fake_session,
+                name="tool_a",
+                description="",
+                input_schema={},
+                session=fake_session,
             ),
             MCPToolAdapter(
-                name="tool_b", description="", input_schema={}, session=fake_session,
+                name="tool_b",
+                description="",
+                input_schema={},
+                session=fake_session,
             ),
         ]
 
@@ -222,8 +236,15 @@ class TestMCPServerConnection:
         assert conn.tools == []
         assert conn.tool_names == []
 
+    def test_connection_accepts_auth_provider(self):
+        auth = StaticMCPAuth(headers={"Authorization": "Bearer t"})
+        conn = MCPServerConnection("https://example.com/sse", auth=auth)
+
+        assert conn._auth_provider is auth
+
 
 # ── Integration: MCP tools work with the harness agent ───────────────────────
+
 
 class TestMCPToolWithAgent:
     async def test_agent_can_call_mcp_tool(self):
@@ -253,6 +274,4 @@ class TestMCPToolWithAgent:
         result = await fetched.execute(path="/tmp")
 
         assert result == {"files": ["a.txt", "b.txt"]}
-        session.call_tool.assert_awaited_once_with(
-            "list_files", arguments={"path": "/tmp"}
-        )
+        session.call_tool.assert_awaited_once_with("list_files", arguments={"path": "/tmp"})

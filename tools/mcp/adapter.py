@@ -30,6 +30,7 @@ Usage (manual lifecycle):
     finally:
         await conn.close()
 """
+
 from __future__ import annotations
 
 import json
@@ -37,10 +38,13 @@ import logging
 from contextlib import AsyncExitStack
 from typing import Any
 
+from tools.mcp.auth import MCPAuthProvider, merge_mcp_auth
+
 logger = logging.getLogger(__name__)
 
 
 # ── Tool Adapter ──────────────────────────────────────────────────────────────
+
 
 class MCPToolAdapter:
     """
@@ -57,7 +61,7 @@ class MCPToolAdapter:
         name: str,
         description: str,
         input_schema: dict,
-        session: Any,           # mcp.client.session.ClientSession
+        session: Any,  # mcp.client.session.ClientSession
     ) -> None:
         self.name = name
         self.description = description
@@ -74,6 +78,7 @@ class MCPToolAdapter:
 
 
 # ── Server Connection ────────────────────────────────────────────────────────
+
 
 class MCPServerConnection:
     """
@@ -93,8 +98,10 @@ class MCPServerConnection:
         server_params: Any,
         *,
         server_name: str | None = None,
+        auth: MCPAuthProvider | None = None,
     ) -> None:
         self._params = server_params
+        self._auth_provider = auth
         self.server_name = server_name or "mcp-server"
         self._session: Any = None
         self._exit_stack: AsyncExitStack | None = None
@@ -117,40 +124,35 @@ class MCPServerConnection:
             from mcp.client.session import ClientSession
             from mcp.client.stdio import stdio_client
         except ImportError as e:
-            raise ImportError(
-                "mcp package not installed. Run: pip install -e \".[mcp]\""
-            ) from e
+            raise ImportError('mcp package not installed. Run: pip install -e ".[mcp]"') from e
 
         self._exit_stack = AsyncExitStack()
         await self._exit_stack.__aenter__()
 
         try:
-            if isinstance(self._params, StdioServerParameters):
-                read, write = await self._exit_stack.enter_async_context(
-                    stdio_client(self._params)
-                )
-            elif isinstance(self._params, str):
+            auth = await self._auth_provider.get_auth() if self._auth_provider else None
+            params = merge_mcp_auth(self._params, auth)
+
+            if isinstance(params, StdioServerParameters):
+                read, write = await self._exit_stack.enter_async_context(stdio_client(params))
+            elif isinstance(params, str):
                 # SSE transport: params is a URL string
                 from mcp.client.sse import sse_client
-                read, write = await self._exit_stack.enter_async_context(
-                    sse_client(self._params)
-                )
-            elif isinstance(self._params, dict) and "url" in self._params:
+
+                read, write = await self._exit_stack.enter_async_context(sse_client(params))
+            elif isinstance(params, dict) and "url" in params:
                 # SSE transport: params as dict with url + optional headers
                 from mcp.client.sse import sse_client
-                read, write = await self._exit_stack.enter_async_context(
-                    sse_client(**self._params)
-                )
+
+                read, write = await self._exit_stack.enter_async_context(sse_client(**params))
             else:
                 raise TypeError(
-                    f"Unsupported server_params type: {type(self._params)}. "
+                    f"Unsupported server_params type: {type(params)}. "
                     "Use StdioServerParameters, an SSE URL string, or "
                     "a dict with 'url' key."
                 )
 
-            self._session = await self._exit_stack.enter_async_context(
-                ClientSession(read, write)
-            )
+            self._session = await self._exit_stack.enter_async_context(ClientSession(read, write))
             await self._session.initialize()
 
             result = await self._session.list_tools()
@@ -158,11 +160,7 @@ class MCPServerConnection:
                 MCPToolAdapter(
                     name=tool.name,
                     description=getattr(tool, "description", None) or "",
-                    input_schema=(
-                        tool.inputSchema
-                        if hasattr(tool, "inputSchema")
-                        else {}
-                    ),
+                    input_schema=(tool.inputSchema if hasattr(tool, "inputSchema") else {}),
                     session=self._session,
                 )
                 for tool in result.tools
@@ -170,7 +168,9 @@ class MCPServerConnection:
 
             logger.info(
                 "Connected to MCP server %r: %d tools discovered: %s",
-                self.server_name, len(self._tools), self.tool_names,
+                self.server_name,
+                len(self._tools),
+                self.tool_names,
             )
             return self._tools
 
@@ -204,11 +204,13 @@ class MCPServerConnection:
 
 # ── Convenience ───────────────────────────────────────────────────────────────
 
+
 async def register_mcp_server(
     tool_registry: Any,
     server_params: Any,
     *,
     server_name: str | None = None,
+    auth: MCPAuthProvider | None = None,
 ) -> MCPServerConnection:
     """
     Convenience: connect to an MCP server and register all its tools.
@@ -217,13 +219,14 @@ async def register_mcp_server(
     when done**. For automatic cleanup, prefer the context-manager
     pattern with MCPServerConnection directly.
     """
-    conn = MCPServerConnection(server_params, server_name=server_name)
+    conn = MCPServerConnection(server_params, server_name=server_name, auth=auth)
     await conn.connect()
     conn.register_tools(tool_registry)
     return conn
 
 
 # ── Content Extraction ────────────────────────────────────────────────────────
+
 
 def _extract_content(result: Any) -> Any:
     """
@@ -259,10 +262,12 @@ def _extract_content(result: Any) -> Any:
         if hasattr(item, "text"):
             parts.append({"type": "text", "content": item.text})
         elif hasattr(item, "data"):
-            parts.append({
-                "type": getattr(item, "type", "binary"),
-                "size": len(item.data),
-            })
+            parts.append(
+                {
+                    "type": getattr(item, "type", "binary"),
+                    "size": len(item.data),
+                }
+            )
         else:
             parts.append({"type": "unknown"})
     return parts
