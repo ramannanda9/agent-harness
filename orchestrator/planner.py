@@ -268,6 +268,39 @@ class Orchestrator:
                     hint.done = True
                 yield event
 
+    async def run_with_plan_stream(self, plan: Plan, goal: str) -> AsyncGenerator[BusEvent, None]:
+        """Execute a caller-supplied plan, bypassing the LLM planner entirely.
+
+        The plan is validated against the registered agents before execution.
+        An ERROR event is yielded and the stream ends if validation fails.
+        Everything downstream — parallel execution, replan-on-failure,
+        synthesis, memory writes — is identical to ``run_stream``.
+        """
+        try:
+            validate_plan(plan, set(self._agents.keys()))
+        except PlanValidationError as exc:
+            logger.error("Pre-built plan validation failed: %s", exc)
+            yield BusEvent(type=EventType.ERROR, agent_id="orchestrator", error=str(exc))
+            return
+
+        logger.info(
+            "Orchestrator run_id=%s pre-built plan (%d tasks)", self._run_id, len(plan.tasks)
+        )
+        self._tracer.start_run(self._run_id, goal)
+        yield BusEvent(
+            type=EventType.PLAN,
+            agent_id="orchestrator",
+            payload={"plan": _plan_to_dict(plan), "pre_built": True},
+        )
+
+        self._set_agent_resume_keys()
+        await self._write_orch_checkpoint(goal, plan, {}, 0)
+        async with _ResumeHint(self._run_id, self._checkpoint_store, "Orchestration") as hint:
+            async for event in self._execute_plan_stream(goal, plan, {}, 0):
+                if event.type == EventType.DONE:
+                    hint.done = True
+                yield event
+
     def _set_agent_resume_keys(self) -> None:
         """Tell every agent to print --resume <run_id> so humans resume the orchestration."""
         for agent in self._agents.values():
