@@ -25,15 +25,14 @@ Optional — customise the images via env vars:
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import sys
 
 from agents.base import AgentConfig
+from harness.console import ConsoleRenderer
 from harness.events import EventType
 from harness.llm.openai import OpenAILLM
 from harness.runtime import AgentRegistry, AgentRuntime, GuardrailConfig, ToolRegistry
-from harness.utils import stream_tokens_inline
 from memory.manager import MemoryManager
 from memory.stores import InMemoryEpisodicStore, InMemorySemanticStore
 from tools.builtin.fetch_image import FetchImage
@@ -58,12 +57,7 @@ GOAL = (
 )
 
 
-def _sep(char: str = "─", w: int = 68) -> str:
-    return char * w
-
-
-def _trunc(s: str, n: int = 120) -> str:
-    return s if len(s) <= n else s[:n] + "…"
+_renderer = ConsoleRenderer()
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -74,11 +68,11 @@ async def main() -> None:
         print("ERROR: set OPENAI_API_KEY before running.", file=sys.stderr)
         sys.exit(2)
 
-    print(_sep("═"))
+    _renderer.sep("═")
     print(f"Model:   {MODEL}")
     print(f"Image 1: {IMAGE_URL_1}")
     print(f"Image 2: {IMAGE_URL_2}")
-    print(_sep("═"))
+    _renderer.sep("═")
 
     llm = OpenAILLM(model=MODEL)
 
@@ -121,41 +115,21 @@ async def main() -> None:
         ),
     )
 
-    print(f"\nGoal: {_trunc(GOAL, 160)}\n" + _sep())
+    print(f"\nGoal: {GOAL}\n")
+    _renderer.sep()
 
     final: dict = {}
-    async for event in stream_tokens_inline(runtime.dispatch_stream(GOAL)):
-        if event.type == EventType.DISPATCH:
-            print(
-                f"[dispatch]  complexity={event.payload['complexity']}"
-                f"  path={event.payload['path']}"
-            )
-        elif event.type == EventType.ROUTE:
-            print(
-                f"[route]     → {event.payload['agent_id']}: "
-                f"{_trunc(event.payload['rationale'], 80)}"
-            )
-        elif event.type == EventType.THOUGHT:
-            thought = event.payload.get("thought", "")
-            if thought:
-                print(f"[thought]   {_trunc(thought)}")
-        elif event.type == EventType.ACTION:
-            args = json.dumps(event.payload["args"], default=str)
-            print(f"[action]    {event.payload['tool']}({_trunc(args, 80)})")
-        elif event.type == EventType.OBSERVATION:
-            obs = event.payload.get("observation", "")
-            # "[image]" is emitted for image blocks; text responses are truncated normally.
-            print(f"[observe]   {_trunc(obs)}")
-        elif event.type == EventType.TASK_DONE:
+    async for event in runtime.dispatch_stream(GOAL):
+        if event.type == EventType.TASK_DONE:
             final = event.payload
-        elif event.type == EventType.ERROR:
-            print(f"[error]     {event.error}", file=sys.stderr)
+        else:
+            _renderer.render(event)
 
-    print(_sep("═"))
+    _renderer.sep("═")
     print("VISION REPORT")
-    print(_sep("═"))
+    _renderer.sep("═")
     print(final.get("answer", "(no answer)"))
-    print(_sep())
+    _renderer.sep()
     print(
         f"Confidence: {final.get('confidence', 0):.2f}  |  "
         f"Steps: {final.get('steps', '?')}  |  "

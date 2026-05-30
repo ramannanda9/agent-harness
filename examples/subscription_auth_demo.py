@@ -49,11 +49,11 @@ import sys
 from pathlib import Path
 
 from agents.base import AgentConfig
+from harness.console import ConsoleRenderer
 from harness.events import EventType
 from harness.llm.claude_code import ClaudeCodeLLM
 from harness.llm.openai_codex import OpenAICodexLLM
 from harness.runtime import AgentRegistry, AgentRuntime, GuardrailConfig, ToolRegistry
-from harness.utils import stream_tokens_inline
 from memory.manager import MemoryManager
 from memory.stores import InMemoryEpisodicStore, InMemorySemanticStore
 
@@ -62,9 +62,7 @@ GOAL = (
     "credential-backed LLM provider."
 )
 
-
-def _truncate(s: str, n: int = 140) -> str:
-    return s if len(s) <= n else s[:n] + "..."
+_renderer = ConsoleRenderer()
 
 
 def _auth_path(provider: str) -> Path:
@@ -151,22 +149,14 @@ async def run(provider: str) -> dict:
     )
 
     final: dict = {}
-    async for event in stream_tokens_inline(runtime.dispatch_stream(GOAL), prefix="[stream]   "):
-        if event.type == EventType.DISPATCH:
-            print(f"[dispatch] {event.payload['path']} ({event.payload['complexity']})")
-        elif event.type == EventType.ROUTE:
-            print(
-                f"[route]    {event.payload['agent_id']}: {_truncate(event.payload['rationale'])}"
-            )
-        elif event.type == EventType.THOUGHT:
-            thought = event.payload.get("thought", "")
-            if thought:
-                print(f"[think]    {_truncate(thought)}")
-        elif event.type == EventType.TASK_DONE:
+    async for event in runtime.dispatch_stream(GOAL):
+        if event.type == EventType.TASK_DONE:
             final = event.payload
         elif event.type == EventType.ERROR:
-            print(f"[error]    {event.error}")
+            _renderer.render(event)
             final = {"error": event.error}
+        else:
+            _renderer.render(event)
 
     return final
 
