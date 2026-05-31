@@ -381,6 +381,8 @@ class BaseAgent:
                 elif thought_event.type == EventType.THOUGHT:
                     response = thought_event.payload.get("response")
                     yield thought_event
+                else:
+                    yield thought_event
 
             if response is None:
                 reason = self._last_think_error or "LLM returned unparseable response"
@@ -642,6 +644,14 @@ class BaseAgent:
         """
         messages = self._working_memory.get_messages()
         accumulated = ""
+        before_usage = self._working_memory.context_usage()
+        before_summarizations = self._working_memory.summarization_count
+
+        yield BusEvent(
+            type=EventType.CONTEXT,
+            agent_id=self.config.agent_id,
+            payload=before_usage,
+        )
 
         try:
             if hasattr(self._llm, "stream_complete"):
@@ -685,6 +695,25 @@ class BaseAgent:
         else:
             if response is not None:
                 self._last_think_error = None
+
+        after_usage = self._working_memory.context_usage()
+        if self._working_memory.summarization_count > before_summarizations:
+            yield BusEvent(
+                type=EventType.MEMORY,
+                agent_id=self.config.agent_id,
+                payload={
+                    "event": "summarized",
+                    "before": before_usage,
+                    "after": after_usage,
+                    "summarizations": self._working_memory.summarization_count,
+                },
+            )
+        if after_usage != before_usage:
+            yield BusEvent(
+                type=EventType.CONTEXT,
+                agent_id=self.config.agent_id,
+                payload=after_usage,
+            )
 
         yield BusEvent(
             type=EventType.THOUGHT,

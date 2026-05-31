@@ -72,6 +72,21 @@ async def test_summary_role_is_assistant_when_first_after_is_user():
 
 
 @pytest.mark.asyncio
+async def test_context_usage_reports_budget_level():
+    wm, _ = _wm(max_tokens=100)
+    await wm.append("user", "x" * 81)
+
+    usage = wm.context_usage()
+
+    assert usage["tokens"] == 81
+    assert usage["max_tokens"] == 100
+    assert usage["percent"] == 0.81
+    assert usage["level"] == "warning"
+    assert usage["messages"] == 1
+    assert usage["summarizations"] == 0
+
+
+@pytest.mark.asyncio
 async def test_summary_role_is_user_when_first_after_is_assistant():
     """3 evictable, cutoff=1, first remaining = assistant → summary role = 'user'."""
     wm, _ = _wm(max_tokens=250)

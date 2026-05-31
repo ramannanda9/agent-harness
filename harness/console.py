@@ -117,6 +117,27 @@ class ConsoleRenderer:
                 file=self._out,
             )
 
+        elif t == EventType.CONTEXT:
+            tokens = int(p.get("tokens") or 0)
+            max_tokens = int(p.get("max_tokens") or 0)
+            pct = float(p.get("percent") or 0.0) * 100
+            level = p.get("level") or "normal"
+            suffix = "" if level == "normal" else f"  {level}"
+            print(
+                f"{self._label(event)} ctx     {tokens:,} / {max_tokens:,} tokens  "
+                f"{pct:.0f}%{suffix}",
+                file=self._out,
+            )
+
+        elif t == EventType.MEMORY:
+            before = p.get("before") if isinstance(p.get("before"), dict) else {}
+            after = p.get("after") if isinstance(p.get("after"), dict) else {}
+            print(
+                f"{self._label(event)} memory  summarized  "
+                f"{int(before.get('tokens') or 0):,} -> {int(after.get('tokens') or 0):,} tokens",
+                file=self._out,
+            )
+
         elif t == EventType.HUMAN_GUIDANCE:
             print(
                 f"\n{self._label(event)} ▶ steered  step={p.get('step')}  text={p.get('text')!r}",
