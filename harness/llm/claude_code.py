@@ -42,6 +42,7 @@ class ClaudeCodeLLM:
         http_client: Any | None = None,
         user_agent: str | None = None,
         betas: str = CLAUDE_CODE_BETAS,
+        prompt_caching: bool = True,
     ) -> None:
         if credential_provider is None:
             if auth_file is None:
@@ -66,6 +67,7 @@ class ClaudeCodeLLM:
         self._owns_client = http_client is None
         self._user_agent = user_agent or _default_user_agent()
         self._betas = betas
+        self._prompt_caching = prompt_caching
         self.last_usage: dict | None = None
 
     async def complete(
@@ -123,6 +125,7 @@ class ClaudeCodeLLM:
             messages=messages,
             max_tokens=max_tokens,
             extra=extra,
+            prompt_caching=self._prompt_caching,
         )
         payload["stream"] = True
         url = f"{self._base_url}/v1/messages"
@@ -251,6 +254,7 @@ def _build_payload(
     messages: list[dict],
     max_tokens: int,
     extra: dict[str, Any],
+    prompt_caching: bool = True,
 ) -> dict[str, Any]:
     instructions = system or ""
     input_messages: list[dict] = []
@@ -261,11 +265,14 @@ def _build_payload(
                 instructions = f"{instructions}\n\n{text}" if instructions else text
             continue
         input_messages.append(message)
+    built_messages = [_message_payload(message) for message in input_messages]
+    if prompt_caching:
+        _apply_last_user_cache_control(built_messages)
     payload: dict[str, Any] = {
         "model": model,
         "max_tokens": max_tokens,
-        "system": _system_blocks(instructions),
-        "messages": [_message_payload(message) for message in input_messages],
+        "system": _system_blocks(instructions, prompt_caching=prompt_caching),
+        "messages": built_messages,
     }
     for key in ("temperature", "top_p", "top_k", "stop_sequences", "thinking"):
         if key in extra:
@@ -273,7 +280,7 @@ def _build_payload(
     return payload
 
 
-def _system_blocks(system: str | None) -> list[dict[str, Any]]:
+def _system_blocks(system: str | None, *, prompt_caching: bool = True) -> list[dict[str, Any]]:
     cc_version = _resolve_cc_version()
     blocks: list[dict[str, Any]] = [
         {
@@ -286,14 +293,31 @@ def _system_blocks(system: str | None) -> list[dict[str, Any]]:
         {"type": "text", "text": CLAUDE_CODE_IDENTITY},
     ]
     if system:
-        blocks.append(
-            {
-                "type": "text",
-                "text": system,
-                "cache_control": {"type": "ephemeral"},
-            }
-        )
+        block: dict[str, Any] = {"type": "text", "text": system}
+        if prompt_caching:
+            block["cache_control"] = {"type": "ephemeral"}
+        blocks.append(block)
     return blocks
+
+
+def _apply_last_user_cache_control(messages: list[dict]) -> None:
+    """Add cache_control to the last user message's content block (string only).
+
+    This marks the current task/goal as cacheable so repeated ReAct steps
+    that share the same leading conversation prefix benefit from the cache.
+    Only mutates messages whose last user-role entry has a plain-string
+    content block (skips multimodal / already-list content).
+    """
+    for message in reversed(messages):
+        if message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            break
+        # content is already a list of blocks from _message_payload
+        if len(content) == 1 and content[0].get("type") == "text":
+            content[0]["cache_control"] = {"type": "ephemeral"}
+        break
 
 
 def _message_payload(message: dict) -> dict[str, Any]:
