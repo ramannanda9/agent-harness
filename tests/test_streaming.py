@@ -33,6 +33,7 @@ async def test_agent_run_stream_finish_yields_task_done(agent_factory):
     types = [e.type for e in events]
     # The default ScriptedLLM finishes immediately; we expect THOUGHT then TASK_DONE.
     assert EventType.THOUGHT in types
+    assert EventType.CONTEXT in types
     assert types[-1] == EventType.TASK_DONE
     assert events[-1].payload["answer"].startswith("done:")
 

@@ -215,6 +215,23 @@ class WorkingMemory:
     def token_count(self) -> int:
         return self._token_total
 
+    def context_usage(self) -> dict:
+        percent = self._token_total / self.max_tokens if self.max_tokens > 0 else 0.0
+        if percent >= 0.95:
+            level = "critical"
+        elif percent >= 0.80:
+            level = "warning"
+        else:
+            level = "normal"
+        return {
+            "tokens": self._token_total,
+            "max_tokens": self.max_tokens,
+            "percent": percent,
+            "level": level,
+            "messages": len(self._messages),
+            "summarizations": self._summarization_count,
+        }
+
     def clear(self) -> None:
         self._messages.clear()
         self._token_total = 0
