@@ -145,6 +145,8 @@ class ClaudeCodeLLM:
 
                 tokens_in = 0
                 tokens_out = 0
+                cache_read_tokens = 0
+                cache_creation_tokens = 0
                 async for _event_type, data in aiter_sse_events(response):
                     if not data or data == "[DONE]":
                         continue
@@ -164,6 +166,10 @@ class ClaudeCodeLLM:
                     elif otype == "message_start":
                         msg_usage = (obj.get("message") or {}).get("usage") or {}
                         tokens_in = int(msg_usage.get("input_tokens") or 0)
+                        cache_read_tokens = int(msg_usage.get("cache_read_input_tokens") or 0)
+                        cache_creation_tokens = int(
+                            msg_usage.get("cache_creation_input_tokens") or 0
+                        )
                     elif otype == "message_delta":
                         delta_usage = obj.get("usage") or {}
                         tokens_out = int(delta_usage.get("output_tokens") or 0)
@@ -171,6 +177,8 @@ class ClaudeCodeLLM:
                 self.last_usage = {
                     "tokens_in": tokens_in,
                     "tokens_out": tokens_out,
+                    "cache_read_tokens": cache_read_tokens,
+                    "cache_creation_tokens": cache_creation_tokens,
                     "total_tokens": tokens_in + tokens_out,
                     "provider": "claude-code",
                 }

@@ -201,6 +201,8 @@ async def test_stream_complete_yields_deltas_incrementally():
     assert llm.last_usage == {
         "tokens_in": 5,
         "tokens_out": 6,
+        "cache_read_tokens": 0,
+        "cache_creation_tokens": 0,
         "total_tokens": 11,
         "provider": "claude-code",
     }
