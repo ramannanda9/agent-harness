@@ -4,7 +4,7 @@ MCP (Model Context Protocol) adapter for the agent harness.
 Connects to any MCP-compatible server and registers its tools into
 the harness's ToolRegistry, making them available to agents.
 
-Supports stdio and SSE transports.
+Supports stdio, SSE, and streamable-HTTP transports.
 
 Install:
     pip install -e ".[mcp]"
@@ -19,6 +19,18 @@ Usage (context manager — recommended):
     async with MCPServerConnection(params, server_name="filesystem") as conn:
         conn.register_tools(tool_registry)
         result = await runtime.run("list files in /tmp")
+
+Streamable-HTTP (e.g. Datadog):
+
+    from tools.mcp.adapter import StreamableHttpServerParams
+    from tools.mcp.auth import DatadogMCPAuth
+
+    auth = DatadogMCPAuth()   # reads DD_API_KEY + DD_APP_KEY from env
+    params = StreamableHttpServerParams(url=auth.url)
+
+    async with MCPServerConnection(params, server_name="datadog", auth=auth) as conn:
+        conn.register_tools(tool_registry)
+        result = await runtime.run("list monitors with status alert")
 
 Usage (manual lifecycle):
 
@@ -36,9 +48,35 @@ from __future__ import annotations
 import json
 import logging
 from contextlib import AsyncExitStack
+from dataclasses import dataclass, field
 from typing import Any
 
 from tools.mcp.auth import MCPAuthProvider, merge_mcp_auth
+
+
+@dataclass
+class StreamableHttpServerParams:
+    """Connection parameters for an MCP server using the streamable-HTTP transport.
+
+    Headers supplied here are merged with those from the MCPAuthProvider before
+    the connection is opened.
+
+    Example::
+
+        from tools.mcp.adapter import StreamableHttpServerParams
+        from tools.mcp.auth import DatadogMCPAuth
+
+        auth = DatadogMCPAuth()
+        params = StreamableHttpServerParams(url=auth.url)
+        async with MCPServerConnection(params, auth=auth) as conn:
+            ...
+    """
+
+    url: str
+    headers: dict[str, str] = field(default_factory=dict)
+    timeout: float = 30.0
+    sse_read_timeout: float = 300.0
+
 
 logger = logging.getLogger(__name__)
 
@@ -135,6 +173,17 @@ class MCPServerConnection:
 
             if isinstance(params, StdioServerParameters):
                 read, write = await self._exit_stack.enter_async_context(stdio_client(params))
+            elif isinstance(params, StreamableHttpServerParams):
+                from mcp.client.streamable_http import streamablehttp_client
+
+                read, write, _ = await self._exit_stack.enter_async_context(
+                    streamablehttp_client(
+                        params.url,
+                        headers=params.headers or None,
+                        timeout=params.timeout,
+                        sse_read_timeout=params.sse_read_timeout,
+                    )
+                )
             elif isinstance(params, str):
                 # SSE transport: params is a URL string
                 from mcp.client.sse import sse_client
@@ -148,8 +197,8 @@ class MCPServerConnection:
             else:
                 raise TypeError(
                     f"Unsupported server_params type: {type(params)}. "
-                    "Use StdioServerParameters, an SSE URL string, or "
-                    "a dict with 'url' key."
+                    "Use StdioServerParameters, StreamableHttpServerParams, "
+                    "an SSE URL string, or a dict with 'url' key."
                 )
 
             self._session = await self._exit_stack.enter_async_context(ClientSession(read, write))

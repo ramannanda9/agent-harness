@@ -91,11 +91,76 @@ class OAuthMCPAuth:
         return MCPAuth(headers={self._header_name: f"Bearer {cred.access}"})
 
 
+class DatadogMCPAuth:
+    """API-key auth for Datadog's hosted MCP endpoint.
+
+    Reads credentials from environment variables by default::
+
+        DD_API_KEY=<key> DD_APP_KEY=<key> python my_agent.py
+
+    Or pass them explicitly::
+
+        auth = DatadogMCPAuth(api_key="...", app_key="...")
+
+    The ``url`` property returns the correct MCP base URL for the configured
+    Datadog site (default ``datadoghq.com``; set ``site`` for EU/Gov/etc.)::
+
+        from tools.mcp.adapter import StreamableHttpServerParams
+        from tools.mcp.auth import DatadogMCPAuth
+
+        auth = DatadogMCPAuth()
+        params = StreamableHttpServerParams(url=auth.url)
+        async with MCPServerConnection(params, server_name="datadog", auth=auth) as conn:
+            conn.register_tools(tool_registry)
+    """
+
+    def __init__(
+        self,
+        *,
+        api_key: str | None = None,
+        app_key: str | None = None,
+        site: str = "datadoghq.com",
+    ) -> None:
+        self._api_key = api_key or os.environ.get("DD_API_KEY", "")
+        self._app_key = app_key or os.environ.get("DD_APP_KEY", "")
+        self._site = site
+        if not self._api_key:
+            raise ValueError("api_key or DD_API_KEY environment variable required")
+        if not self._app_key:
+            raise ValueError("app_key or DD_APP_KEY environment variable required")
+
+    @property
+    def url(self) -> str:
+        return f"https://mcp.{self._site}/"
+
+    async def get_auth(self) -> MCPAuth:
+        return MCPAuth(
+            headers={
+                "DD-Api-Key": self._api_key,
+                "DD-Application-Key": self._app_key,
+            }
+        )
+
+
 def merge_mcp_auth(server_params: Any, auth: MCPAuth | None) -> Any:
     """Return server params with auth applied without mutating caller input."""
 
     if auth is None or (not auth.headers and not auth.env):
         return server_params
+
+    # Avoid a hard import — StreamableHttpServerParams lives in adapter.py
+    # and auth.py must not depend on it (would create a circular import).
+    # We duck-type on the presence of url + headers + timeout attributes.
+    if (
+        hasattr(server_params, "url")
+        and hasattr(server_params, "headers")
+        and hasattr(server_params, "timeout")
+        and not isinstance(server_params, dict)
+    ):
+        import dataclasses as _dc
+
+        merged_headers = {**dict(server_params.headers or {}), **dict(auth.headers)}
+        return _dc.replace(server_params, headers=merged_headers)
 
     if isinstance(server_params, str):
         params: dict[str, Any] = {"url": server_params}

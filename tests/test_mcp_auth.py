@@ -7,7 +7,15 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from tools.mcp.auth import BearerMCPAuth, MCPAuth, OAuthMCPAuth, StaticMCPAuth, merge_mcp_auth
+from tools.mcp.adapter import StreamableHttpServerParams
+from tools.mcp.auth import (
+    BearerMCPAuth,
+    DatadogMCPAuth,
+    MCPAuth,
+    OAuthMCPAuth,
+    StaticMCPAuth,
+    merge_mcp_auth,
+)
 
 
 async def test_static_mcp_auth_returns_headers_and_env():
@@ -102,3 +110,87 @@ def test_headers_are_rejected_for_stdio_params():
 
     with pytest.raises(TypeError, match="headers require a remote"):
         merge_mcp_auth(params, MCPAuth(headers={"Authorization": "Bearer t"}))
+
+
+# ── DatadogMCPAuth ────────────────────────────────────────────────────────────
+
+
+async def test_datadog_auth_reads_env(monkeypatch):
+    monkeypatch.setenv("DD_API_KEY", "test-api-key")
+    monkeypatch.setenv("DD_APP_KEY", "test-app-key")
+
+    auth = DatadogMCPAuth()
+    resolved = await auth.get_auth()
+
+    assert resolved.headers == {
+        "DD-Api-Key": "test-api-key",
+        "DD-Application-Key": "test-app-key",
+    }
+
+
+async def test_datadog_auth_explicit_keys():
+    auth = DatadogMCPAuth(api_key="ak", app_key="appk")
+    resolved = await auth.get_auth()
+
+    assert resolved.headers["DD-Api-Key"] == "ak"
+    assert resolved.headers["DD-Application-Key"] == "appk"
+
+
+def test_datadog_auth_url_default_site():
+    auth = DatadogMCPAuth(api_key="k", app_key="k")
+    assert auth.url == "https://mcp.datadoghq.com/"
+
+
+def test_datadog_auth_url_custom_site():
+    auth = DatadogMCPAuth(api_key="k", app_key="k", site="us5.datadoghq.com")
+    assert auth.url == "https://mcp.us5.datadoghq.com/"
+
+
+def test_datadog_auth_raises_without_api_key(monkeypatch):
+    monkeypatch.delenv("DD_API_KEY", raising=False)
+    monkeypatch.delenv("DD_APP_KEY", raising=False)
+
+    with pytest.raises(ValueError, match="DD_API_KEY"):
+        DatadogMCPAuth()
+
+
+def test_datadog_auth_raises_without_app_key(monkeypatch):
+    monkeypatch.delenv("DD_APP_KEY", raising=False)
+
+    with pytest.raises(ValueError, match="DD_APP_KEY"):
+        DatadogMCPAuth(api_key="k")
+
+
+# ── StreamableHttpServerParams + merge_mcp_auth ──────────────────────────────
+
+
+def test_merge_auth_into_streamable_http_params():
+    params = StreamableHttpServerParams(url="https://mcp.datadoghq.com/")
+    auth = MCPAuth(headers={"DD-Api-Key": "k1", "DD-Application-Key": "k2"})
+
+    merged = merge_mcp_auth(params, auth)
+
+    assert isinstance(merged, StreamableHttpServerParams)
+    assert merged.url == "https://mcp.datadoghq.com/"
+    assert merged.headers == {"DD-Api-Key": "k1", "DD-Application-Key": "k2"}
+
+
+def test_merge_auth_into_streamable_http_params_merges_existing_headers():
+    params = StreamableHttpServerParams(
+        url="https://mcp.datadoghq.com/",
+        headers={"X-Custom": "existing"},
+    )
+    auth = MCPAuth(headers={"DD-Api-Key": "k1"})
+
+    merged = merge_mcp_auth(params, auth)
+
+    assert merged.headers == {"X-Custom": "existing", "DD-Api-Key": "k1"}
+    # original not mutated
+    assert params.headers == {"X-Custom": "existing"}
+
+
+def test_merge_auth_preserves_streamable_http_timeout():
+    params = StreamableHttpServerParams(url="https://mcp.datadoghq.com/", timeout=60.0)
+    merged = merge_mcp_auth(params, MCPAuth(headers={"DD-Api-Key": "k"}))
+
+    assert merged.timeout == 60.0
