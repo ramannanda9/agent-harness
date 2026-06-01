@@ -708,11 +708,18 @@ class BaseAgent:
                     "summarizations": self._working_memory.summarization_count,
                 },
             )
-        if after_usage != before_usage:
+        llm_usage = getattr(self._llm, "last_usage", None) or {}
+        if llm_usage or after_usage != before_usage:
             yield BusEvent(
                 type=EventType.CONTEXT,
                 agent_id=self.config.agent_id,
-                payload=after_usage,
+                payload={
+                    **after_usage,
+                    "tokens_in": llm_usage.get("tokens_in"),
+                    "tokens_out": llm_usage.get("tokens_out"),
+                    "cache_read_tokens": llm_usage.get("cache_read_tokens"),
+                    "cache_creation_tokens": llm_usage.get("cache_creation_tokens"),
+                },
             )
 
         yield BusEvent(

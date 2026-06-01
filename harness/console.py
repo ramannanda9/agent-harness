@@ -123,9 +123,19 @@ class ConsoleRenderer:
             pct = float(p.get("percent") or 0.0) * 100
             level = p.get("level") or "normal"
             suffix = "" if level == "normal" else f"  {level}"
+            llm_parts: list[str] = []
+            if p.get("tokens_in") is not None:
+                llm_parts.append(f"in={int(p['tokens_in']):,}")
+            if p.get("tokens_out") is not None:
+                llm_parts.append(f"out={int(p['tokens_out']):,}")
+            if p.get("cache_read_tokens"):
+                llm_parts.append(f"cache_hit={int(p['cache_read_tokens']):,}")
+            if p.get("cache_creation_tokens"):
+                llm_parts.append(f"cache_new={int(p['cache_creation_tokens']):,}")
+            llm_suffix = f"  [{' '.join(llm_parts)}]" if llm_parts else ""
             print(
                 f"{self._label(event)} ctx     {tokens:,} / {max_tokens:,} tokens  "
-                f"{pct:.0f}%{suffix}",
+                f"{pct:.0f}%{suffix}{llm_suffix}",
                 file=self._out,
             )
 
