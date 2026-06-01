@@ -10,10 +10,12 @@ import pytest
 from tools.mcp.auth import (
     ApiKeyMCPAuth,
     BearerMCPAuth,
+    BrowserOAuthMCPAuth,
     MCPAuth,
     OAuthMCPAuth,
     StaticMCPAuth,
     StreamableHttpServerParams,
+    _FileTokenStorage,
     merge_mcp_auth,
 )
 
@@ -183,3 +185,184 @@ def test_merge_auth_preserves_streamable_http_timeout():
     merged = merge_mcp_auth(params, MCPAuth(headers={"DD-Api-Key": "k"}))
 
     assert merged.timeout == 60.0
+
+
+# ── _FileTokenStorage ─────────────────────────────────────────────────────────
+
+
+async def test_file_token_storage_roundtrips_tokens(tmp_path):
+    from mcp.shared.auth import OAuthToken
+
+    storage = _FileTokenStorage(tmp_path / "auth.json", "mcp:svc")
+    assert await storage.get_tokens() is None
+
+    tok = OAuthToken(access_token="A", token_type="Bearer", expires_in=3600, refresh_token="R")
+    await storage.set_tokens(tok)
+
+    loaded = await storage.get_tokens()
+    assert loaded.access_token == "A"
+    assert loaded.refresh_token == "R"
+
+
+async def test_file_token_storage_roundtrips_client_info(tmp_path):
+    from mcp.shared.auth import OAuthClientInformationFull
+
+    storage = _FileTokenStorage(tmp_path / "auth.json", "mcp:svc")
+    assert await storage.get_client_info() is None
+
+    info = OAuthClientInformationFull(
+        client_id="cid",
+        client_secret="csec",
+        redirect_uris=["http://127.0.0.1:8765/callback"],
+    )
+    await storage.set_client_info(info)
+
+    loaded = await storage.get_client_info()
+    assert loaded.client_id == "cid"
+    assert loaded.client_secret == "csec"
+
+
+async def test_file_token_storage_keeps_unrelated_entries(tmp_path):
+    """Writing MCP entries must not clobber existing claude-code/openai-codex entries."""
+    import json
+
+    from mcp.shared.auth import OAuthToken
+
+    path = tmp_path / "auth.json"
+    path.write_text(
+        json.dumps(
+            {
+                "claude-code": {"type": "oauth", "access": "X", "refresh": "Y"},
+            }
+        )
+    )
+
+    storage = _FileTokenStorage(path, "mcp:svc")
+    await storage.set_tokens(OAuthToken(access_token="A", token_type="Bearer"))
+
+    data = json.loads(path.read_text())
+    assert data["claude-code"]["access"] == "X"  # not clobbered
+    assert data["mcp:svc"]["tokens"]["access_token"] == "A"
+
+
+def test_file_token_storage_writes_0600(tmp_path):
+    import asyncio
+    import os
+
+    from mcp.shared.auth import OAuthToken
+
+    if os.name == "nt":
+        pytest.skip("POSIX permission semantics only")
+
+    path = tmp_path / "auth.json"
+    storage = _FileTokenStorage(path, "mcp:svc")
+    asyncio.run(storage.set_tokens(OAuthToken(access_token="A", token_type="Bearer")))
+
+    mode = path.stat().st_mode & 0o777
+    assert mode == 0o600
+
+
+# ── BrowserOAuthMCPAuth ───────────────────────────────────────────────────────
+
+
+async def test_browser_oauth_get_auth_returns_empty():
+    """OAuth flow happens via httpx_auth; get_auth() must return an empty MCPAuth."""
+    auth = BrowserOAuthMCPAuth(
+        server_url="https://mcp.example.com/",
+        provider_name="mcp:example",
+    )
+    resolved = await auth.get_auth()
+    assert resolved.headers == {}
+    assert resolved.env == {}
+
+
+def test_browser_oauth_httpx_auth_constructs_lazily():
+    """Provider should not touch the MCP SDK until httpx_auth is accessed."""
+    auth = BrowserOAuthMCPAuth(
+        server_url="https://mcp.example.com/",
+        provider_name="mcp:example",
+        scopes=["read", "write"],
+    )
+    assert auth._provider is None
+
+    provider = auth.httpx_auth
+    assert provider is not None
+    # Second access returns the same instance — cached.
+    assert auth.httpx_auth is provider
+
+
+async def test_browser_oauth_static_client_id_seeds_storage(tmp_path):
+    """Pre-registered client_id should be written to storage so the SDK skips
+    dynamic registration (which would fail against providers that don't
+    support RFC 7591)."""
+    auth_file = tmp_path / "auth.json"
+    auth = BrowserOAuthMCPAuth(
+        server_url="https://mcp.example.com/",
+        provider_name="mcp:example",
+        client_id="my-client-id",
+        client_secret="my-secret",
+        auth_file=auth_file,
+    )
+    # Trigger lazy construction.
+    _ = auth.httpx_auth
+
+    storage = _FileTokenStorage(auth_file, "mcp:example")
+    info = await storage.get_client_info()
+    assert info is not None
+    assert info.client_id == "my-client-id"
+    assert info.client_secret == "my-secret"
+
+
+def test_browser_oauth_does_not_reseed_matching_client_id(tmp_path):
+    """When storage already has client_info matching the supplied client_id,
+    leave it alone (avoids touching the file on every construct)."""
+    import json
+
+    auth_file = tmp_path / "auth.json"
+    auth_file.write_text(
+        json.dumps(
+            {
+                "mcp:example": {
+                    "type": "mcp-oauth",
+                    "client_info": {
+                        "client_id": "static-client-id",
+                        "redirect_uris": ["http://127.0.0.1:8765/callback"],
+                    },
+                    "tokens": {"access_token": "keep-me", "token_type": "Bearer"},
+                }
+            }
+        )
+    )
+
+    auth = BrowserOAuthMCPAuth(
+        server_url="https://mcp.example.com/",
+        provider_name="mcp:example",
+        client_id="static-client-id",
+        auth_file=auth_file,
+    )
+    _ = auth.httpx_auth
+
+    data = json.loads(auth_file.read_text())
+    assert data["mcp:example"]["tokens"]["access_token"] == "keep-me"
+
+
+def test_browser_oauth_reseeds_stale_entry_missing_client_info(tmp_path):
+    """A previous run without client_id can leave a stale entry. We must
+    write client_info into it so the SDK skips dynamic registration."""
+    import json
+
+    auth_file = tmp_path / "auth.json"
+    auth_file.write_text(
+        json.dumps({"mcp:example": {"type": "mcp-oauth"}})  # no client_info
+    )
+
+    auth = BrowserOAuthMCPAuth(
+        server_url="https://mcp.example.com/",
+        provider_name="mcp:example",
+        client_id="static-client-id",
+        auth_file=auth_file,
+    )
+    _ = auth.httpx_auth
+
+    data = json.loads(auth_file.read_text())
+    assert data["mcp:example"]["client_info"]["client_id"] == "static-client-id"

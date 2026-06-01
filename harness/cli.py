@@ -79,11 +79,13 @@ def main() -> int:
 
 
 async def _login_openai_codex(path: Path) -> int:
+    from harness.oauth_browser import open_or_print_url
+
     client = OpenAICodexOAuthClient()
     try:
         device = await client.request_device_code()
         print("OpenAI Codex login")
-        print(f"Open: {device.verification_uri}")
+        open_or_print_url(device.verification_uri, prefix="Open:")
         print(f"Code: {device.user_code}")
         print("Waiting for authorization...")
         cred = await client.poll_device_code(device)
@@ -95,11 +97,16 @@ async def _login_openai_codex(path: Path) -> int:
 
 
 async def _login_claude_code(path: Path) -> int:
+    from harness.oauth_browser import open_or_print_url
+
     client = AnthropicClaudeCodeOAuthClient()
     try:
         login = client.begin_login()
         print("Claude Code login")
-        print(f"Open: {login.url}")
+        # Anthropic owns the redirect URI (console.anthropic.com), so we
+        # can't auto-capture the callback here. Best we can do is open the
+        # browser for the user and let them paste the result.
+        open_or_print_url(login.url, prefix="Open:")
         print("Paste the final callback URL, or the code#state value.")
         callback_input = input("Callback: ")
         cred = await client.finish_login(login, callback_input)

@@ -158,7 +158,14 @@ class MCPServerConnection:
         await self._exit_stack.__aenter__()
 
         try:
-            auth = await self._auth_provider.get_auth() if self._auth_provider else None
+            # OAuth (httpx.Auth) providers bypass the static-headers path —
+            # the transport client drives the OAuth dance itself.
+            httpx_auth = getattr(self._auth_provider, "httpx_auth", None)
+            auth = (
+                await self._auth_provider.get_auth()
+                if self._auth_provider and httpx_auth is None
+                else None
+            )
             auth_headers = dict(auth.headers) if auth else {}
 
             if isinstance(self._params, StreamableHttpServerParams):
@@ -171,6 +178,7 @@ class MCPServerConnection:
                         headers=headers or None,
                         timeout=self._params.timeout,
                         sse_read_timeout=self._params.sse_read_timeout,
+                        auth=httpx_auth,
                     )
                 )
             elif isinstance(self._params, StdioServerParameters):
@@ -180,7 +188,7 @@ class MCPServerConnection:
                 from mcp.client.sse import sse_client
 
                 read, write = await self._exit_stack.enter_async_context(
-                    sse_client(self._params, headers=auth_headers or None)
+                    sse_client(self._params, headers=auth_headers or None, auth=httpx_auth)
                 )
             elif isinstance(self._params, dict) and "url" in self._params:
                 from mcp.client.sse import sse_client
@@ -189,6 +197,8 @@ class MCPServerConnection:
                     **self._params,
                     "headers": {**self._params.get("headers", {}), **auth_headers},
                 }
+                if httpx_auth is not None:
+                    merged["auth"] = httpx_auth
                 read, write = await self._exit_stack.enter_async_context(sse_client(**merged))
             else:
                 raise TypeError(

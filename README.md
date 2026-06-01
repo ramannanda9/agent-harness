@@ -44,6 +44,7 @@ harness/steering.py         Async steering — agent.steer(text), StdinRouter pu
 harness/checkpoint.py       CheckpointStore + _ResumeHint + maybe_resume_key — pluggable run-state persistence (file + Redis); auto-resume built into dispatch_stream / run_stream
 harness/otel.py             OTELHook — OpenTelemetry span exporter (opt-in)
 harness/executor_bridge.py  ExecutorBridge + ExecutorTool — controlled subprocess launcher with optional Docker sandboxing
+harness/oauth_browser.py    Localhost OAuth callback server + open_or_print_url — shared by MCP browser-OAuth and LLM login flows
 orchestrator/planner.py     Hybrid DAG orchestrator — plan, replan, synthesize
 agents/base.py              Generic BaseAgent — ReAct loop, no subclassing needed
 memory/manager.py           MemoryManager — semantic KV + episodic vector
@@ -592,47 +593,78 @@ async with MCPServerConnection(params, server_name="filesystem") as conn:
     result = await runtime.run("list files in /tmp")
 ```
 
-Supports **stdio** and **SSE** transports. The `MCPServerConnection` context
-manager handles the full lifecycle — connect, discover, and cleanup.
+Supports **stdio**, **SSE**, and **streamable-HTTP** transports. The
+`MCPServerConnection` context manager handles the full lifecycle —
+connect, discover, and cleanup.
 
-Remote MCP servers can receive static headers or bearer tokens through an auth
-provider:
+### Auth options
+
+Pick the provider that matches how your MCP server authenticates:
+
+| Provider | When to use |
+|---|---|
+| `StaticMCPAuth` | Literal header/env values you have in hand |
+| `BearerMCPAuth` | A single bearer token string |
+| `ApiKeyMCPAuth` | API-key headers backed by environment variables |
+| `OAuthMCPAuth` | Bearer token cached in the shared `auth.json` file |
+| `BrowserOAuthMCPAuth` | Full OAuth 2.0 + PKCE flow with browser login |
+
+**API keys backed by env vars** — generic, no vendor coupling:
 
 ```python
 import os
-from tools.mcp import MCPServerConnection, StaticMCPAuth
+from tools.mcp.auth import ApiKeyMCPAuth, StreamableHttpServerParams
+from tools.mcp import MCPServerConnection
 
-auth = StaticMCPAuth(
-    headers={
-        "DD_API_KEY": os.environ["DD_API_KEY"],
-        "DD_APPLICATION_KEY": os.environ["DD_APPLICATION_KEY"],
-    }
-)
+auth = ApiKeyMCPAuth({
+    "DD-Api-Key": "DD_API_KEY",
+    "DD-Application-Key": "DD_APP_KEY",
+})
+params = StreamableHttpServerParams(url="https://mcp.datadoghq.com/")
 
-async with MCPServerConnection(
-    {"url": "https://mcp.datadoghq.com/api/unstable/mcp-server/mcp"},
-    server_name="datadog",
-    auth=auth,
-) as conn:
+async with MCPServerConnection(params, server_name="datadog", auth=auth) as conn:
     conn.register_tools(tool_registry)
 ```
 
-OAuth-style auth files can be reused for MCP bearer auth:
+**Browser-based OAuth (PKCE) for hosted MCP servers**:
 
 ```python
-from tools.mcp import MCPServerConnection, OAuthMCPAuth
+from tools.mcp.auth import BrowserOAuthMCPAuth, StreamableHttpServerParams
+from tools.mcp import MCPServerConnection
+
+auth = BrowserOAuthMCPAuth(
+    server_url="https://mcp.example.com/",
+    provider_name="mcp:example",
+    client_id="abc123",         # from the provider's developer console
+    client_secret="shh",        # optional (PKCE-only flows omit)
+    scopes=["read", "write"],
+)
+params = StreamableHttpServerParams(url="https://mcp.example.com/")
+
+async with MCPServerConnection(params, auth=auth) as conn:
+    conn.register_tools(tool_registry)
+```
+
+First connect opens the browser, captures the redirect on
+`http://127.0.0.1:8765/callback`, persists tokens to
+`~/.agent-harness/auth/auth.json` (chmod 0600), and refreshes them
+transparently on every subsequent run. Register your OAuth app with that
+redirect URI.
+
+Servers that support RFC 7591 dynamic client registration work without
+supplying `client_id` — the MCP SDK registers a fresh client on first
+connect.
+
+**Cached OAuth from the auth.json file** (for tokens you already minted
+elsewhere):
+
+```python
+from tools.mcp import OAuthMCPAuth, MCPServerConnection
 
 auth = OAuthMCPAuth.from_auth_file(
     "~/.agent-harness/auth/auth.json",
-    provider="datadog-mcp",
+    provider="my-service",
 )
-
-async with MCPServerConnection(
-    {"url": "https://mcp.datadoghq.com/api/unstable/mcp-server/mcp"},
-    server_name="datadog",
-    auth=auth,
-) as conn:
-    conn.register_tools(tool_registry)
 ```
 
 See `examples/mcp_demo.py` for local stdio MCP and `examples/mcp_auth_demo.py`
