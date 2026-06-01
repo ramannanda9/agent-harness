@@ -115,17 +115,14 @@ def test_headers_are_rejected_for_stdio_params():
 # ── ApiKeyMCPAuth ─────────────────────────────────────────────────────────────
 
 
-async def test_api_key_auth_reads_env(monkeypatch):
-    monkeypatch.setenv("DD_API_KEY", "test-api-key")
-    monkeypatch.setenv("DD_APP_KEY", "test-app-key")
+async def test_api_key_auth_reads_multiple_env_vars(monkeypatch):
+    monkeypatch.setenv("SVC_KEY", "key-value")
+    monkeypatch.setenv("SVC_SECRET", "secret-value")
 
-    auth = ApiKeyMCPAuth({"DD-Api-Key": "DD_API_KEY", "DD-Application-Key": "DD_APP_KEY"})
+    auth = ApiKeyMCPAuth({"X-Service-Key": "SVC_KEY", "X-Service-Secret": "SVC_SECRET"})
     resolved = await auth.get_auth()
 
-    assert resolved.headers == {
-        "DD-Api-Key": "test-api-key",
-        "DD-Application-Key": "test-app-key",
-    }
+    assert resolved.headers == {"X-Service-Key": "key-value", "X-Service-Secret": "secret-value"}
 
 
 async def test_api_key_auth_single_header(monkeypatch):
@@ -138,19 +135,19 @@ async def test_api_key_auth_single_header(monkeypatch):
 
 
 def test_api_key_auth_raises_on_missing_env(monkeypatch):
-    monkeypatch.delenv("DD_API_KEY", raising=False)
-    monkeypatch.delenv("DD_APP_KEY", raising=False)
+    monkeypatch.delenv("SVC_KEY", raising=False)
+    monkeypatch.delenv("SVC_SECRET", raising=False)
 
-    with pytest.raises(ValueError, match="DD_API_KEY"):
-        ApiKeyMCPAuth({"DD-Api-Key": "DD_API_KEY", "DD-Application-Key": "DD_APP_KEY"})
+    with pytest.raises(ValueError, match="SVC_KEY"):
+        ApiKeyMCPAuth({"X-Service-Key": "SVC_KEY", "X-Service-Secret": "SVC_SECRET"})
 
 
 def test_api_key_auth_raises_on_partial_missing_env(monkeypatch):
-    monkeypatch.setenv("DD_API_KEY", "present")
-    monkeypatch.delenv("DD_APP_KEY", raising=False)
+    monkeypatch.setenv("SVC_KEY", "present")
+    monkeypatch.delenv("SVC_SECRET", raising=False)
 
-    with pytest.raises(ValueError, match="DD_APP_KEY"):
-        ApiKeyMCPAuth({"DD-Api-Key": "DD_API_KEY", "DD-Application-Key": "DD_APP_KEY"})
+    with pytest.raises(ValueError, match="SVC_SECRET"):
+        ApiKeyMCPAuth({"X-Service-Key": "SVC_KEY", "X-Service-Secret": "SVC_SECRET"})
 
 
 # ── StreamableHttpServerParams + merge_mcp_auth ──────────────────────────────
