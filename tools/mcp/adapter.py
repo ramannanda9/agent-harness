@@ -4,7 +4,7 @@ MCP (Model Context Protocol) adapter for the agent harness.
 Connects to any MCP-compatible server and registers its tools into
 the harness's ToolRegistry, making them available to agents.
 
-Supports stdio and SSE transports.
+Supports stdio, SSE, and streamable-HTTP transports.
 
 Install:
     pip install -e ".[mcp]"
@@ -19,6 +19,34 @@ Usage (context manager — recommended):
     async with MCPServerConnection(params, server_name="filesystem") as conn:
         conn.register_tools(tool_registry)
         result = await runtime.run("list files in /tmp")
+
+Streamable-HTTP with API keys (env-var backed):
+
+    from tools.mcp.auth import ApiKeyMCPAuth, StreamableHttpServerParams
+
+    auth = ApiKeyMCPAuth({
+        "X-Api-Key": "MY_SERVICE_API_KEY",
+        "X-App-Key": "MY_SERVICE_APP_KEY",
+    })
+    params = StreamableHttpServerParams(url="https://mcp.example.com/")
+
+    async with MCPServerConnection(params, auth=auth) as conn:
+        conn.register_tools(tool_registry)
+        result = await runtime.run("...")
+
+Streamable-HTTP with OAuth token (auth file backed):
+
+    from tools.mcp.auth import OAuthMCPAuth, StreamableHttpServerParams
+
+    auth = OAuthMCPAuth.from_auth_file(
+        "~/.agent-harness/auth/auth.json",
+        provider="my-service",
+    )
+    params = StreamableHttpServerParams(url="https://mcp.example.com/")
+
+    async with MCPServerConnection(params, auth=auth) as conn:
+        conn.register_tools(tool_registry)
+        result = await runtime.run("...")
 
 Usage (manual lifecycle):
 
@@ -38,7 +66,7 @@ import logging
 from contextlib import AsyncExitStack
 from typing import Any
 
-from tools.mcp.auth import MCPAuthProvider, merge_mcp_auth
+from tools.mcp.auth import MCPAuthProvider, StreamableHttpServerParams, merge_mcp_auth
 
 logger = logging.getLogger(__name__)
 
@@ -131,25 +159,42 @@ class MCPServerConnection:
 
         try:
             auth = await self._auth_provider.get_auth() if self._auth_provider else None
-            params = merge_mcp_auth(self._params, auth)
+            auth_headers = dict(auth.headers) if auth else {}
 
-            if isinstance(params, StdioServerParameters):
+            if isinstance(self._params, StreamableHttpServerParams):
+                from mcp.client.streamable_http import streamablehttp_client
+
+                headers = {**self._params.headers, **auth_headers}
+                read, write, _ = await self._exit_stack.enter_async_context(
+                    streamablehttp_client(
+                        self._params.url,
+                        headers=headers or None,
+                        timeout=self._params.timeout,
+                        sse_read_timeout=self._params.sse_read_timeout,
+                    )
+                )
+            elif isinstance(self._params, StdioServerParameters):
+                params = merge_mcp_auth(self._params, auth)
                 read, write = await self._exit_stack.enter_async_context(stdio_client(params))
-            elif isinstance(params, str):
-                # SSE transport: params is a URL string
+            elif isinstance(self._params, str):
                 from mcp.client.sse import sse_client
 
-                read, write = await self._exit_stack.enter_async_context(sse_client(params))
-            elif isinstance(params, dict) and "url" in params:
-                # SSE transport: params as dict with url + optional headers
+                read, write = await self._exit_stack.enter_async_context(
+                    sse_client(self._params, headers=auth_headers or None)
+                )
+            elif isinstance(self._params, dict) and "url" in self._params:
                 from mcp.client.sse import sse_client
 
-                read, write = await self._exit_stack.enter_async_context(sse_client(**params))
+                merged = {
+                    **self._params,
+                    "headers": {**self._params.get("headers", {}), **auth_headers},
+                }
+                read, write = await self._exit_stack.enter_async_context(sse_client(**merged))
             else:
                 raise TypeError(
-                    f"Unsupported server_params type: {type(params)}. "
-                    "Use StdioServerParameters, an SSE URL string, or "
-                    "a dict with 'url' key."
+                    f"Unsupported server_params type: {type(self._params)}. "
+                    "Use StdioServerParameters, StreamableHttpServerParams, "
+                    "an SSE URL string, or a dict with 'url' key."
                 )
 
             self._session = await self._exit_stack.enter_async_context(ClientSession(read, write))

@@ -1,4 +1,4 @@
-"""Authentication helpers for MCP server connections."""
+"""Authentication helpers and connection parameter types for MCP servers."""
 
 from __future__ import annotations
 
@@ -9,6 +9,30 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from harness.llm.auth import AuthFileOAuthProvider
+
+
+@dataclass
+class StreamableHttpServerParams:
+    """Connection parameters for an MCP server using the streamable-HTTP transport.
+
+    Headers supplied here are merged with those from the MCPAuthProvider before
+    the connection is opened.
+
+    Example::
+
+        # API-key auth
+        auth = ApiKeyMCPAuth({"X-Api-Key": "MY_SERVICE_KEY"})
+        # or OAuth from auth file
+        # auth = OAuthMCPAuth.from_auth_file("~/.agent-harness/auth/auth.json", provider="svc")
+        params = StreamableHttpServerParams(url="https://mcp.example.com/")
+        async with MCPServerConnection(params, auth=auth) as conn:
+            ...
+    """
+
+    url: str
+    headers: dict[str, str] = field(default_factory=dict)
+    timeout: float = 30.0
+    sse_read_timeout: float = 300.0
 
 
 @dataclass(frozen=True)
@@ -91,11 +115,49 @@ class OAuthMCPAuth:
         return MCPAuth(headers={self._header_name: f"Bearer {cred.access}"})
 
 
+class ApiKeyMCPAuth:
+    """Header-based auth where values are read from environment variables.
+
+    Maps HTTP header names to environment variable names. Suitable for any
+    remote MCP server that authenticates via API keys in request headers.
+
+    Example — Datadog::
+
+        auth = ApiKeyMCPAuth({
+            "DD-Api-Key": "DD_API_KEY",
+            "DD-Application-Key": "DD_APP_KEY",
+        })
+        params = StreamableHttpServerParams(url="https://mcp.datadoghq.com/")
+        async with MCPServerConnection(params, auth=auth) as conn:
+            ...
+
+    Example — single-key service::
+
+        auth = ApiKeyMCPAuth({"Authorization": "MY_SERVICE_TOKEN"})
+
+    Raises ``ValueError`` at construction time if any mapped environment
+    variable is absent or empty, so misconfiguration fails fast.
+    """
+
+    def __init__(self, header_env_map: dict[str, str]) -> None:
+        missing = [env for env in header_env_map.values() if not os.environ.get(env)]
+        if missing:
+            raise ValueError(f"Missing or empty environment variable(s): {', '.join(missing)}")
+        self._map = dict(header_env_map)
+
+    async def get_auth(self) -> MCPAuth:
+        return MCPAuth(headers={header: os.environ[env] for header, env in self._map.items()})
+
+
 def merge_mcp_auth(server_params: Any, auth: MCPAuth | None) -> Any:
     """Return server params with auth applied without mutating caller input."""
 
     if auth is None or (not auth.headers and not auth.env):
         return server_params
+
+    if isinstance(server_params, StreamableHttpServerParams):
+        merged_headers = {**dict(server_params.headers or {}), **dict(auth.headers)}
+        return dataclasses.replace(server_params, headers=merged_headers)
 
     if isinstance(server_params, str):
         params: dict[str, Any] = {"url": server_params}
