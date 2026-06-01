@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from collections.abc import Callable
 
 import pytest
 from prompt_toolkit.input import create_pipe_input
@@ -68,9 +69,34 @@ def _piped_router():
         yield router, pipe_in
 
 
-async def _drain(timeout: float = 0.1) -> None:
-    """Let the router process pending input. Small await for the read loop."""
-    await asyncio.sleep(timeout)
+async def _drain(
+    predicate: Callable[[], bool] | None = None,
+    *,
+    timeout: float = 2.0,
+    poll_interval: float = 0.01,
+) -> None:
+    """Let the router process pending input.
+
+    Two modes:
+      - ``predicate`` given: poll until it returns True or ``timeout`` elapses.
+        Use this whenever the test has an observable post-condition (e.g.
+        ``lambda: len(received) >= 1``) — gives deterministic, fast results
+        even on loaded machines.
+      - ``predicate`` None: best-effort short sleep for tests that want to
+        verify a side effect (stderr warning) with no list to poll.
+
+    The old fixed-sleep behaviour was flaky under load.
+    """
+    if predicate is None:
+        await asyncio.sleep(0.2)
+        return
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        if predicate():
+            return
+        await asyncio.sleep(poll_interval)
+    raise AssertionError(f"_drain predicate did not become True within {timeout}s")
 
 
 # ── Core: BaseAgent.steer() + drain ───────────────────────────────────────────
@@ -323,7 +349,7 @@ async def test_router_routes_to_catchall_subscriber():
         router.subscribe(None, received.append)
         await router.start()
         pipe_in.send_text("plain line\r")
-        await _drain()
+        await _drain(lambda: len(received) >= 1)
         await router.stop()
     assert received == ["plain line"]
 
@@ -337,9 +363,9 @@ async def test_router_routes_by_prefix():
         router.subscribe("b", b_received.append)
         await router.start()
         pipe_in.send_text("a: hello a\r")
-        await _drain()
+        await _drain(lambda: len(a_received) >= 1)
         pipe_in.send_text("b: hello b\r")
-        await _drain()
+        await _drain(lambda: len(b_received) >= 1)
         await router.stop()
     assert a_received == ["hello a"]
     assert b_received == ["hello b"]
@@ -354,7 +380,7 @@ async def test_router_broadcast_with_star():
         router.subscribe("b", b_received.append)
         await router.start()
         pipe_in.send_text("*: stop everyone\r")
-        await _drain()
+        await _drain(lambda: a_received and b_received)
         await router.stop()
     assert a_received == ["stop everyone"]
     assert b_received == ["stop everyone"]
@@ -369,7 +395,7 @@ async def test_router_multiline_input_via_ctrl_j():
         await router.start()
         # Type "a: line one" + Ctrl+J + "line two" + Enter
         pipe_in.send_text("a: line one\nline two\r")
-        await _drain()
+        await _drain(lambda: len(received) >= 1)
         await router.stop()
     assert received == ["line one\nline two"]
 
@@ -406,9 +432,12 @@ async def test_router_unsubscribe_removes_subscription():
         sid = router.subscribe("a", received.append)
         await router.start()
         pipe_in.send_text("a: first\r")
-        await _drain()
+        await _drain(lambda: len(received) >= 1)
         router.unsubscribe(sid)
         pipe_in.send_text("a: second\r")
+        # No subscriber after unsubscribe — fall back to the unconditional
+        # short sleep (no list to grow). The post-condition is the final
+        # `assert received == ["first"]`, which catches accidental delivery.
         await _drain()
         await router.stop()
     assert received == ["first"]
@@ -449,7 +478,7 @@ async def test_stdin_single_agent_no_prefix_needed():
         try:
             async with StdinSteer(a, router=router, patch_stdout_=False):
                 pipe_in.send_text("just do it\r")
-                await _drain()
+                await _drain(lambda: len(a.steered) >= 1)
         finally:
             await router.stop()
     assert a.steered == ["just do it"]
@@ -463,7 +492,7 @@ async def test_stdin_single_agent_prefix_also_works():
         try:
             async with StdinSteer(a, router=router, patch_stdout_=False):
                 pipe_in.send_text("a: explicit\r")
-                await _drain()
+                await _drain(lambda: len(a.steered) >= 1)
         finally:
             await router.stop()
     assert a.steered == ["explicit"]
@@ -478,9 +507,9 @@ async def test_stdin_multi_agent_prefix_routes():
         try:
             async with StdinSteer([a, b], router=router, patch_stdout_=False):
                 pipe_in.send_text("a: do A\r")
-                await _drain()
+                await _drain(lambda: len(a.steered) >= 1)
                 pipe_in.send_text("b: do B\r")
-                await _drain()
+                await _drain(lambda: len(b.steered) >= 1)
         finally:
             await router.stop()
     assert a.steered == ["do A"]
@@ -496,7 +525,7 @@ async def test_stdin_multi_agent_broadcast():
         try:
             async with StdinSteer([a, b], router=router, patch_stdout_=False):
                 pipe_in.send_text("*: stop now\r")
-                await _drain()
+                await _drain(lambda: a.steered and b.steered)
         finally:
             await router.stop()
     assert a.steered == ["stop now"]
