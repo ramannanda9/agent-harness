@@ -20,13 +20,16 @@ Usage (context manager — recommended):
         conn.register_tools(tool_registry)
         result = await runtime.run("list files in /tmp")
 
-Streamable-HTTP (e.g. Datadog):
+Streamable-HTTP (e.g. Datadog, any API-key-gated MCP SaaS):
 
     from tools.mcp.adapter import StreamableHttpServerParams
-    from tools.mcp.auth import DatadogMCPAuth
+    from tools.mcp.auth import ApiKeyMCPAuth
 
-    auth = DatadogMCPAuth()   # reads DD_API_KEY + DD_APP_KEY from env
-    params = StreamableHttpServerParams(url=auth.url)
+    auth = ApiKeyMCPAuth({
+        "DD-Api-Key": "DD_API_KEY",
+        "DD-Application-Key": "DD_APP_KEY",
+    })
+    params = StreamableHttpServerParams(url="https://mcp.datadoghq.com/")
 
     async with MCPServerConnection(params, server_name="datadog", auth=auth) as conn:
         conn.register_tools(tool_registry)
@@ -66,8 +69,8 @@ class StreamableHttpServerParams:
         from tools.mcp.adapter import StreamableHttpServerParams
         from tools.mcp.auth import DatadogMCPAuth
 
-        auth = DatadogMCPAuth()
-        params = StreamableHttpServerParams(url=auth.url)
+        auth = ApiKeyMCPAuth({"DD-Api-Key": "DD_API_KEY", "DD-Application-Key": "DD_APP_KEY"})
+        params = StreamableHttpServerParams(url="https://mcp.datadoghq.com/")
         async with MCPServerConnection(params, auth=auth) as conn:
             ...
     """

@@ -91,55 +91,38 @@ class OAuthMCPAuth:
         return MCPAuth(headers={self._header_name: f"Bearer {cred.access}"})
 
 
-class DatadogMCPAuth:
-    """API-key auth for Datadog's hosted MCP endpoint.
+class ApiKeyMCPAuth:
+    """Header-based auth where values are read from environment variables.
 
-    Reads credentials from environment variables by default::
+    Maps HTTP header names to environment variable names. Suitable for any
+    remote MCP server that authenticates via API keys in request headers.
 
-        DD_API_KEY=<key> DD_APP_KEY=<key> python my_agent.py
+    Example — Datadog::
 
-    Or pass them explicitly::
+        auth = ApiKeyMCPAuth({
+            "DD-Api-Key": "DD_API_KEY",
+            "DD-Application-Key": "DD_APP_KEY",
+        })
+        params = StreamableHttpServerParams(url="https://mcp.datadoghq.com/")
+        async with MCPServerConnection(params, auth=auth) as conn:
+            ...
 
-        auth = DatadogMCPAuth(api_key="...", app_key="...")
+    Example — single-key service::
 
-    The ``url`` property returns the correct MCP base URL for the configured
-    Datadog site (default ``datadoghq.com``; set ``site`` for EU/Gov/etc.)::
+        auth = ApiKeyMCPAuth({"Authorization": "MY_SERVICE_TOKEN"})
 
-        from tools.mcp.adapter import StreamableHttpServerParams
-        from tools.mcp.auth import DatadogMCPAuth
-
-        auth = DatadogMCPAuth()
-        params = StreamableHttpServerParams(url=auth.url)
-        async with MCPServerConnection(params, server_name="datadog", auth=auth) as conn:
-            conn.register_tools(tool_registry)
+    Raises ``ValueError`` at construction time if any mapped environment
+    variable is absent or empty, so misconfiguration fails fast.
     """
 
-    def __init__(
-        self,
-        *,
-        api_key: str | None = None,
-        app_key: str | None = None,
-        site: str = "datadoghq.com",
-    ) -> None:
-        self._api_key = api_key or os.environ.get("DD_API_KEY", "")
-        self._app_key = app_key or os.environ.get("DD_APP_KEY", "")
-        self._site = site
-        if not self._api_key:
-            raise ValueError("api_key or DD_API_KEY environment variable required")
-        if not self._app_key:
-            raise ValueError("app_key or DD_APP_KEY environment variable required")
-
-    @property
-    def url(self) -> str:
-        return f"https://mcp.{self._site}/"
+    def __init__(self, header_env_map: dict[str, str]) -> None:
+        missing = [env for env in header_env_map.values() if not os.environ.get(env)]
+        if missing:
+            raise ValueError(f"Missing or empty environment variable(s): {', '.join(missing)}")
+        self._map = dict(header_env_map)
 
     async def get_auth(self) -> MCPAuth:
-        return MCPAuth(
-            headers={
-                "DD-Api-Key": self._api_key,
-                "DD-Application-Key": self._app_key,
-            }
-        )
+        return MCPAuth(headers={header: os.environ[env] for header, env in self._map.items()})
 
 
 def merge_mcp_auth(server_params: Any, auth: MCPAuth | None) -> Any:

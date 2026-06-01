@@ -9,8 +9,8 @@ import pytest
 
 from tools.mcp.adapter import StreamableHttpServerParams
 from tools.mcp.auth import (
+    ApiKeyMCPAuth,
     BearerMCPAuth,
-    DatadogMCPAuth,
     MCPAuth,
     OAuthMCPAuth,
     StaticMCPAuth,
@@ -112,14 +112,14 @@ def test_headers_are_rejected_for_stdio_params():
         merge_mcp_auth(params, MCPAuth(headers={"Authorization": "Bearer t"}))
 
 
-# ── DatadogMCPAuth ────────────────────────────────────────────────────────────
+# ── ApiKeyMCPAuth ─────────────────────────────────────────────────────────────
 
 
-async def test_datadog_auth_reads_env(monkeypatch):
+async def test_api_key_auth_reads_env(monkeypatch):
     monkeypatch.setenv("DD_API_KEY", "test-api-key")
     monkeypatch.setenv("DD_APP_KEY", "test-app-key")
 
-    auth = DatadogMCPAuth()
+    auth = ApiKeyMCPAuth({"DD-Api-Key": "DD_API_KEY", "DD-Application-Key": "DD_APP_KEY"})
     resolved = await auth.get_auth()
 
     assert resolved.headers == {
@@ -128,37 +128,29 @@ async def test_datadog_auth_reads_env(monkeypatch):
     }
 
 
-async def test_datadog_auth_explicit_keys():
-    auth = DatadogMCPAuth(api_key="ak", app_key="appk")
+async def test_api_key_auth_single_header(monkeypatch):
+    monkeypatch.setenv("MY_TOKEN", "secret")
+
+    auth = ApiKeyMCPAuth({"Authorization": "MY_TOKEN"})
     resolved = await auth.get_auth()
 
-    assert resolved.headers["DD-Api-Key"] == "ak"
-    assert resolved.headers["DD-Application-Key"] == "appk"
+    assert resolved.headers == {"Authorization": "secret"}
 
 
-def test_datadog_auth_url_default_site():
-    auth = DatadogMCPAuth(api_key="k", app_key="k")
-    assert auth.url == "https://mcp.datadoghq.com/"
-
-
-def test_datadog_auth_url_custom_site():
-    auth = DatadogMCPAuth(api_key="k", app_key="k", site="us5.datadoghq.com")
-    assert auth.url == "https://mcp.us5.datadoghq.com/"
-
-
-def test_datadog_auth_raises_without_api_key(monkeypatch):
+def test_api_key_auth_raises_on_missing_env(monkeypatch):
     monkeypatch.delenv("DD_API_KEY", raising=False)
     monkeypatch.delenv("DD_APP_KEY", raising=False)
 
     with pytest.raises(ValueError, match="DD_API_KEY"):
-        DatadogMCPAuth()
+        ApiKeyMCPAuth({"DD-Api-Key": "DD_API_KEY", "DD-Application-Key": "DD_APP_KEY"})
 
 
-def test_datadog_auth_raises_without_app_key(monkeypatch):
+def test_api_key_auth_raises_on_partial_missing_env(monkeypatch):
+    monkeypatch.setenv("DD_API_KEY", "present")
     monkeypatch.delenv("DD_APP_KEY", raising=False)
 
     with pytest.raises(ValueError, match="DD_APP_KEY"):
-        DatadogMCPAuth(api_key="k")
+        ApiKeyMCPAuth({"DD-Api-Key": "DD_API_KEY", "DD-Application-Key": "DD_APP_KEY"})
 
 
 # ── StreamableHttpServerParams + merge_mcp_auth ──────────────────────────────
