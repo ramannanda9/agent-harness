@@ -46,6 +46,19 @@ def main() -> int:
     policy_clear = policy_sub.add_parser("clear", help="remove all policy rules")
     policy_clear.add_argument("--policy-file", default=str(default_policy_file()))
 
+    trace = sub.add_parser("trace", help="view or replay a recorded run trace")
+    trace_sub = trace.add_subparsers(dest="trace_command", required=True)
+    trace_view = trace_sub.add_parser("view", help="open a local web viewer for a trace")
+    trace_view.add_argument("path", help="path to a JSONL trace produced by record_trace")
+    trace_view.add_argument("--port", type=int, default=8765)
+    trace_view.add_argument("--no-open", action="store_true", help="don't auto-open the browser")
+    trace_replay = trace_sub.add_parser("replay", help="dump a trace to stdout via ConsoleRenderer")
+    trace_replay.add_argument("path", help="path to a JSONL trace produced by record_trace")
+    trace_replay.add_argument(
+        "--realtime", action="store_true", help="preserve recorded inter-event timing"
+    )
+    trace_replay.add_argument("--speed", type=float, default=1.0, help="realtime speed multiplier")
+
     args = parser.parse_args()
     try:
         if args.command == "login":
@@ -71,6 +84,16 @@ def main() -> int:
                 return _policy_revoke(path, args.rule_id)
             if args.policy_command == "clear":
                 return _policy_clear(path)
+        if args.command == "trace":
+            if args.trace_command == "view":
+                from harness.trace_viewer import serve
+
+                serve(args.path, port=args.port, open_browser=not args.no_open)
+                return 0
+            if args.trace_command == "replay":
+                return asyncio.run(
+                    _trace_replay(args.path, realtime=args.realtime, speed=args.speed)
+                )
     except Exception as e:
         print(f"agent-harness: {e}", file=sys.stderr)
         return 1
@@ -177,6 +200,17 @@ def _policy_revoke(path: Path, rule_id: str) -> int:
 def _policy_clear(path: Path) -> int:
     count = ToolPolicyStore(path).clear()
     print(f"Removed {count} policy rule(s)")
+    return 0
+
+
+async def _trace_replay(path: str, *, realtime: bool, speed: float) -> int:
+    """Read a JSONL trace and render it via ConsoleRenderer."""
+    from harness.console import ConsoleRenderer
+    from harness.trace import replay
+
+    renderer = ConsoleRenderer()
+    async for event in replay(path, realtime=realtime, speed=speed):
+        renderer.render(event)
     return 0
 
 

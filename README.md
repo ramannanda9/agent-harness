@@ -722,6 +722,49 @@ The OTEL hook is a side-channel on the existing `Tracer` — the in-memory trace
 is always available via `result["trace"]` regardless of whether OTEL is enabled.
 Zero overhead and zero imports when `enable_otel=False`.
 
+## Trace recorder + replay + local viewer
+
+For local debug and post-mortem inspection without an OTEL backend, the
+harness ships a JSONL trace recorder and a stdlib-only HTML viewer. Wrap
+any streaming call:
+
+```python
+from harness.trace import record_trace, replay
+
+async for event in record_trace(runtime.dispatch_stream(goal), "run.jsonl"):
+    ...  # your normal handling
+```
+
+Each `BusEvent` is flushed per-line, so a partial trace survives a crash.
+View the trace in your browser:
+
+```bash
+agent-harness trace view run.jsonl     # opens http://127.0.0.1:8765/
+```
+
+The viewer is a single embedded HTML page — vertical timeline, filter by
+agent / event type / text, expandable per-event JSON. No build step, no
+external services.
+
+Replay a trace through `ConsoleRenderer` (great for grepping or piping
+into another script):
+
+```bash
+agent-harness trace replay run.jsonl
+agent-harness trace replay run.jsonl --realtime --speed 2.0
+```
+
+Programmatic replay yields reconstructed `BusEvent` objects:
+
+```python
+async for event in replay("run.jsonl", realtime=False):
+    ...  # reuse the same loops you write for live streams
+```
+
+This is complementary to OTEL — OTEL is for production observability and
+long-term storage in Jaeger/Datadog; the JSONL recorder is for local
+debugging, sharing reproductions, and replaying past runs.
+
 ## Vision / multimodal agents
 
 `WorkingMemory` accepts `str | list` content so image blocks pass through to
