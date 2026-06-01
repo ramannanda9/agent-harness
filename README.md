@@ -36,6 +36,8 @@ events to stdout and prints elapsed time + cost at the end.
 harness/runtime.py          AgentRuntime — single entry point, wire once run anything
 harness/events.py           BusEvent + EventType — canonical event vocabulary
 harness/llm/openai.py       OpenAILLM — OpenAI adapter with usage + cost tracking
+harness/llm/fallback.py     FallbackLLM — transparent retry on transient upstream errors
+harness/llm/routing.py      RoutingLLM — dispatch calls to different adapters by a selector
 harness/annotation.py       Annotation store + AnnotationHook — RLHF trajectory capture
 harness/hitl.py             HITL approval gate — interactive CLI, session-allow list
 harness/tool_policy.py      Persistent tool policy — user-scoped allow rules, CLI management
@@ -187,6 +189,65 @@ llm = ClaudeCodeLLM(
     auth_file="~/.agent-harness/auth/auth.json",
 )
 ```
+
+### Smart routing + fallback
+
+Two composable wrappers reduce cost and improve reliability without changing
+the rest of the harness:
+
+**`FallbackLLM`** — try each adapter in order; transparently switch to the
+next on rate limits, timeouts, or 5xx errors:
+
+```python
+from harness.llm.anthropic import AnthropicLLM
+from harness.llm.openai import OpenAILLM
+from harness.llm.fallback import FallbackLLM
+
+llm = FallbackLLM([
+    AnthropicLLM(model="claude-sonnet-4-6"),   # primary
+    OpenAILLM(model="gpt-4o-mini"),            # backup
+])
+runtime = AgentRuntime(..., llm=llm)
+print(llm.last_route)   # 0 if primary worked, 1 if backup did
+```
+
+Permanent errors (auth, bad request) propagate immediately — only transient
+upstream errors trigger fallback. Customise the classifier with
+`transient_errors=lambda exc: ...`. Streaming retries only fire before the
+first token; mid-stream failures propagate to preserve response integrity.
+
+**`RoutingLLM`** — dispatch each call to a different adapter by a selector.
+The canonical use is cost shaping (cheap model for short / structured calls,
+big model for the main loop):
+
+```python
+from harness.llm.routing import RoutingLLM, by_system_keyword
+
+llm = RoutingLLM(
+    routes={
+        "cheap":   OpenAILLM(model="gpt-4o-mini"),
+        "default": AnthropicLLM(model="claude-sonnet-4-6"),
+    },
+    selector=by_system_keyword(
+        {"planner": "cheap", "synthesiser": "cheap"},
+        default="default",
+    ),
+    default_route="default",
+)
+```
+
+Shipped selectors:
+
+| Selector | Picks based on |
+|---|---|
+| `by_system_keyword({...}, default=...)` | Substring match against the system prompt |
+| `by_token_count(threshold=, small=, large=)` | Total chars / 4 (or your own counter) vs threshold |
+| `by_role({...}, default=...)` | A `call_role` field stashed in the last message |
+
+Compose them: `FallbackLLM([RoutingLLM(...), OpenAILLM(...)])` gives you
+**cost-shaped primary with reliability fallback** in one line.
+
+---
 
 `ClaudeCodeLLM` reads a `claude-code` OAuth entry, refreshes it automatically
 when expired, and retries once after `401`/`403`. This mirrors Pi's Claude
