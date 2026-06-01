@@ -159,34 +159,40 @@ class MCPServerConnection:
 
         try:
             auth = await self._auth_provider.get_auth() if self._auth_provider else None
-            params = merge_mcp_auth(self._params, auth)
+            auth_headers = dict(auth.headers) if auth else {}
 
-            if isinstance(params, StdioServerParameters):
-                read, write = await self._exit_stack.enter_async_context(stdio_client(params))
-            elif isinstance(params, StreamableHttpServerParams):
+            if isinstance(self._params, StreamableHttpServerParams):
                 from mcp.client.streamable_http import streamablehttp_client
 
+                headers = {**self._params.headers, **auth_headers}
                 read, write, _ = await self._exit_stack.enter_async_context(
                     streamablehttp_client(
-                        params.url,
-                        headers=params.headers or None,
-                        timeout=params.timeout,
-                        sse_read_timeout=params.sse_read_timeout,
+                        self._params.url,
+                        headers=headers or None,
+                        timeout=self._params.timeout,
+                        sse_read_timeout=self._params.sse_read_timeout,
                     )
                 )
-            elif isinstance(params, str):
-                # SSE transport: params is a URL string
+            elif isinstance(self._params, StdioServerParameters):
+                params = merge_mcp_auth(self._params, auth)
+                read, write = await self._exit_stack.enter_async_context(stdio_client(params))
+            elif isinstance(self._params, str):
                 from mcp.client.sse import sse_client
 
-                read, write = await self._exit_stack.enter_async_context(sse_client(params))
-            elif isinstance(params, dict) and "url" in params:
-                # SSE transport: params as dict with url + optional headers
+                read, write = await self._exit_stack.enter_async_context(
+                    sse_client(self._params, headers=auth_headers or None)
+                )
+            elif isinstance(self._params, dict) and "url" in self._params:
                 from mcp.client.sse import sse_client
 
-                read, write = await self._exit_stack.enter_async_context(sse_client(**params))
+                merged = {
+                    **self._params,
+                    "headers": {**self._params.get("headers", {}), **auth_headers},
+                }
+                read, write = await self._exit_stack.enter_async_context(sse_client(**merged))
             else:
                 raise TypeError(
-                    f"Unsupported server_params type: {type(params)}. "
+                    f"Unsupported server_params type: {type(self._params)}. "
                     "Use StdioServerParameters, StreamableHttpServerParams, "
                     "an SSE URL string, or a dict with 'url' key."
                 )
