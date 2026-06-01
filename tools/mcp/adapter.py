@@ -20,20 +20,35 @@ Usage (context manager — recommended):
         conn.register_tools(tool_registry)
         result = await runtime.run("list files in /tmp")
 
-Streamable-HTTP (e.g. Datadog, any API-key-gated MCP SaaS):
+Streamable-HTTP with API keys (env-var backed):
 
     from tools.mcp.adapter import StreamableHttpServerParams
     from tools.mcp.auth import ApiKeyMCPAuth
 
     auth = ApiKeyMCPAuth({
-        "DD-Api-Key": "DD_API_KEY",
-        "DD-Application-Key": "DD_APP_KEY",
+        "X-Api-Key": "MY_SERVICE_API_KEY",
+        "X-App-Key": "MY_SERVICE_APP_KEY",
     })
-    params = StreamableHttpServerParams(url="https://mcp.datadoghq.com/")
+    params = StreamableHttpServerParams(url="https://mcp.example.com/")
 
-    async with MCPServerConnection(params, server_name="datadog", auth=auth) as conn:
+    async with MCPServerConnection(params, auth=auth) as conn:
         conn.register_tools(tool_registry)
-        result = await runtime.run("list monitors with status alert")
+        result = await runtime.run("...")
+
+Streamable-HTTP with OAuth token (auth file backed):
+
+    from tools.mcp.adapter import StreamableHttpServerParams
+    from tools.mcp.auth import OAuthMCPAuth
+
+    auth = OAuthMCPAuth.from_auth_file(
+        "~/.agent-harness/auth/auth.json",
+        provider="my-service",
+    )
+    params = StreamableHttpServerParams(url="https://mcp.example.com/")
+
+    async with MCPServerConnection(params, auth=auth) as conn:
+        conn.register_tools(tool_registry)
+        result = await runtime.run("...")
 
 Usage (manual lifecycle):
 
@@ -69,8 +84,11 @@ class StreamableHttpServerParams:
         from tools.mcp.adapter import StreamableHttpServerParams
         from tools.mcp.auth import DatadogMCPAuth
 
-        auth = ApiKeyMCPAuth({"DD-Api-Key": "DD_API_KEY", "DD-Application-Key": "DD_APP_KEY"})
-        params = StreamableHttpServerParams(url="https://mcp.datadoghq.com/")
+        # API-key auth
+        auth = ApiKeyMCPAuth({"X-Api-Key": "MY_SERVICE_KEY"})
+        # or OAuth from auth file
+        # auth = OAuthMCPAuth.from_auth_file("~/.agent-harness/auth/auth.json", provider="svc")
+        params = StreamableHttpServerParams(url="https://mcp.example.com/")
         async with MCPServerConnection(params, auth=auth) as conn:
             ...
     """
