@@ -7,13 +7,13 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from tools.mcp.adapter import StreamableHttpServerParams
 from tools.mcp.auth import (
     ApiKeyMCPAuth,
     BearerMCPAuth,
     MCPAuth,
     OAuthMCPAuth,
     StaticMCPAuth,
+    StreamableHttpServerParams,
     merge_mcp_auth,
 )
 

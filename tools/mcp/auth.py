@@ -1,4 +1,4 @@
-"""Authentication helpers for MCP server connections."""
+"""Authentication helpers and connection parameter types for MCP servers."""
 
 from __future__ import annotations
 
@@ -9,6 +9,30 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from harness.llm.auth import AuthFileOAuthProvider
+
+
+@dataclass
+class StreamableHttpServerParams:
+    """Connection parameters for an MCP server using the streamable-HTTP transport.
+
+    Headers supplied here are merged with those from the MCPAuthProvider before
+    the connection is opened.
+
+    Example::
+
+        # API-key auth
+        auth = ApiKeyMCPAuth({"X-Api-Key": "MY_SERVICE_KEY"})
+        # or OAuth from auth file
+        # auth = OAuthMCPAuth.from_auth_file("~/.agent-harness/auth/auth.json", provider="svc")
+        params = StreamableHttpServerParams(url="https://mcp.example.com/")
+        async with MCPServerConnection(params, auth=auth) as conn:
+            ...
+    """
+
+    url: str
+    headers: dict[str, str] = field(default_factory=dict)
+    timeout: float = 30.0
+    sse_read_timeout: float = 300.0
 
 
 @dataclass(frozen=True)
@@ -131,19 +155,9 @@ def merge_mcp_auth(server_params: Any, auth: MCPAuth | None) -> Any:
     if auth is None or (not auth.headers and not auth.env):
         return server_params
 
-    # Avoid a hard import — StreamableHttpServerParams lives in adapter.py
-    # and auth.py must not depend on it (would create a circular import).
-    # We duck-type on the presence of url + headers + timeout attributes.
-    if (
-        hasattr(server_params, "url")
-        and hasattr(server_params, "headers")
-        and hasattr(server_params, "timeout")
-        and not isinstance(server_params, dict)
-    ):
-        import dataclasses as _dc
-
+    if isinstance(server_params, StreamableHttpServerParams):
         merged_headers = {**dict(server_params.headers or {}), **dict(auth.headers)}
-        return _dc.replace(server_params, headers=merged_headers)
+        return dataclasses.replace(server_params, headers=merged_headers)
 
     if isinstance(server_params, str):
         params: dict[str, Any] = {"url": server_params}

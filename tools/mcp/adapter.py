@@ -22,8 +22,7 @@ Usage (context manager — recommended):
 
 Streamable-HTTP with API keys (env-var backed):
 
-    from tools.mcp.adapter import StreamableHttpServerParams
-    from tools.mcp.auth import ApiKeyMCPAuth
+    from tools.mcp.auth import ApiKeyMCPAuth, StreamableHttpServerParams
 
     auth = ApiKeyMCPAuth({
         "X-Api-Key": "MY_SERVICE_API_KEY",
@@ -37,8 +36,7 @@ Streamable-HTTP with API keys (env-var backed):
 
 Streamable-HTTP with OAuth token (auth file backed):
 
-    from tools.mcp.adapter import StreamableHttpServerParams
-    from tools.mcp.auth import OAuthMCPAuth
+    from tools.mcp.auth import OAuthMCPAuth, StreamableHttpServerParams
 
     auth = OAuthMCPAuth.from_auth_file(
         "~/.agent-harness/auth/auth.json",
@@ -66,38 +64,9 @@ from __future__ import annotations
 import json
 import logging
 from contextlib import AsyncExitStack
-from dataclasses import dataclass, field
 from typing import Any
 
-from tools.mcp.auth import MCPAuthProvider, merge_mcp_auth
-
-
-@dataclass
-class StreamableHttpServerParams:
-    """Connection parameters for an MCP server using the streamable-HTTP transport.
-
-    Headers supplied here are merged with those from the MCPAuthProvider before
-    the connection is opened.
-
-    Example::
-
-        from tools.mcp.adapter import StreamableHttpServerParams
-        from tools.mcp.auth import DatadogMCPAuth
-
-        # API-key auth
-        auth = ApiKeyMCPAuth({"X-Api-Key": "MY_SERVICE_KEY"})
-        # or OAuth from auth file
-        # auth = OAuthMCPAuth.from_auth_file("~/.agent-harness/auth/auth.json", provider="svc")
-        params = StreamableHttpServerParams(url="https://mcp.example.com/")
-        async with MCPServerConnection(params, auth=auth) as conn:
-            ...
-    """
-
-    url: str
-    headers: dict[str, str] = field(default_factory=dict)
-    timeout: float = 30.0
-    sse_read_timeout: float = 300.0
-
+from tools.mcp.auth import MCPAuthProvider, StreamableHttpServerParams, merge_mcp_auth
 
 logger = logging.getLogger(__name__)
 
