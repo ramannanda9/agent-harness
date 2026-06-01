@@ -1,9 +1,19 @@
 """``RoutingLLM`` — dispatch each LLM call to a different adapter by a selector.
 
-The classic use case is **cost shaping**: cheap model for planner/synthesiser
-calls, expensive model for the main ReAct loop. Real workloads see 50-70%
-cost reduction with no quality loss because the cheap calls are short,
-structured, and don't need frontier reasoning.
+The classic use case is **cost shaping**: route the *short, structured,
+low-stakes* calls to a cheap model, keep the *reasoning-heavy* calls on a
+frontier model. In this harness the natural split is:
+
+  Cheap-appropriate (short prompts, small/enum outputs):
+    - the classifier (``simple`` vs ``complex`` dispatch decision)
+    - the router (pick one of N agents)
+    - memory summarisation (mechanical compaction of older context)
+
+  Premium-required (high-stakes reasoning, multi-turn outputs):
+    - the planner (decomposes the goal into a DAG — bad plan, run wasted)
+    - the replanner (reasons about why the previous plan failed)
+    - the per-agent ReAct loop (the actual work)
+    - the synthesiser when it has to reconcile conflicting evidence
 
 Wire it up by giving each adapter a key, then supplying a ``selector``
 function that returns the key for the current call::
@@ -18,7 +28,9 @@ function that returns the key for the current call::
             "default": AnthropicLLM(model="claude-sonnet-4-6"),
         },
         selector=by_system_keyword(
-            {"planner": "cheap", "synthesiser": "cheap"},
+            # Match phrases from the orchestrator's own system prompts —
+            # "classifier" and "routing agent" appear verbatim.
+            {"classifier": "cheap", "routing agent": "cheap"},
             default="default",
         ),
         default_route="default",
@@ -27,15 +39,17 @@ function that returns the key for the current call::
 The selector receives ``(system, messages)`` and returns a key from the
 ``routes`` dict. The shipped selectors are::
 
-    by_system_keyword({"planner": "cheap", ...}, default="default")
+    by_system_keyword({"classifier": "cheap", ...}, default="default")
         Match substrings in the system prompt.
 
     by_token_count(threshold=1500, small="cheap", large="default")
-        Cheap model below the threshold; bigger model above.
+        Cheap model for short contexts (good for the classifier and router
+        which see only the goal + agent descriptions); bigger model once
+        the working memory grows.
 
-    by_role({"planner": "cheap", ...}, default="default")
-        Match against an explicit ``call_role`` kwarg passed by the caller
-        (e.g. ``llm.complete(system, msgs, call_role="planner")``).
+    by_role({"classifier": "cheap", ...}, default="default")
+        Match against a ``call_role`` field on the last message — useful
+        when your own call sites tag their purpose explicitly.
 
 ``last_route`` exposes the key of the route that handled the most recent
 call — handy for logging and tests.

@@ -217,8 +217,16 @@ upstream errors trigger fallback. Customise the classifier with
 first token; mid-stream failures propagate to preserve response integrity.
 
 **`RoutingLLM`** — dispatch each call to a different adapter by a selector.
-The canonical use is cost shaping (cheap model for short / structured calls,
-big model for the main loop):
+The canonical use is cost shaping: route the *short, structured, low-stakes*
+calls to a cheap model, keep the *reasoning-heavy* ones on a frontier model.
+In this harness the natural split is:
+
+- **Cheap-appropriate**: the classifier (`simple` vs `complex` dispatch),
+  the router (pick one of N agents), memory summarisation. Short prompts,
+  small/enum outputs.
+- **Premium-required**: the planner (decomposes the goal into a DAG — a
+  bad plan wastes the whole run), the replanner, per-agent ReAct loops,
+  and the synthesiser when it has to reconcile conflicting evidence.
 
 ```python
 from harness.llm.routing import RoutingLLM, by_system_keyword
@@ -229,7 +237,9 @@ llm = RoutingLLM(
         "default": AnthropicLLM(model="claude-sonnet-4-6"),
     },
     selector=by_system_keyword(
-        {"planner": "cheap", "synthesiser": "cheap"},
+        # "classifier" and "routing agent" appear verbatim in the
+        # orchestrator's own system prompts.
+        {"classifier": "cheap", "routing agent": "cheap"},
         default="default",
     ),
     default_route="default",
