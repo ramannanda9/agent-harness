@@ -4,7 +4,12 @@ from datetime import datetime, timedelta, timezone
 
 import harness.llm.claude_code as cc_mod
 from harness.llm.auth import OAuthCredential
-from harness.llm.claude_code import ClaudeCodeLLM, _build_payload, _default_user_agent
+from harness.llm.claude_code import (
+    ClaudeCodeLLM,
+    _build_payload,
+    _default_user_agent,
+    _system_blocks,
+)
 
 # ── Mock streaming HTTP client ────────────────────────────────────────────────
 
@@ -95,8 +100,12 @@ def test_build_payload_uses_anthropic_messages_shape():
     assert payload["system"][0]["text"].startswith("x-anthropic-billing-header:")
     assert "Claude Code" in payload["system"][1]["text"]
     assert payload["system"][2]["text"] == "sys\n\nignored system"
+    # With prompt_caching=True (default), the last user message gets cache_control.
     assert payload["messages"] == [
-        {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}],
+        },
     ]
 
 
@@ -192,6 +201,8 @@ async def test_stream_complete_yields_deltas_incrementally():
     assert llm.last_usage == {
         "tokens_in": 5,
         "tokens_out": 6,
+        "cache_read_tokens": 0,
+        "cache_creation_tokens": 0,
         "total_tokens": 11,
         "provider": "claude-code",
     }
@@ -263,3 +274,105 @@ async def test_complete_collects_streamed_deltas():
     assert creds.calls == [False, True]
     assert client.calls[1]["json"]["model"] == "claude-sonnet-4-6"
     assert client.calls[1]["json"]["stream"] is True
+
+
+# ── Prompt caching ────────────────────────────────────────────────────────────
+
+
+def test_prompt_caching_enabled_wraps_system_with_cache_control():
+    """When prompt_caching=True (default), the system block has cache_control."""
+    payload = _build_payload(
+        model="claude-sonnet-4-6",
+        system="You are a helpful agent.",
+        messages=[{"role": "user", "content": "do stuff"}],
+        max_tokens=100,
+        extra={},
+        prompt_caching=True,
+    )
+    # The third system block (index 2) is the caller-supplied system prompt.
+    system_block = payload["system"][2]
+    assert system_block["text"] == "You are a helpful agent."
+    assert system_block.get("cache_control") == {"type": "ephemeral"}
+
+
+def test_prompt_caching_disabled_system_is_plain_string_block():
+    """When prompt_caching=False, the system block has no cache_control."""
+    payload = _build_payload(
+        model="claude-sonnet-4-6",
+        system="You are a helpful agent.",
+        messages=[{"role": "user", "content": "do stuff"}],
+        max_tokens=100,
+        extra={},
+        prompt_caching=False,
+    )
+    system_block = payload["system"][2]
+    assert system_block["text"] == "You are a helpful agent."
+    assert "cache_control" not in system_block
+
+
+def test_prompt_caching_empty_system_no_system_field_in_request():
+    """Empty/None system prompt -> only billing + identity blocks, no user block."""
+    for system_val in (None, ""):
+        payload = _build_payload(
+            model="claude-sonnet-4-6",
+            system=system_val,
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=100,
+            extra={},
+            prompt_caching=True,
+        )
+        # Only the two fixed preamble blocks should be present.
+        assert len(payload["system"]) == 2
+        texts = [b["text"] for b in payload["system"]]
+        assert any("billing-header" in t for t in texts)
+        assert any("Claude Code" in t for t in texts)
+
+
+def test_prompt_caching_last_user_message_gets_cache_control():
+    """When prompt_caching=True, the last user message content block gets cache_control."""
+    payload = _build_payload(
+        model="claude-sonnet-4-6",
+        system="sys",
+        messages=[
+            {"role": "user", "content": "first turn"},
+            {"role": "assistant", "content": "response"},
+            {"role": "user", "content": "second turn"},
+        ],
+        max_tokens=100,
+        extra={},
+        prompt_caching=True,
+    )
+    messages = payload["messages"]
+    # Last message should be the second user turn.
+    last = messages[-1]
+    assert last["role"] == "user"
+    assert last["content"][0].get("cache_control") == {"type": "ephemeral"}
+    # Earlier user message should NOT have cache_control.
+    first_user = messages[0]
+    assert "cache_control" not in first_user["content"][0]
+
+
+def test_prompt_caching_disabled_no_cache_control_on_user_messages():
+    """When prompt_caching=False, no cache_control is injected into messages."""
+    payload = _build_payload(
+        model="claude-sonnet-4-6",
+        system="sys",
+        messages=[{"role": "user", "content": "do stuff"}],
+        max_tokens=100,
+        extra={},
+        prompt_caching=False,
+    )
+    last = payload["messages"][-1]
+    assert "cache_control" not in last["content"][0]
+
+
+def test_system_blocks_helper_respects_caching_flag():
+    """_system_blocks propagates prompt_caching to the caller-supplied block."""
+    blocks_on = _system_blocks("my system prompt", prompt_caching=True)
+    blocks_off = _system_blocks("my system prompt", prompt_caching=False)
+
+    user_block_on = next(b for b in blocks_on if b.get("text") == "my system prompt")
+    user_block_off = next(b for b in blocks_off if b.get("text") == "my system prompt")
+
+    assert user_block_on.get("cache_control") == {"type": "ephemeral"}
+    assert "cache_control" not in user_block_off
