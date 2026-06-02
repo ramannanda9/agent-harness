@@ -1,7 +1,9 @@
 # react-agent-harness
 
 Bring-your-own-LLM multi-agent harness: hybrid DAG planning with replan-on-failure,
-two-tier memory (semantic KV + episodic vector), and a streaming-primary event model.
+two-tier memory (semantic KV + episodic vector), a streaming-primary event model,
+and cost/token budgets with per-call-site attribution (classifier, router,
+planner, synthesizer, agent).
 
 Config-driven — register tools and agents, run any goal. No subclassing.
 
@@ -33,15 +35,21 @@ events to stdout and prints elapsed time + cost at the end.
 ## Architecture
 
 ```
-harness/runtime.py          AgentRuntime — single entry point, wire once run anything
+harness/runtime.py          AgentRuntime — single entry point; BudgetGuard with cost/token caps + per-call-site breakdown
 harness/events.py           BusEvent + EventType — canonical event vocabulary
-harness/llm/openai.py       OpenAILLM — OpenAI adapter with usage + cost tracking
+harness/llm/openai.py       OpenAILLM — OpenAI API-key adapter with usage + cost tracking
+harness/llm/anthropic.py    AnthropicLLM — direct Anthropic API-key adapter with prompt-caching support
+harness/llm/claude_code.py  ClaudeCodeLLM — Claude subscription OAuth adapter (experimental, ToS caveats)
+harness/llm/openai_codex.py OpenAICodexLLM — ChatGPT subscription OAuth adapter (experimental, ToS caveats)
+harness/llm/auth.py         Shared OAuth + auth-file primitives for the subscription adapters
 harness/llm/fallback.py     FallbackLLM — transparent retry on transient upstream errors
 harness/llm/routing.py      RoutingLLM — dispatch calls to different adapters by a selector
+harness/trace.py            JSONL trace recorder + replay — durable, per-event flush
+harness/trace_viewer.py     Local web timeline viewer for recorded JSONL traces
 harness/annotation.py       Annotation store + AnnotationHook — RLHF trajectory capture
 harness/hitl.py             HITL approval gate — interactive CLI, session-allow list
 harness/tool_policy.py      Persistent tool policy — user-scoped allow rules, CLI management
-harness/console.py          ConsoleRenderer — centralised BusEvent formatting for CLI apps
+harness/console.py          ConsoleRenderer — centralised BusEvent formatting + render_budget helper
 harness/steering.py         Async steering — agent.steer(text), StdinRouter pub/sub, FileSteer, factory helpers
 harness/checkpoint.py       CheckpointStore + _ResumeHint + maybe_resume_key — pluggable run-state persistence (file + Redis); auto-resume built into dispatch_stream / run_stream
 harness/otel.py             OTELHook — OpenTelemetry span exporter (opt-in)
@@ -56,7 +64,8 @@ memory/redis_store.py       Redis semantic store — durable KV with TTL
 memory/stores.py            InMemory stores — local dev default, no deps
 tools/builtin/http_fetch.py HTTPFetch — minimal read-only GET tool
 tools/builtin/fetch_image.py FetchImage — fetch URL and return OpenAI image_url block
-tools/mcp/adapter.py        MCP tool adapter — connect any MCP server
+tools/mcp/adapter.py        MCP tool adapter — stdio, SSE, streamable-HTTP transports
+tools/mcp/auth.py           ApiKeyMCPAuth + BrowserOAuthMCPAuth — auth primitives for remote MCP servers
 ```
 
 Execution is **streaming-primary**: every path yields `BusEvent`s for
