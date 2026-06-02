@@ -279,7 +279,7 @@ def _build_llm(provider: str):
     raise SystemExit(f"unknown provider: {provider}")
 
 
-async def run(provider: str) -> dict:
+async def run(provider: str, *, trace_path: str | None = None) -> dict:
     llm = _build_llm(provider)
     agents = AgentRegistry().register(
         AgentConfig(
@@ -310,8 +310,14 @@ async def run(provider: str) -> dict:
         ),
     )
 
+    stream = runtime.dispatch_stream(GOAL)
+    if trace_path:
+        from harness.trace import record_trace
+
+        stream = record_trace(stream, trace_path)
+
     final: dict = {}
-    async for event in runtime.dispatch_stream(GOAL):
+    async for event in stream:
         if event.type == EventType.TASK_DONE:
             final = event.payload
         elif event.type == EventType.ERROR:
@@ -320,10 +326,12 @@ async def run(provider: str) -> dict:
         else:
             _renderer.render(event)
 
+    if trace_path:
+        print(f"\n[trace] Wrote {trace_path} — view with: agent-harness trace view {trace_path}")
     return final
 
 
-async def run_cache_demo(provider: str) -> dict:
+async def run_cache_demo(provider: str, *, trace_path: str | None = None) -> dict:
     """Multi-step run with a long system prompt to demonstrate prompt caching.
 
     The system prompt is >1024 tokens, which is Anthropic's minimum cache block
@@ -376,8 +384,14 @@ async def run_cache_demo(provider: str) -> dict:
         "subsequent calls → cache_hit=N\n"
     )
 
+    stream = runtime.dispatch_stream(_CACHE_DEMO_GOAL)
+    if trace_path:
+        from harness.trace import record_trace
+
+        stream = record_trace(stream, trace_path)
+
     final: dict = {}
-    async for event in runtime.dispatch_stream(_CACHE_DEMO_GOAL):
+    async for event in stream:
         if event.type == EventType.TASK_DONE:
             final = event.payload
         elif event.type == EventType.ERROR:
@@ -390,6 +404,8 @@ async def run_cache_demo(provider: str) -> dict:
         print("\n[cache-demo] Recorded observations:")
         for i, entry in enumerate(record_tool.entries, 1):
             print(f"  {i}. {entry}")
+    if trace_path:
+        print(f"\n[trace] Wrote {trace_path} — view with: agent-harness trace view {trace_path}")
 
     return final
 
@@ -403,13 +419,19 @@ def main() -> None:
         help="Run a multi-step audit task with a long system prompt to show prompt caching "
         "(claude-code only; requires >=1024 token system prompt for cache to activate)",
     )
+    parser.add_argument(
+        "--trace",
+        metavar="PATH",
+        help="Record every BusEvent to a JSONL trace file; view with "
+        "'agent-harness trace view PATH'",
+    )
     args = parser.parse_args()
 
     _check_auth(args.provider)
     if args.cache_demo:
-        result = asyncio.run(run_cache_demo(args.provider))
+        result = asyncio.run(run_cache_demo(args.provider, trace_path=args.trace))
     else:
-        result = asyncio.run(run(args.provider))
+        result = asyncio.run(run(args.provider, trace_path=args.trace))
     print("\nResult:")
     print(json.dumps(result, indent=2, default=str))
 
