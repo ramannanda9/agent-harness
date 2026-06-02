@@ -30,6 +30,69 @@ def test_console_renderer_context_levels():
     assert "warning" in text
 
 
+def test_console_renderer_done_event_renders_budget_breakdown():
+    """When the DONE event carries a ``budget`` snapshot, the renderer should
+    show total tokens + the per-call-site breakdown so demos surface
+    classifier/router/planner/synthesizer spending."""
+    out = StringIO()
+    renderer = ConsoleRenderer(out=out)
+
+    renderer.render(
+        BusEvent(
+            type=EventType.DONE,
+            agent_id="orchestrator",
+            payload={
+                "answer": "all systems nominal",
+                "confidence": 0.91,
+                "replan_count": 0,
+                "budget": {
+                    "cost_usd": 0.0142,
+                    "elapsed_seconds": 23.4,
+                    "tokens_in": 12_340,
+                    "tokens_out": 2_890,
+                    "breakdown": {
+                        "classifier": {"tokens_in": 156, "tokens_out": 24},
+                        "planner": {"tokens_in": 8_432, "tokens_out": 1_200},
+                    },
+                },
+            },
+        )
+    )
+
+    text = out.getvalue()
+    assert "all systems nominal" in text
+    assert "$0.0142" in text
+    assert "23.4s" in text
+    assert "in=12,340" in text
+    assert "out=2,890" in text
+    assert "classifier" in text and "8,432" in text
+
+
+def test_console_renderer_done_event_back_compat_without_budget():
+    """Old-shape DONE events without a ``budget`` key still render cost/time
+    from the legacy flat fields — no breakdown printed."""
+    out = StringIO()
+    renderer = ConsoleRenderer(out=out)
+
+    renderer.render(
+        BusEvent(
+            type=EventType.DONE,
+            agent_id="orchestrator",
+            payload={
+                "answer": "done",
+                "confidence": 0.9,
+                "cost_usd": 0.005,
+                "elapsed_seconds": 1.2,
+            },
+        )
+    )
+
+    text = out.getvalue()
+    assert "$0.0050" in text
+    assert "1.2s" in text
+    assert "Tokens:" not in text
+
+
 def test_console_renderer_memory_summary_marker():
     out = StringIO()
     renderer = ConsoleRenderer(out=out)

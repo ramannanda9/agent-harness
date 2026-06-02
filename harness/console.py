@@ -178,13 +178,37 @@ class ConsoleRenderer:
             self.sep("═")
             print(p.get("answer", "(no answer)"), file=self._out)
             self.sep()
+            # ``budget`` snapshot supersedes the flat cost/elapsed fields when
+            # present (added with token caps + per-call-site breakdown).
+            budget = p.get("budget") or {}
+            cost = budget.get("cost_usd", p.get("cost_usd", 0))
+            elapsed = budget.get("elapsed_seconds", p.get("elapsed_seconds", 0))
             print(
                 f"Confidence: {p.get('confidence', 0):.2f}  |  "
                 f"Replans: {p.get('replan_count', 0)}  |  "
-                f"Cost: ${p.get('cost_usd', 0):.4f}  |  "
-                f"Time: {p.get('elapsed_seconds', 0):.1f}s",
+                f"Cost: ${cost:.4f}  |  "
+                f"Time: {elapsed:.1f}s",
                 file=self._out,
             )
+            tokens_in = budget.get("tokens_in")
+            tokens_out = budget.get("tokens_out")
+            if tokens_in is not None or tokens_out is not None:
+                print(
+                    f"Tokens:     in={int(tokens_in or 0):,}  out={int(tokens_out or 0):,}",
+                    file=self._out,
+                )
+            breakdown = budget.get("breakdown") or {}
+            if breakdown:
+                # Right-pad the slot label so columns line up — matters when
+                # the demo prints multiple slots in sequence.
+                width = max(len(name) for name in breakdown)
+                for slot, stats in breakdown.items():
+                    print(
+                        f"  {slot:<{width}}  "
+                        f"in={int(stats.get('tokens_in', 0)):>7,}  "
+                        f"out={int(stats.get('tokens_out', 0)):>6,}",
+                        file=self._out,
+                    )
 
         elif t == EventType.ERROR:
             print(f"\n[error]      {event.error}", file=sys.stderr)
