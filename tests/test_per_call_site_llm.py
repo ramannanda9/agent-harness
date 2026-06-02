@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 
 from agents.base import AgentConfig
+from harness.events import BusEvent, EventType
 from harness.runtime import AgentRegistry, AgentRuntime, GuardrailConfig, ToolRegistry
 from memory.manager import MemoryManager
 from memory.stores import InMemoryEpisodicStore, InMemorySemanticStore
@@ -50,6 +51,7 @@ def _build_two_agent_runtime(
     router_llm: Any | None = None,
     planner_llm: Any | None = None,
     synthesizer_llm: Any | None = None,
+    checkpoint_store: Any | None = None,
 ) -> AgentRuntime:
     agents = (
         AgentRegistry()
@@ -84,7 +86,22 @@ def _build_two_agent_runtime(
         planner_llm=planner_llm,
         synthesizer_llm=synthesizer_llm,
         guardrail_config=GuardrailConfig(),
+        checkpoint_store=checkpoint_store,
     )
+
+
+class _MemoryCheckpointStore:
+    def __init__(self, data: dict[str, dict]) -> None:
+        self._data = data
+
+    async def read(self, key: str) -> dict | None:
+        return self._data.get(key)
+
+    async def write(self, key: str, data: dict) -> None:
+        self._data[key] = data
+
+    async def delete(self, key: str) -> None:
+        self._data.pop(key, None)
 
 
 # ── Defaults: slots fall back to main llm ────────────────────────────────────
@@ -155,6 +172,58 @@ def test_attach_budget_is_idempotent_per_instance():
     )
     # _budget_targets must contain the shared instance exactly once.
     assert sum(1 for t in runtime._budget_targets if t is shared) == 1
+
+
+@pytest.mark.asyncio
+async def test_resume_stream_agent_checkpoint_attaches_budget_to_all_slots(monkeypatch):
+    """The streaming resume path should use the same budget wiring as normal runs."""
+
+    class FakeBaseAgent:
+        def __init__(self, **kwargs) -> None:
+            self.config = kwargs["config"]
+
+        async def _resume_stream(self, **_kwargs):
+            yield BusEvent(
+                type=EventType.TASK_DONE,
+                agent_id=self.config.agent_id,
+                payload={"answer": "ok", "confidence": 1.0},
+            )
+
+    import agents.base as base_module
+
+    monkeypatch.setattr(base_module, "BaseAgent", FakeBaseAgent)
+
+    main = _RecordingLLM(name="main", answer={})
+    cheap = _RecordingLLM(name="cheap", answer={})
+    checkpoint_store = _MemoryCheckpointStore(
+        {
+            "run-1:alpha": {
+                "run_id": "run-1",
+                "agent_id": "alpha",
+                "task": "resume me",
+                "step": 0,
+                "memory": {
+                    "messages": [],
+                    "summarization_count": 0,
+                    "max_tokens": 8000,
+                    "summarize_ratio": 0.5,
+                    "recency_window": 4,
+                },
+            }
+        }
+    )
+    runtime = _build_two_agent_runtime(
+        llm=main,
+        classifier_llm=cheap,
+        router_llm=cheap,
+        checkpoint_store=checkpoint_store,
+    )
+
+    events = [event async for event in runtime.resume_stream("run-1:alpha")]
+
+    assert events[-1].type == EventType.TASK_DONE
+    assert main.budget is not None
+    assert cheap.budget is main.budget
 
 
 # ── End-to-end: classifier slot actually answers dispatch ────────────────────

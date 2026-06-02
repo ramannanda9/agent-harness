@@ -534,8 +534,7 @@ class AgentRuntime:
             outer_run_id = checkpoint["run_id"]
             config = self._agent_registry.get(checkpoint["agent_id"])
             guard = BudgetGuard(self._guardrail_config)
-            if hasattr(self._llm, "set_budget"):
-                self._llm.set_budget(guard)
+            self._attach_budget(guard)
             tracer = self._make_tracer()
             agent = BaseAgent(
                 config=config,
