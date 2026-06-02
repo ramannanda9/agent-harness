@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import hashlib
 import json
 import logging
 import uuid
@@ -205,7 +204,6 @@ class BaseAgent:
             except asyncio.QueueEmpty:
                 break  # defensive — single consumer, should never fire
             await self._working_memory.append("user", f"Human guidance: {text}")
-            self._persist_human_correction(text, step=step)
             self._tracer.log(
                 "human_guidance",
                 self.config.agent_id,
@@ -894,37 +892,7 @@ class BaseAgent:
         """Append human correction to WorkingMemory and commit a clean checkpoint."""
         await self._working_memory.append("assistant", json.dumps(response))
         await self._working_memory.append("user", f"Human guidance: {correction}")
-        self._persist_human_correction(correction, step=step)
         await self._commit_checkpoint(run_id, step)
-
-    def _persist_human_correction(self, text: str, *, step: int) -> None:
-        """Record a human correction as a durable semantic fact.
-
-        Async steering and HITL corrections are the highest-signal data a
-        run produces — discarding them at run-end leaves the framework
-        unable to learn from operator feedback. The fact is keyed by
-        ``human-correction:<agent_id>:<fingerprint>`` so future
-        ``build_context(goal)`` searches over global facts can surface
-        prior corrections that match the new goal's pattern.
-
-        Fire-and-forget — the agent never blocks on the write.
-        """
-        text = text.strip()
-        if not text:
-            return
-        fingerprint = hashlib.sha1(text.encode("utf-8")).hexdigest()[:10]
-        fire(
-            self._memory.write_semantic_fact(
-                f"human-correction:{self.config.agent_id}:{fingerprint}",
-                {
-                    "agent_id": self.config.agent_id,
-                    "task": (self._task or "")[:200],
-                    "step": step,
-                    "guidance": text,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                },
-            )
-        )
 
     async def _commit_checkpoint(self, run_id: str, step: int) -> None:
         """Overwrite checkpoint with current state (no pending field).

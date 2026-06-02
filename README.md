@@ -339,13 +339,6 @@ crashing the loop.
 
 - **During run**: `write_working_fact()` — lightweight KV, namespaced, short TTL
 - **End of run**: `write_run_end()` — LLM extraction → global semantic + episodic vector
-- **On replan**: durable failure-mode fact under `replan:<agent>:<fingerprint>`
-  (same `(agent, error)` collapses to one key so lessons accumulate without
-  duplicates; surfaces via `build_context` so future planners avoid the same
-  dead end).
-- **On human correction**: steering and HITL corrections write to
-  `human-correction:<agent>:<fingerprint>` so operator feedback survives
-  the run and shapes future plans, not just the current working memory.
 
 ### Tool-result caching (opt-in, per run)
 
