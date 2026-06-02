@@ -134,10 +134,10 @@ function buildSidebar() {
   filters.agents = new Set(agents);
   filters.types = new Set(types);
   document.getElementById('agents').innerHTML = [...agents].sort().map(a =>
-    `<label><input type=\"checkbox\" data-kind=\"agent\" data-name=\"${a}\" checked>${a}</label>`
+    `<label><input type=\"checkbox\" data-kind=\"agent\" data-name=\"${escapeAttr(a)}\" checked>${escapeHTML(a)}</label>`
   ).join('');
   document.getElementById('types').innerHTML = [...types].sort().map(t =>
-    `<label><input type=\"checkbox\" data-kind=\"type\" data-name=\"${t}\" checked>${t}</label>`
+    `<label><input type=\"checkbox\" data-kind=\"type\" data-name=\"${escapeAttr(t)}\" checked>${escapeHTML(t)}</label>`
   ).join('');
   for (const el of document.querySelectorAll('aside input[type=checkbox]')) {
     el.addEventListener('change', () => {
@@ -174,9 +174,11 @@ function render() {
     const dt = (e.timestamp - start).toFixed(3);
     const body = formatBody(e);
     const meta = e.agent_id ? `<span class=\"agent\">${escapeHTML(e.agent_id)}</span>` : '';
+    const typeText = escapeHTML(e.type);
+    const typeClass = cssClassForType(e.type);
     return `<div class=\"event\">
       <div class=\"t\">+${dt}s</div>
-      <div class=\"type ${e.type}\">${e.type}</div>
+      <div class=\"type ${typeClass}\">${typeText}</div>
       <div>${meta}<div class=\"body\">${body}</div></div>
     </div>`;
   }).join('');
@@ -206,8 +208,9 @@ function summarizePayload(type, p) {
     const pct = max ? Math.round(100 * tokens / max) : 0;
     return escapeHTML(`${tokens.toLocaleString()} / ${max.toLocaleString()} tokens (${pct}%)`);
   }
-  if (type === 'plan' && Array.isArray(p.tasks)) {
-    return escapeHTML(`${p.tasks.length} task(s)`);
+  if (type === 'plan') {
+    const tasks = Array.isArray(p.tasks) ? p.tasks : p.plan?.tasks;
+    if (Array.isArray(tasks)) return escapeHTML(`${tasks.length} task(s)`);
   }
   return '';
 }
@@ -221,10 +224,18 @@ function escapeHTML(s) {
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '\"': '&quot;', \"'\": '&#39;'
   })[c]);
 }
+function escapeAttr(s) {
+  return escapeHTML(s);
+}
+function cssClassForType(s) {
+  return String(s).replace(/[^a-zA-Z0-9_-]/g, '_');
+}
 
 load().catch(e => {
-  document.getElementById('events').innerHTML =
-    `<div class=\"empty\">Failed to load trace: ${e.message}</div>`;
+  const empty = document.createElement('div');
+  empty.className = 'empty';
+  empty.textContent = `Failed to load trace: ${e.message}`;
+  document.getElementById('events').replaceChildren(empty);
 });
 </script>
 </body>
