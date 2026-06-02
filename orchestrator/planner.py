@@ -28,11 +28,13 @@ Public API:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import uuid
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
@@ -167,6 +169,19 @@ class EvalConfig:
 def should_replan(result: TaskResult, config: EvalConfig) -> bool:
     """Replan trigger: task failed OR confidence below threshold."""
     return not result.success or result.confidence < config.confidence_threshold
+
+
+def _replan_lesson_key(result: TaskResult) -> str:
+    """Key for the durable replan fact, fingerprinted by failure signature.
+
+    The same (agent, normalised error) pair maps to the same key so
+    repeated failures collapse into one entry (which then surfaces via
+    ``build_context``'s global-prefix search at planning time) instead of
+    accumulating duplicates.
+    """
+    signature = (result.error or f"low-confidence:{result.confidence:.2f}").lower().strip()
+    fingerprint = hashlib.sha1(f"{result.agent_id}:{signature[:200]}".encode()).hexdigest()[:10]
+    return f"replan:{result.agent_id}:{fingerprint}"
 
 
 # ── Orchestrator ──────────────────────────────────────────────────────────────
@@ -434,6 +449,27 @@ class Orchestrator:
                 fire(
                     self._memory.write_semantic_fact(
                         "orchestrator:last_replan_agents", [t.agent_id for t in new_plan.tasks]
+                    )
+                )
+                # Durable failure-mode record. Unlike the two ``last_*``
+                # keys above (which overwrite per run), each unique failure
+                # pattern accumulates under its own key so future planners
+                # can recognise it via ``build_context``'s global-prefix
+                # search and avoid the same dead end.
+                fire(
+                    self._memory.write_semantic_fact(
+                        _replan_lesson_key(result),
+                        {
+                            "agent_id": result.agent_id,
+                            "task_id": task.id,
+                            "failure": (
+                                result.error or f"low-confidence ({result.confidence:.2f})"
+                            )[:300],
+                            "corrective_rationale": new_plan.rationale,
+                            "corrective_agents": [t.agent_id for t in new_plan.tasks],
+                            "goal": goal[:200],
+                            "first_seen": datetime.now(timezone.utc).isoformat(),
+                        },
                     )
                 )
                 yield BusEvent(

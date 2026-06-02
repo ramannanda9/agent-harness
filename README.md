@@ -339,6 +339,37 @@ crashing the loop.
 
 - **During run**: `write_working_fact()` — lightweight KV, namespaced, short TTL
 - **End of run**: `write_run_end()` — LLM extraction → global semantic + episodic vector
+- **On replan**: durable failure-mode fact under `replan:<agent>:<fingerprint>`
+  (same `(agent, error)` collapses to one key so lessons accumulate without
+  duplicates; surfaces via `build_context` so future planners avoid the same
+  dead end).
+- **On human correction**: steering and HITL corrections write to
+  `human-correction:<agent>:<fingerprint>` so operator feedback survives
+  the run and shapes future plans, not just the current working memory.
+
+### Tool-result caching (opt-in, per run)
+
+`AgentConfig.cache_tool_results = True` memoizes tool calls within a single
+run, keyed by `(tool_name, args)`. Useful for multi-agent runs where agents
+redo each other's idempotent reads (`HTTPFetch` on stable URLs,
+`kubectl get ...` discovery, MCP filesystem reads).
+
+A tool can veto caching for itself with `cacheable = False` on the
+instance — required for anything with side effects or time-dependent
+output. Errors are never cached (a transient failure shouldn't poison the
+rest of the run).
+
+```python
+class HTTPFetch:
+    name = "http_fetch"
+    cacheable = True  # default; explicit for clarity
+
+agents.register(AgentConfig(
+    agent_id="web",
+    ...,
+    cache_tool_results=True,
+))
+```
 
 Defaults are in-memory (`InMemorySemanticStore`, `InMemoryEpisodicStore`).
 For durable storage:

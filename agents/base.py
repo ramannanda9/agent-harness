@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import uuid
@@ -65,6 +66,13 @@ class AgentConfig:
     working_memory_max_tokens: int = 8000  # WorkingMemory eviction threshold; tune per agent
     hitl_tools: list[str] = None  # tools requiring human approval; None = no HITL
     checkpoint_every: int = 0  # write a resumable checkpoint every N steps; 0 = disabled
+    # Cache tool results within a single run, keyed by (tool_name, args).
+    # Opt-in because not every tool is idempotent — a tool may also veto
+    # caching for itself by exposing ``cacheable = False`` on its instance.
+    # Designed for read-mostly multi-agent runs where agents redo each
+    # other's lookups (HTTPFetch on stable URLs, ``kubectl get …`` style
+    # discovery, MCP filesystem reads).
+    cache_tool_results: bool = False
 
     def __post_init__(self):
         if self.hitl_tools is None:
@@ -159,6 +167,12 @@ class BaseAgent:
         self._resume_key: str = (
             ""  # key printed in --resume banner; set by orchestrator to outer run_id
         )
+        # Per-run tool-result cache. ``None`` when caching is off so the
+        # hot path on ``_execute_tool`` skips the lookup entirely; a fresh
+        # dict per BaseAgent instance bounds the lifetime to one run.
+        self._tool_cache: dict[tuple[str, str], Any] | None = (
+            {} if config.cache_tool_results else None
+        )
 
     # ── Async steering ────────────────────────────────────────────────────────
 
@@ -191,6 +205,7 @@ class BaseAgent:
             except asyncio.QueueEmpty:
                 break  # defensive — single consumer, should never fire
             await self._working_memory.append("user", f"Human guidance: {text}")
+            self._persist_human_correction(text, step=step)
             self._tracer.log(
                 "human_guidance",
                 self.config.agent_id,
@@ -752,11 +767,31 @@ class BaseAgent:
             return (
                 f"Error: tool '{name}' not available. Available tools: {list(self._tools.keys())}"
             )
+        tool = self._tools[name]
+
+        # Per-run memoization, gated by both agent opt-in AND tool consent.
+        # Tools that have side effects or time-dependent output can veto
+        # caching by setting ``cacheable = False`` on the instance. Errors
+        # are NOT cached — a transient failure should not poison the rest
+        # of the run.
+        cache_key: tuple[str, str] | None = None
+        if self._tool_cache is not None and getattr(tool, "cacheable", True) is True:
+            try:
+                cache_key = (name, json.dumps(args, sort_keys=True, default=str))
+            except (TypeError, ValueError):
+                cache_key = None  # un-serialisable args — silently skip
+            if cache_key is not None and cache_key in self._tool_cache:
+                return self._tool_cache[cache_key]
+
         try:
-            return await self._tools[name].execute(**args)
+            result = await tool.execute(**args)
         except Exception as e:
             logger.error("Tool %s failed: %s", name, e)
             return f"Tool error ({name}): {e}"
+
+        if cache_key is not None and self._tool_cache is not None:
+            self._tool_cache[cache_key] = result
+        return result
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -859,7 +894,37 @@ class BaseAgent:
         """Append human correction to WorkingMemory and commit a clean checkpoint."""
         await self._working_memory.append("assistant", json.dumps(response))
         await self._working_memory.append("user", f"Human guidance: {correction}")
+        self._persist_human_correction(correction, step=step)
         await self._commit_checkpoint(run_id, step)
+
+    def _persist_human_correction(self, text: str, *, step: int) -> None:
+        """Record a human correction as a durable semantic fact.
+
+        Async steering and HITL corrections are the highest-signal data a
+        run produces — discarding them at run-end leaves the framework
+        unable to learn from operator feedback. The fact is keyed by
+        ``human-correction:<agent_id>:<fingerprint>`` so future
+        ``build_context(goal)`` searches over global facts can surface
+        prior corrections that match the new goal's pattern.
+
+        Fire-and-forget — the agent never blocks on the write.
+        """
+        text = text.strip()
+        if not text:
+            return
+        fingerprint = hashlib.sha1(text.encode("utf-8")).hexdigest()[:10]
+        fire(
+            self._memory.write_semantic_fact(
+                f"human-correction:{self.config.agent_id}:{fingerprint}",
+                {
+                    "agent_id": self.config.agent_id,
+                    "task": (self._task or "")[:200],
+                    "step": step,
+                    "guidance": text,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+        )
 
     async def _commit_checkpoint(self, run_id: str, step: int) -> None:
         """Overwrite checkpoint with current state (no pending field).
