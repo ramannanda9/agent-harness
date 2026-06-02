@@ -318,8 +318,10 @@ async def test_runtime_runs_two_task_dag_to_completion():
     # both tasks should have run
     task_ids = {tr["task_id"] for tr in result["task_results"]}
     assert task_ids == {"t1", "t2"}
-    # episodic memory should have the run-end summary
-    assert memory._episodic.count() == 1
+    # episodic memory has one per-agent task episode plus the shared run summary
+    assert memory._episodic.count() == 3
+    kinds = {ep["metadata"].get("memory_kind") for ep in memory._episodic._episodes}
+    assert kinds == {"agent_task", "run_summary"}
 
 
 # ── Router tests ──────────────────────────────────────────────────────────────

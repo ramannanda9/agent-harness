@@ -339,7 +339,7 @@ class Orchestrator:
                 break
 
             batch_results: dict[str, TaskResult] = {}
-            async for event in self._run_batch(ready, batch_results, completed):
+            async for event in self._run_batch(goal, ready, batch_results, completed):
                 yield event
 
             for t in ready:
@@ -617,6 +617,7 @@ class Orchestrator:
 
     async def _run_batch(
         self,
+        goal: str,
         ready: list[Task],
         results_out: dict[str, TaskResult],
         completed_results: dict[str, TaskResult] | None = None,
@@ -711,6 +712,22 @@ class Orchestrator:
                     success=False,
                     error=last_error or "agent stream ended without TASK_DONE",
                 )
+            if hasattr(self._memory, "write_agent_task_end"):
+                try:
+                    await self._memory.write_agent_task_end(
+                        goal=goal,
+                        task_id=task.id,
+                        agent_id=task.agent_id,
+                        instruction=instruction,
+                        result={
+                            "answer": result.answer,
+                            "confidence": result.confidence,
+                            "success": result.success,
+                            "error": result.error,
+                        },
+                    )
+                except Exception as e:
+                    logger.warning("Per-agent memory write failed for task %s: %s", task.id, e)
             await bus.put((task, result))
             await bus.put((task, DRIVER_DONE))
 

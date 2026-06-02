@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Protocol, runtime_checkable
@@ -49,8 +50,17 @@ class SemanticStore(Protocol):
 
 @runtime_checkable
 class EpisodicStore(Protocol):
-    async def write(self, text: str, metadata: dict) -> str: ...  # returns episode_id
-    async def search(self, query: str, top_k: int = 3) -> list[dict]: ...
+    async def write(self, text: str, metadata: dict, agent_id: str = "") -> str: ...
+    async def search(
+        self,
+        query: str,
+        top_k: int = 3,
+        *,
+        memory_scope: str | None = None,
+        agent_id: str | None = None,
+        include_shared: bool = True,
+        include_legacy: bool = True,
+    ) -> list[dict]: ...
     async def get(self, episode_id: str) -> dict | None: ...
 
 
@@ -161,6 +171,8 @@ class MemoryManager:
         working_facts_ttl: int = 3600,  # agent working facts expire in 1 hour
         context_max_episodes: int = 3,
         context_max_semantic_keys: int = 20,
+        memory_scope: str | None = None,
+        memory_subject: str | None = None,
     ) -> None:
         self._semantic = semantic_store
         self._episodic = episodic_store
@@ -168,6 +180,8 @@ class MemoryManager:
         self._working_facts_ttl = working_facts_ttl
         self._context_max_episodes = context_max_episodes
         self._context_max_semantic_keys = context_max_semantic_keys
+        self._memory_scope = memory_scope
+        self._memory_subject = memory_subject
         self._conflict_log: list[dict] = []
 
     # ── Agent-level write (during run, no LLM) ────────────────────────────────
@@ -239,6 +253,48 @@ class MemoryManager:
         )
         return extracted
 
+    async def write_agent_task_end(
+        self,
+        *,
+        goal: str,
+        task_id: str,
+        agent_id: str,
+        instruction: str,
+        result: dict,
+    ) -> None:
+        """Write a compact per-agent episode after one task finishes.
+
+        This complements the run-level ``write_run_end`` summary. Agent
+        episodes are retrieved back only for that agent (within the same
+        memory scope), while the run-level episode is shared.
+        """
+        answer = str(result.get("answer") or "")
+        error = result.get("error")
+        confidence = result.get("confidence")
+        status = "failed" if error else "completed"
+        text = (
+            f"Agent {agent_id} {status} task {task_id}. "
+            f"Instruction: {instruction}. "
+            f"Answer: {answer[:1200]}"
+        )
+        if error:
+            text += f" Error: {error}"
+        metadata = {
+            "goal": goal,
+            "task_id": task_id,
+            "agent_id": agent_id,
+            "agent_ids": [agent_id],
+            "memory_kind": "agent_task",
+            "memory_policy": "append",
+            "memory_key": f"agent_task:{agent_id}",
+            "shared": False,
+            "confidence": confidence,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        if self._memory_scope is not None:
+            metadata["memory_scope"] = self._memory_scope
+        await self._episodic.write(text=text, metadata=metadata, agent_id=agent_id)
+
     async def _extract_memory(
         self,
         goal: str,
@@ -279,33 +335,35 @@ class MemoryManager:
         ttl_seconds: int | None = None,
     ) -> None:
         """Write a single global semantic fact — persists across runs, no run/agent prefix."""
-        existing = await self._semantic.read(key)
+        storage_key = self._semantic_storage_key(key)
+        existing = await self._semantic.read(storage_key)
         if existing is not None and existing != value:
             self._conflict_log.append(
                 {
-                    "key": key,
+                    "key": storage_key,
                     "old": existing,
                     "new": value,
                     "scope": "global",
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 }
             )
-        await self._semantic.write(key, value, ttl_seconds=ttl_seconds)
+        await self._semantic.write(storage_key, value, ttl_seconds=ttl_seconds)
 
     async def _write_semantic_global(self, req: MemoryWriteRequest) -> None:
         for key, value in req.semantic_facts.items():
-            existing = await self._semantic.read(key)
+            storage_key = self._semantic_storage_key(key)
+            existing = await self._semantic.read(storage_key)
             if existing is not None and existing != value:
                 self._conflict_log.append(
                     {
-                        "key": key,
+                        "key": storage_key,
                         "old": existing,
                         "new": value,
                         "scope": "global",
                         "timestamp": datetime.now(timezone.utc).isoformat(),
                     }
                 )
-            await self._semantic.write(key, value, ttl_seconds=req.ttl_seconds)
+            await self._semantic.write(storage_key, value, ttl_seconds=req.ttl_seconds)
 
     async def _write_episodic(
         self, goal: str, agent_results: list[dict], req: MemoryWriteRequest
@@ -314,14 +372,21 @@ class MemoryManager:
             "goal": goal,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "agent_ids": [r.get("agent_id") for r in agent_results],
+            "memory_kind": "run_summary",
+            "memory_policy": "latest",
+            "memory_key": f"run_summary:{self._memory_subject or _memory_key_fragment(goal)}",
+            "shared": True,
             "outcome": "success"
             if any(r.get("confidence", 0) > 0.5 for r in agent_results)
             else "uncertain",
             **req.metadata,
         }
+        if self._memory_scope is not None:
+            metadata["memory_scope"] = self._memory_scope
         return await self._episodic.write(
             text=req.episodic_summary,
             metadata=metadata,
+            agent_id="",
         )
 
     # ── Read path ─────────────────────────────────────────────────────────────
@@ -335,7 +400,7 @@ class MemoryManager:
           - Semantic: agent-specific keys first, then global facts extracted at
             run-end, up to context_max_semantic_keys total.
         """
-        episodes = await self._episodic.search(goal, top_k=self._context_max_episodes)
+        episodes = await self._search_scoped_episodes(goal, agent_id=agent_id)
 
         semantic_facts: dict[str, Any] = {}
 
@@ -349,18 +414,52 @@ class MemoryManager:
         # global facts extracted at run-end (no run: or agent: prefix)
         remaining = self._context_max_semantic_keys - len(semantic_facts)
         if remaining > 0:
-            all_facts = await self._semantic.search_prefix("")
-            global_facts = {
-                k: v
-                for k, v in all_facts.items()
-                if not k.startswith("run:") and not k.startswith("agent:")
-            }
+            if self._memory_scope is not None:
+                prefix = self._semantic_scope_prefix()
+                scoped_facts = await self._semantic.search_prefix(prefix)
+                global_facts = {
+                    k.removeprefix(prefix): v
+                    for k, v in scoped_facts.items()
+                    if not k.removeprefix(prefix).startswith("orchestrator:")
+                }
+            else:
+                all_facts = await self._semantic.search_prefix("")
+                global_facts = {
+                    k: v
+                    for k, v in all_facts.items()
+                    if not k.startswith("run:")
+                    and not k.startswith("agent:")
+                    and not k.startswith("orchestrator:")
+                    and not k.startswith("scope:")
+                }
             semantic_facts.update(dict(list(global_facts.items())[:remaining]))
 
         return MemoryContext(
             semantic_facts=semantic_facts,
             episodes=episodes,
         )
+
+    async def _search_scoped_episodes(self, goal: str, agent_id: str | None) -> list[dict]:
+        """Search episodic memory, filtering to scope and agent when configured."""
+        return await self._episodic.search(
+            goal,
+            top_k=self._context_max_episodes,
+            memory_scope=self._memory_scope,
+            agent_id=agent_id,
+            include_shared=True,
+            include_legacy=self._memory_scope is None,
+        )
+
+    def _semantic_scope_prefix(self) -> str:
+        assert self._memory_scope is not None
+        return f"scope:{self._memory_scope}:"
+
+    def _semantic_storage_key(self, key: str) -> str:
+        if self._memory_scope is None:
+            return key
+        if key.startswith(("run:", "agent:", "scope:")):
+            return key
+        return f"{self._semantic_scope_prefix()}{key}"
 
     # ── Introspection ─────────────────────────────────────────────────────────
 
@@ -370,3 +469,7 @@ class MemoryManager:
     async def lookup(self, key: str) -> Any | None:
         """Direct semantic lookup — used by memory_lookup tool in ReAct loop."""
         return await self._semantic.read(key)
+
+
+def _memory_key_fragment(value: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_.:-]+", "-", value.strip().lower()).strip("-")[:120] or "default"

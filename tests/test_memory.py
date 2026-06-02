@@ -1,4 +1,5 @@
 """Memory store + manager smoke tests."""
+
 from __future__ import annotations
 
 from memory.manager import MemoryManager
@@ -156,3 +157,225 @@ async def test_build_context_returns_episodes_for_goal():
     assert any("worker-07" in e["text"] for e in ctx.episodes)
     rendered = ctx.render()
     assert "worker-07" in rendered
+
+
+async def test_build_context_filters_internal_orchestrator_facts():
+    llm = ScriptedLLM()
+    semantic = InMemorySemanticStore()
+    episodic = InMemoryEpisodicStore()
+    await semantic.write("orchestrator:last_plan_rationale", "parallelize the audit")
+    await semantic.write("project:status", "healthy")
+    mgr = MemoryManager(semantic_store=semantic, episodic_store=episodic, llm=llm)
+
+    ctx = await mgr.build_context(goal="audit project", agent_id="diag")
+
+    assert "project:status" in ctx.semantic_facts
+    assert "orchestrator:last_plan_rationale" not in ctx.semantic_facts
+
+
+async def test_scoped_semantic_facts_do_not_leak_across_memory_scopes():
+    llm = ScriptedLLM()
+    semantic = InMemorySemanticStore()
+    episodic = InMemoryEpisodicStore()
+    sysaudit = MemoryManager(
+        semantic_store=semantic,
+        episodic_store=episodic,
+        llm=llm,
+        memory_scope="sysaudit",
+    )
+    python_demo = MemoryManager(
+        semantic_store=semantic,
+        episodic_store=episodic,
+        llm=llm,
+        memory_scope="python-demo",
+    )
+
+    await sysaudit.write_semantic_fact("project:status", "healthy")
+    await python_demo.write_semantic_fact("project:status", "pickle demo")
+    await semantic.write("project:status", "old unscoped junk")
+
+    sysaudit_ctx = await sysaudit.build_context(goal="project audit", agent_id="shell_agent")
+    python_ctx = await python_demo.build_context(goal="python module", agent_id="explainer")
+
+    assert sysaudit_ctx.semantic_facts == {"project:status": "healthy"}
+    assert python_ctx.semantic_facts == {"project:status": "pickle demo"}
+    assert await semantic.read("scope:sysaudit:project:status") == "healthy"
+    assert await semantic.read("scope:python-demo:project:status") == "pickle demo"
+
+
+async def test_build_context_filters_episodes_by_memory_scope():
+    llm = ScriptedLLM()
+    semantic = InMemorySemanticStore()
+    episodic = InMemoryEpisodicStore()
+    await episodic.write(
+        "Python json module serializes and parses JSON",
+        {"memory_scope": "python-demo", "timestamp": "old"},
+    )
+    await episodic.write(
+        "System audit found uncommitted files and high memory pressure",
+        {
+            "memory_scope": "sysaudit",
+            "agent_id": "analyst",
+            "agent_ids": ["analyst"],
+            "timestamp": "now",
+        },
+    )
+    mgr = MemoryManager(
+        semantic_store=semantic,
+        episodic_store=episodic,
+        llm=llm,
+        memory_scope="sysaudit",
+    )
+
+    ctx = await mgr.build_context(goal="project system audit action list", agent_id="analyst")
+
+    assert len(ctx.episodes) == 1
+    assert "System audit" in ctx.episodes[0]["text"]
+    assert "json module" not in ctx.render()
+
+
+async def test_build_context_includes_agent_specific_and_shared_scoped_episodes():
+    llm = ScriptedLLM()
+    semantic = InMemorySemanticStore()
+    episodic = InMemoryEpisodicStore()
+    await episodic.write(
+        "Shell agent learned to skip process listing after human guidance",
+        {
+            "memory_scope": "sysaudit",
+            "agent_id": "shell_agent",
+            "agent_ids": ["shell_agent"],
+        },
+    )
+    await episodic.write(
+        "Filesystem agent read README and pyproject successfully",
+        {
+            "memory_scope": "sysaudit",
+            "agent_id": "filesystem_agent",
+            "agent_ids": ["filesystem_agent"],
+        },
+    )
+    await episodic.write(
+        "Shared audit summary: repo had uncommitted files",
+        {"memory_scope": "sysaudit", "shared": True},
+    )
+    mgr = MemoryManager(
+        semantic_store=semantic,
+        episodic_store=episodic,
+        llm=llm,
+        memory_scope="sysaudit",
+        context_max_episodes=5,
+    )
+
+    ctx = await mgr.build_context(goal="audit shell memory", agent_id="shell_agent")
+    rendered = ctx.render()
+
+    assert "Shell agent learned" in rendered
+    assert "Shared audit summary" in rendered
+    assert "Filesystem agent read" not in rendered
+
+
+async def test_build_context_filters_agent_task_episodes_without_memory_scope():
+    llm = ScriptedLLM()
+    semantic = InMemorySemanticStore()
+    episodic = InMemoryEpisodicStore()
+    await episodic.write(
+        "Analyst-specific lesson",
+        {"memory_kind": "agent_task", "agent_id": "analyst", "agent_ids": ["analyst"]},
+    )
+    await episodic.write(
+        "Shared run lesson",
+        {"memory_kind": "run_summary", "shared": True},
+    )
+    await episodic.write("Legacy untagged memory", {"timestamp": "old"})
+    mgr = MemoryManager(semantic_store=semantic, episodic_store=episodic, llm=llm)
+
+    ctx = await mgr.build_context(goal="lesson", agent_id="reporter")
+    rendered = ctx.render()
+
+    assert "Analyst-specific lesson" not in rendered
+    assert "Shared run lesson" in rendered
+    assert "Legacy untagged memory" in rendered
+
+
+async def test_latest_policy_supersedes_older_matching_episode():
+    store = InMemoryEpisodicStore()
+    await store.write(
+        "old audit summary",
+        {
+            "memory_kind": "run_summary",
+            "memory_policy": "latest",
+            "memory_key": "run_summary:repo",
+            "shared": True,
+        },
+    )
+    await store.write(
+        "new audit summary",
+        {
+            "memory_kind": "run_summary",
+            "memory_policy": "latest",
+            "memory_key": "run_summary:repo",
+            "shared": True,
+        },
+    )
+
+    hits = await store.search("audit summary", top_k=5, agent_id="analyst")
+
+    assert [hit["text"] for hit in hits] == ["new audit summary"]
+
+
+async def test_write_run_end_uses_latest_policy_for_same_subject():
+    calls = 0
+
+    def extract(system, messages, kwargs):
+        nonlocal calls
+        calls += 1
+        return {
+            "semantic_facts": {},
+            "episodic_summary": f"run summary {calls}",
+            "metadata": {},
+            "ttl_seconds": None,
+        }
+
+    llm = ScriptedLLM(routes={"memory extraction": extract})
+    semantic = InMemorySemanticStore()
+    episodic = InMemoryEpisodicStore()
+    mgr = MemoryManager(
+        semantic_store=semantic,
+        episodic_store=episodic,
+        llm=llm,
+        memory_scope="sysaudit",
+        memory_subject="repo",
+    )
+
+    await mgr.write_run_end(goal="audit repo", agent_results=[{"confidence": 1.0}], trace=[])
+    await mgr.write_run_end(goal="audit repo", agent_results=[{"confidence": 1.0}], trace=[])
+    ctx = await mgr.build_context(goal="audit repo", agent_id="analyst")
+
+    assert "run summary 2" in ctx.render()
+    assert "run summary 1" not in ctx.render()
+
+
+async def test_write_agent_task_end_writes_agent_scoped_episode():
+    llm = ScriptedLLM()
+    semantic = InMemorySemanticStore()
+    episodic = InMemoryEpisodicStore()
+    mgr = MemoryManager(
+        semantic_store=semantic,
+        episodic_store=episodic,
+        llm=llm,
+        memory_scope="sysaudit",
+    )
+
+    await mgr.write_agent_task_end(
+        goal="audit",
+        task_id="t1",
+        agent_id="shell_agent",
+        instruction="inspect git status",
+        result={"answer": "dirty worktree", "confidence": 0.9, "success": True},
+    )
+
+    ctx = await mgr.build_context(goal="inspect git status", agent_id="shell_agent")
+    assert len(ctx.episodes) == 1
+    assert ctx.episodes[0]["metadata"]["memory_kind"] == "agent_task"
+    assert ctx.episodes[0]["metadata"]["agent_id"] == "shell_agent"
+    assert "dirty worktree" in ctx.render()
