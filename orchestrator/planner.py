@@ -198,12 +198,21 @@ class Orchestrator:
         eval_config: EvalConfig | None = None,
         checkpoint_store: Any | None = None,
         run_id: str | None = None,  # supply on resume to keep the same run_id
+        # ── Optional per-call-site LLM overrides ──────────────────────────────
+        # ``llm`` remains the default; ``planner_llm`` covers _plan / _replan
+        # (which build/repair the DAG and want strong reasoning), and
+        # ``synthesizer_llm`` covers _synthesize (which merges agent results).
+        # AgentRuntime wires these through from its own slots of the same name.
+        planner_llm: Any | None = None,
+        synthesizer_llm: Any | None = None,
     ) -> None:
         self._agents = agents
         self._memory = memory
         self._tracer = tracer
         self._guard = guard
         self._llm = llm
+        self._planner_llm = planner_llm or llm
+        self._synthesizer_llm = synthesizer_llm or llm
         self._eval = eval_config or EvalConfig()
         self._checkpoint_store = checkpoint_store
         self._run_id = run_id or str(uuid.uuid4())
@@ -542,7 +551,7 @@ class Orchestrator:
         if context:
             prompt += f"\n\nAdditional context:\n{context}"
 
-        response = await self._llm.complete(
+        response = await self._planner_llm.complete(
             system=PLAN_SYSTEM.format(agent_descriptions=agent_descriptions),
             messages=[{"role": "user", "content": prompt}],
             response_format={"type": "json_object"},
@@ -567,7 +576,7 @@ class Orchestrator:
         if not mem_context.is_empty():
             replan_prompt += f"\n\nRelevant context from memory:\n{mem_context.render()}"
 
-        response = await self._llm.complete(
+        response = await self._planner_llm.complete(
             system=REPLAN_SYSTEM.format(
                 agent_descriptions=agent_descriptions,
                 completed=json.dumps(
@@ -739,7 +748,7 @@ class Orchestrator:
             indent=2,
         )
         try:
-            response = await self._llm.complete(
+            response = await self._synthesizer_llm.complete(
                 system=SYNTHESIZE_SYSTEM,
                 messages=[
                     {

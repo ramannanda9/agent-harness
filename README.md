@@ -36,6 +36,8 @@ events to stdout and prints elapsed time + cost at the end.
 harness/runtime.py          AgentRuntime — single entry point, wire once run anything
 harness/events.py           BusEvent + EventType — canonical event vocabulary
 harness/llm/openai.py       OpenAILLM — OpenAI adapter with usage + cost tracking
+harness/llm/fallback.py     FallbackLLM — transparent retry on transient upstream errors
+harness/llm/routing.py      RoutingLLM — dispatch calls to different adapters by a selector
 harness/annotation.py       Annotation store + AnnotationHook — RLHF trajectory capture
 harness/hitl.py             HITL approval gate — interactive CLI, session-allow list
 harness/tool_policy.py      Persistent tool policy — user-scoped allow rules, CLI management
@@ -187,6 +189,99 @@ llm = ClaudeCodeLLM(
     auth_file="~/.agent-harness/auth/auth.json",
 )
 ```
+
+### Cost shaping + reliability
+
+Two patterns, ordered by how production teams actually solve this:
+
+**1. Per-call-site LLM injection (the recommended pattern)**
+
+`AgentRuntime` exposes one slot per orchestrator call site. Each defaults to
+`llm` when unset, so existing code keeps working. The classifier and router
+both see only the goal + agent descriptions (~300 tokens) and emit a
+one-token decision — natural candidates for a cheaper model. The planner
+and synthesiser produce structured DAGs and final answers and usually want
+to stay on the main model.
+
+```python
+runtime = AgentRuntime(
+    agent_registry=agents,
+    tool_registry=tools,
+    memory=memory,
+    llm=premium,                 # default — agent ReAct loops use this
+    classifier_llm=cheap,        # simple vs complex dispatch decision
+    router_llm=cheap,            # single-agent picker
+    # planner_llm=...            # defaults to llm; override only if you want
+    # synthesizer_llm=...        # defaults to llm
+)
+```
+
+No guessing, no keyword matching, no fragility — you read the runtime
+construction and you know exactly which model serves which purpose. The
+budget guard is wired into every distinct LLM instance automatically
+(deduped by object identity, so injecting the same wrapper into multiple
+slots costs no extra calls).
+
+**2. `FallbackLLM` for resilience**
+
+Try each adapter in order; transparently switch to the next on rate
+limits, timeouts, or 5xx errors:
+
+```python
+from harness.llm.fallback import FallbackLLM
+
+llm = FallbackLLM([
+    AnthropicLLM(model="claude-sonnet-4-6"),   # primary
+    OpenAILLM(model="gpt-4o-mini"),            # backup
+])
+runtime = AgentRuntime(..., llm=llm)
+print(llm.last_route)   # 0 if primary worked, 1 if backup did
+```
+
+Permanent errors (auth, bad request) propagate immediately — only transient
+upstream errors trigger fallback. Customise with `transient_errors=...`.
+Streaming retries only fire before the first token; mid-stream failures
+propagate to preserve response integrity.
+
+**3. `RoutingLLM` for bring-your-own-selector cases**
+
+When you need runtime routing — capability gating (`vision` vs
+`long_context`), learned classifiers (RouteLLM-style), cascade
+routing (cheap-then-escalate-on-low-confidence) — wrap a routes dict
+with your own selector callable:
+
+```python
+from harness.llm.routing import RoutingLLM
+
+def by_capability(system, messages):
+    if _needs_vision(messages):
+        return "vision"
+    if _estimated_tokens(system, messages) > 100_000:
+        return "long_context"
+    return "default"
+
+llm = RoutingLLM(
+    routes={
+        "default":      OpenAILLM(model="gpt-4o-mini"),
+        "vision":       OpenAILLM(model="gpt-4o"),
+        "long_context": AnthropicLLM(model="claude-sonnet-4-6"),
+    },
+    selector=by_capability,
+    default_route="default",
+)
+```
+
+The harness intentionally does not ship default selectors. Naive selectors
+(keyword matching, fixed token thresholds) misroute in subtle ways and
+encourage the wrong mental model — if you're reaching for one, you almost
+certainly want per-call-site injection instead.
+
+Compose freely: `FallbackLLM([premium, backup])` injected into the
+`llm=` slot gives the agent loops resilience, with `classifier_llm=cheap`
+and `router_llm=cheap` shaping the cheap-call cost — all without a custom
+selector.
+
+---
 
 `ClaudeCodeLLM` reads a `claude-code` OAuth entry, refreshes it automatically
 when expired, and retries once after `401`/`403`. This mirrors Pi's Claude
