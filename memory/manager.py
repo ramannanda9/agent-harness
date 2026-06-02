@@ -161,6 +161,7 @@ class MemoryManager:
         working_facts_ttl: int = 3600,  # agent working facts expire in 1 hour
         context_max_episodes: int = 3,
         context_max_semantic_keys: int = 20,
+        memory_scope: str | None = None,
     ) -> None:
         self._semantic = semantic_store
         self._episodic = episodic_store
@@ -168,6 +169,7 @@ class MemoryManager:
         self._working_facts_ttl = working_facts_ttl
         self._context_max_episodes = context_max_episodes
         self._context_max_semantic_keys = context_max_semantic_keys
+        self._memory_scope = memory_scope
         self._conflict_log: list[dict] = []
 
     # ── Agent-level write (during run, no LLM) ────────────────────────────────
@@ -239,6 +241,46 @@ class MemoryManager:
         )
         return extracted
 
+    async def write_agent_task_end(
+        self,
+        *,
+        goal: str,
+        task_id: str,
+        agent_id: str,
+        instruction: str,
+        result: dict,
+    ) -> None:
+        """Write a compact per-agent episode after one task finishes.
+
+        This complements the run-level ``write_run_end`` summary. Agent
+        episodes are retrieved back only for that agent (within the same
+        memory scope), while the run-level episode is shared.
+        """
+        answer = str(result.get("answer") or "")
+        error = result.get("error")
+        confidence = result.get("confidence")
+        status = "failed" if error else "completed"
+        text = (
+            f"Agent {agent_id} {status} task {task_id}. "
+            f"Instruction: {instruction}. "
+            f"Answer: {answer[:1200]}"
+        )
+        if error:
+            text += f" Error: {error}"
+        metadata = {
+            "goal": goal,
+            "task_id": task_id,
+            "agent_id": agent_id,
+            "agent_ids": [agent_id],
+            "memory_kind": "agent_task",
+            "shared": False,
+            "confidence": confidence,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        if self._memory_scope is not None:
+            metadata["memory_scope"] = self._memory_scope
+        await self._episodic.write(text=text, metadata=metadata)
+
     async def _extract_memory(
         self,
         goal: str,
@@ -279,33 +321,35 @@ class MemoryManager:
         ttl_seconds: int | None = None,
     ) -> None:
         """Write a single global semantic fact — persists across runs, no run/agent prefix."""
-        existing = await self._semantic.read(key)
+        storage_key = self._semantic_storage_key(key)
+        existing = await self._semantic.read(storage_key)
         if existing is not None and existing != value:
             self._conflict_log.append(
                 {
-                    "key": key,
+                    "key": storage_key,
                     "old": existing,
                     "new": value,
                     "scope": "global",
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 }
             )
-        await self._semantic.write(key, value, ttl_seconds=ttl_seconds)
+        await self._semantic.write(storage_key, value, ttl_seconds=ttl_seconds)
 
     async def _write_semantic_global(self, req: MemoryWriteRequest) -> None:
         for key, value in req.semantic_facts.items():
-            existing = await self._semantic.read(key)
+            storage_key = self._semantic_storage_key(key)
+            existing = await self._semantic.read(storage_key)
             if existing is not None and existing != value:
                 self._conflict_log.append(
                     {
-                        "key": key,
+                        "key": storage_key,
                         "old": existing,
                         "new": value,
                         "scope": "global",
                         "timestamp": datetime.now(timezone.utc).isoformat(),
                     }
                 )
-            await self._semantic.write(key, value, ttl_seconds=req.ttl_seconds)
+            await self._semantic.write(storage_key, value, ttl_seconds=req.ttl_seconds)
 
     async def _write_episodic(
         self, goal: str, agent_results: list[dict], req: MemoryWriteRequest
@@ -314,11 +358,15 @@ class MemoryManager:
             "goal": goal,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "agent_ids": [r.get("agent_id") for r in agent_results],
+            "memory_kind": "run_summary",
+            "shared": True,
             "outcome": "success"
             if any(r.get("confidence", 0) > 0.5 for r in agent_results)
             else "uncertain",
             **req.metadata,
         }
+        if self._memory_scope is not None:
+            metadata["memory_scope"] = self._memory_scope
         return await self._episodic.write(
             text=req.episodic_summary,
             metadata=metadata,
@@ -335,7 +383,7 @@ class MemoryManager:
           - Semantic: agent-specific keys first, then global facts extracted at
             run-end, up to context_max_semantic_keys total.
         """
-        episodes = await self._episodic.search(goal, top_k=self._context_max_episodes)
+        episodes = await self._search_scoped_episodes(goal, agent_id=agent_id)
 
         semantic_facts: dict[str, Any] = {}
 
@@ -349,18 +397,64 @@ class MemoryManager:
         # global facts extracted at run-end (no run: or agent: prefix)
         remaining = self._context_max_semantic_keys - len(semantic_facts)
         if remaining > 0:
-            all_facts = await self._semantic.search_prefix("")
-            global_facts = {
-                k: v
-                for k, v in all_facts.items()
-                if not k.startswith("run:") and not k.startswith("agent:")
-            }
+            if self._memory_scope is not None:
+                prefix = self._semantic_scope_prefix()
+                scoped_facts = await self._semantic.search_prefix(prefix)
+                global_facts = {
+                    k.removeprefix(prefix): v
+                    for k, v in scoped_facts.items()
+                    if not k.removeprefix(prefix).startswith("orchestrator:")
+                }
+            else:
+                all_facts = await self._semantic.search_prefix("")
+                global_facts = {
+                    k: v
+                    for k, v in all_facts.items()
+                    if not k.startswith("run:")
+                    and not k.startswith("agent:")
+                    and not k.startswith("orchestrator:")
+                    and not k.startswith("scope:")
+                }
             semantic_facts.update(dict(list(global_facts.items())[:remaining]))
 
         return MemoryContext(
             semantic_facts=semantic_facts,
             episodes=episodes,
         )
+
+    async def _search_scoped_episodes(self, goal: str, agent_id: str | None) -> list[dict]:
+        """Search episodic memory, filtering to scope and agent when configured."""
+        if self._memory_scope is None:
+            return await self._episodic.search(goal, top_k=self._context_max_episodes)
+
+        # Ask for more than we need so scoped rows are not crowded out by
+        # unrelated durable memories that happen to rank nearby.
+        raw = await self._episodic.search(goal, top_k=max(self._context_max_episodes * 5, 10))
+        scoped: list[dict] = []
+        for ep in raw:
+            metadata = ep.get("metadata", {})
+            if metadata.get("memory_scope") != self._memory_scope:
+                continue
+            if agent_id is None or metadata.get("shared") is True:
+                scoped.append(ep)
+                continue
+            if metadata.get("agent_id") == agent_id:
+                scoped.append(ep)
+                continue
+            if agent_id in (metadata.get("agent_ids") or []):
+                scoped.append(ep)
+        return scoped[: self._context_max_episodes]
+
+    def _semantic_scope_prefix(self) -> str:
+        assert self._memory_scope is not None
+        return f"scope:{self._memory_scope}:"
+
+    def _semantic_storage_key(self, key: str) -> str:
+        if self._memory_scope is None:
+            return key
+        if key.startswith(("run:", "agent:", "scope:")):
+            return key
+        return f"{self._semantic_scope_prefix()}{key}"
 
     # ── Introspection ─────────────────────────────────────────────────────────
 

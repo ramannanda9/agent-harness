@@ -30,6 +30,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import uuid
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
@@ -348,7 +349,15 @@ class BaseAgent:
                 agent_id=self.config.agent_id,
             )
             if not mem_context.is_empty():
-                parts.append(mem_context.render())
+                rendered = mem_context.render()
+                if os.environ.get("DEBUG_MEMORY_CONTEXT") == "1":
+                    print(f"\n[debug:memory] context injected for {self.config.agent_id}")
+                    print("─" * 64)
+                    print(rendered)
+                    print("─" * 64)
+                parts.append(rendered)
+            elif os.environ.get("DEBUG_MEMORY_CONTEXT") == "1":
+                print(f"\n[debug:memory] context injected for {self.config.agent_id}: (empty)")
 
         tool_list = ", ".join(self._tools.keys()) or "none"
         parts.append(REACT_FORMAT.replace("__TOOL_LIST__", tool_list))

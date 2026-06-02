@@ -39,6 +39,7 @@ Optional:
   PROJECT_DIR=...         — project root to audit (defaults to repo root)
   PYPI_PACKAGE=...        — PyPI package name to fetch (defaults to agent-harness)
   HITL_CHECKPOINT_DIR=... — override checkpoint directory (default ~/.agent-harness/checkpoints)
+  DEBUG_MEMORY_CONTEXT=1  — print memory context injected into each agent prompt
 """
 
 from __future__ import annotations
@@ -285,6 +286,7 @@ async def main() -> None:
             semantic_store=semantic_store,
             episodic_store=episodic_store,
             llm=llm,
+            memory_scope="sysaudit",
         )
 
         # Steering: one factory shared across both runtimes. The factory is
