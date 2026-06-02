@@ -59,6 +59,10 @@ def test_cli_writes_claude_code_login(monkeypatch, tmp_path):
 
     monkeypatch.setattr(cli, "AnthropicClaudeCodeOAuthClient", _Client)
     monkeypatch.setattr("builtins.input", lambda _prompt: "code#state")
+    # Without this patch, the test pops a real browser window to
+    # claude.ai/oauth/authorize during the run — `_login_claude_code`
+    # imports `open_or_print_url` lazily and calls it unconditionally.
+    monkeypatch.setattr("harness.oauth_browser.open_or_print_url", lambda *_a, **_k: None)
     monkeypatch.setattr(
         "sys.argv",
         ["agent-harness", "login", "claude-code", "--auth-file", str(path)],
