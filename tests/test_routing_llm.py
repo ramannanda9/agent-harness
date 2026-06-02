@@ -29,7 +29,7 @@ class _StubLLM:
         self.calls += 1
         return {"text": self._text, "usage": self.last_usage or {}}
 
-    async def stream_complete(self, system, messages) -> AsyncGenerator[str, None]:
+    async def stream_complete(self, system, messages, **_kwargs) -> AsyncGenerator[str, None]:
         self.stream_calls += 1
         if self._text:
             yield self._text

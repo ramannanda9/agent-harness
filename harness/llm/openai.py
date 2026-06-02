@@ -134,6 +134,8 @@ class OpenAILLM:
         self,
         system: str | None,
         messages: list[dict],
+        *,
+        source: str | None = None,
     ) -> AsyncGenerator[str, None]:
         full_messages = _prepend_system(system, messages)
         # include_usage adds a final SSE chunk with the same usage block as
@@ -158,7 +160,7 @@ class OpenAILLM:
 
         if final_chunk is not None:
             usage = self._build_usage(final_chunk, headers)
-            self._record_usage(usage, source=None)
+            self._record_usage(usage, source=source)
             self.last_usage = usage
 
     # ── Internals ─────────────────────────────────────────────────────────────

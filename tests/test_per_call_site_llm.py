@@ -369,10 +369,12 @@ async def test_dispatch_populates_budget_breakdown_with_classifier_and_router():
     assert breakdown["classifier"]["tokens_out"] == 10
     assert breakdown["router"]["tokens_in"] == 200
     assert breakdown["router"]["tokens_out"] == 20
-    # The main LLM's untagged ReAct call(s) accumulate into the totals but
-    # don't get an attributed key in the breakdown.
-    assert "react" not in breakdown
-    assert guard.tokens_in >= 100 + 200  # at least classifier + router; ReAct may add more
+    # BaseAgent tags its ReAct calls with `agent:<agent_id>`, so the
+    # main LLM's spending lands under that key.
+    assert "agent:alpha" in breakdown, (
+        f"ReAct should attribute under 'agent:alpha'; got: {list(breakdown)!r}"
+    )
+    assert guard.tokens_in >= 100 + 200 + 500  # classifier + router + ≥1 ReAct call
 
 
 @pytest.mark.asyncio

@@ -86,9 +86,11 @@ class OpenAICodexLLM:
         self,
         system: str | None,
         messages: list[dict],
+        *,
+        source: str | None = None,
     ) -> AsyncGenerator[str, None]:
         """Yield each `response.output_text.delta` token as it arrives."""
-        async for delta in self._iter_stream(system, messages, extra={}, source=None):
+        async for delta in self._iter_stream(system, messages, extra={}, source=source):
             yield delta
 
     async def aclose(self) -> None:

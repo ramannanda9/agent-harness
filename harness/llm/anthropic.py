@@ -124,6 +124,8 @@ class AnthropicLLM:
         self,
         system: str | None,
         messages: list[dict],
+        *,
+        source: str | None = None,
     ) -> AsyncGenerator[str, None]:
         sys_blocks = _system_blocks(system, prompt_caching=self._prompt_caching)
         built_messages = _build_messages(messages, prompt_caching=self._prompt_caching)
@@ -145,7 +147,7 @@ class AnthropicLLM:
             cost = _compute_cost(usage, self._cost_fn)
             if cost is not None:
                 usage["cost_usd"] = cost
-            self._record_usage(usage, source=None)
+            self._record_usage(usage, source=source)
             self.last_usage = usage
 
     # ── Internals ─────────────────────────────────────────────────────────────

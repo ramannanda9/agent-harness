@@ -104,7 +104,7 @@ async def test_agent_forwards_token_events_when_llm_streams(agent_factory):
         async def complete(self, system, messages, **kwargs):
             return {"action": "finish", "answer": "x", "confidence": 1.0}
 
-        async def stream_complete(self, system, messages):
+        async def stream_complete(self, system, messages, **_kwargs):
             for tok in ['{"action":"', "finish", '","answer":"', "ok", '","confidence":1.0}']:
                 yield tok
 

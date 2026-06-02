@@ -109,9 +109,11 @@ class ClaudeCodeLLM:
         self,
         system: str | None,
         messages: list[dict],
+        *,
+        source: str | None = None,
     ) -> AsyncGenerator[str, None]:
         async for delta in self._iter_stream(
-            system, messages, max_tokens=self._max_tokens, extra={}, source=None
+            system, messages, max_tokens=self._max_tokens, extra={}, source=source
         ):
             yield delta
 
