@@ -274,6 +274,29 @@ async def test_build_context_includes_agent_specific_and_shared_scoped_episodes(
     assert "Filesystem agent read" not in rendered
 
 
+async def test_build_context_filters_agent_task_episodes_without_memory_scope():
+    llm = ScriptedLLM()
+    semantic = InMemorySemanticStore()
+    episodic = InMemoryEpisodicStore()
+    await episodic.write(
+        "Analyst-specific lesson",
+        {"memory_kind": "agent_task", "agent_id": "analyst", "agent_ids": ["analyst"]},
+    )
+    await episodic.write(
+        "Shared run lesson",
+        {"memory_kind": "run_summary", "shared": True},
+    )
+    await episodic.write("Legacy untagged memory", {"timestamp": "old"})
+    mgr = MemoryManager(semantic_store=semantic, episodic_store=episodic, llm=llm)
+
+    ctx = await mgr.build_context(goal="lesson", agent_id="reporter")
+    rendered = ctx.render()
+
+    assert "Analyst-specific lesson" not in rendered
+    assert "Shared run lesson" in rendered
+    assert "Legacy untagged memory" in rendered
+
+
 async def test_write_agent_task_end_writes_agent_scoped_episode():
     llm = ScriptedLLM()
     semantic = InMemorySemanticStore()

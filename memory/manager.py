@@ -425,7 +425,8 @@ class MemoryManager:
     async def _search_scoped_episodes(self, goal: str, agent_id: str | None) -> list[dict]:
         """Search episodic memory, filtering to scope and agent when configured."""
         if self._memory_scope is None:
-            return await self._episodic.search(goal, top_k=self._context_max_episodes)
+            raw = await self._episodic.search(goal, top_k=max(self._context_max_episodes * 5, 10))
+            return self._filter_agent_episodes(raw, agent_id)[: self._context_max_episodes]
 
         # Ask for more than we need so scoped rows are not crowded out by
         # unrelated durable memories that happen to rank nearby.
@@ -435,15 +436,28 @@ class MemoryManager:
             metadata = ep.get("metadata", {})
             if metadata.get("memory_scope") != self._memory_scope:
                 continue
-            if agent_id is None or metadata.get("shared") is True:
-                scoped.append(ep)
+            scoped.append(ep)
+        return self._filter_agent_episodes(scoped, agent_id)[: self._context_max_episodes]
+
+    def _filter_agent_episodes(self, episodes: list[dict], agent_id: str | None) -> list[dict]:
+        """Keep shared, matching-agent, and legacy untagged episodes."""
+        if agent_id is None:
+            return episodes
+        filtered: list[dict] = []
+        for ep in episodes:
+            metadata = ep.get("metadata", {})
+            if metadata.get("shared") is True:
+                filtered.append(ep)
                 continue
             if metadata.get("agent_id") == agent_id:
-                scoped.append(ep)
+                filtered.append(ep)
                 continue
             if agent_id in (metadata.get("agent_ids") or []):
-                scoped.append(ep)
-        return scoped[: self._context_max_episodes]
+                filtered.append(ep)
+                continue
+            if not metadata.get("memory_kind") and not metadata.get("agent_id"):
+                filtered.append(ep)
+        return filtered
 
     def _semantic_scope_prefix(self) -> str:
         assert self._memory_scope is not None
