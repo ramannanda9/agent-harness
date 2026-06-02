@@ -422,6 +422,12 @@ class BaseAgent:
                         "summarizations": self._working_memory.summarization_count,
                     },
                 }
+                # Attach the current budget snapshot so dispatch_stream
+                # consumers can read totals + per-call-site breakdown off
+                # the routed path's terminal event, same shape as the
+                # orchestrator's DONE event.
+                if self._guard is not None and hasattr(self._guard, "snapshot"):
+                    result["budget"] = self._guard.snapshot()
                 logger.info(
                     "Agent %s completed: steps=%d confidence=%.2f summarizations=%d",
                     self.config.agent_id,
@@ -653,11 +659,17 @@ class BaseAgent:
             payload=before_usage,
         )
 
+        # Tag ReAct spending so it shows up in BudgetGuard.breakdown alongside
+        # classifier/router/planner/synthesizer. Per-agent attribution makes
+        # multi-agent demos surface which specialist agent actually drove the
+        # bulk of token usage.
+        react_source = f"agent:{self.config.agent_id}"
         try:
             if hasattr(self._llm, "stream_complete"):
                 async for token in self._llm.stream_complete(
                     system=None,
                     messages=messages,
+                    source=react_source,
                 ):
                     accumulated += token
                     if self.config.stream_tokens:
@@ -679,6 +691,7 @@ class BaseAgent:
                     system=None,
                     messages=messages,
                     response_format={"type": "json_object"},
+                    source=react_source,
                 )
                 response = _normalize_response(raw)
                 if response is None:

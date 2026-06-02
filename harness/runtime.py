@@ -148,6 +148,11 @@ class Tracer:
 class GuardrailConfig:
     max_total_cost_usd: float = 2.0
     max_wall_time_seconds: int = 180
+    # Token caps default to None (unlimited) so existing callers see no
+    # behaviour change. Subscription-auth adapters (claude-code, codex)
+    # finally have an enforceable dimension here — no pricing required.
+    max_input_tokens: int | None = None
+    max_output_tokens: int | None = None
     max_replan_count: int = 2  # forwarded to EvalConfig
     confidence_threshold: float = 0.6  # forwarded to EvalConfig
 
@@ -159,17 +164,49 @@ class BudgetGuard:
 
     suspend() / resume() pause the wall-time clock (e.g. during HITL waits)
     so human think-time is not counted against the agent's time budget.
+
+    Per-call-site attribution
+    -------------------------
+    `add_cost` / `add_tokens` accept an optional ``source`` tag (e.g.
+    ``"classifier"``, ``"planner"``). When supplied, the value also lands
+    in ``breakdown[source]`` alongside the running totals. Untagged spending
+    contributes to totals only — useful for the BaseAgent ReAct loop, which
+    isn't a single call site.
     """
 
     def __init__(self, config: GuardrailConfig) -> None:
         self.config = config
         self._cost: float = 0.0
+        self._tokens_in: int = 0
+        self._tokens_out: int = 0
+        self._breakdown: dict[str, dict[str, float]] = {}
         self._start: float = time.time()
         self._suspended_seconds: float = 0.0
         self._suspend_at: float | None = None
 
-    def add_cost(self, usd: float) -> None:
+    def add_cost(self, usd: float, *, source: str | None = None) -> None:
         self._cost += usd
+        if source:
+            self._attribute(source)["cost_usd"] += usd
+
+    def add_tokens(
+        self,
+        tokens_in: int,
+        tokens_out: int,
+        *,
+        source: str | None = None,
+    ) -> None:
+        self._tokens_in += int(tokens_in)
+        self._tokens_out += int(tokens_out)
+        if source:
+            slot = self._attribute(source)
+            slot["tokens_in"] += int(tokens_in)
+            slot["tokens_out"] += int(tokens_out)
+
+    def _attribute(self, source: str) -> dict[str, float]:
+        return self._breakdown.setdefault(
+            source, {"cost_usd": 0.0, "tokens_in": 0, "tokens_out": 0}
+        )
 
     def suspend(self) -> None:
         """Pause the wall-time clock. Safe to call multiple times; only the first has effect."""
@@ -192,6 +229,20 @@ class BudgetGuard:
             raise RuntimeError(
                 f"Time budget exceeded: {elapsed:.1f}s > {self.config.max_wall_time_seconds}s"
             )
+        if (
+            self.config.max_input_tokens is not None
+            and self._tokens_in > self.config.max_input_tokens
+        ):
+            raise RuntimeError(
+                f"Input token budget exceeded: {self._tokens_in} > {self.config.max_input_tokens}"
+            )
+        if (
+            self.config.max_output_tokens is not None
+            and self._tokens_out > self.config.max_output_tokens
+        ):
+            raise RuntimeError(
+                f"Output token budget exceeded: {self._tokens_out} > {self.config.max_output_tokens}"
+            )
 
     @property
     def elapsed(self) -> float:
@@ -200,6 +251,46 @@ class BudgetGuard:
     @property
     def cost(self) -> float:
         return self._cost
+
+    @property
+    def tokens_in(self) -> int:
+        return self._tokens_in
+
+    @property
+    def tokens_out(self) -> int:
+        return self._tokens_out
+
+    @property
+    def breakdown(self) -> dict[str, dict[str, float]]:
+        """Read-only snapshot of per-source spending.
+
+        Returned as a fresh dict-of-dicts so callers can mutate it freely
+        without poisoning the guard's internal state.
+        """
+        return {source: dict(values) for source, values in self._breakdown.items()}
+
+    def snapshot(self) -> dict[str, Any]:
+        """Serialisable view of the guard's state — attached to terminal
+        events so streaming consumers can read totals + breakdown without
+        ever holding a reference to the guard itself.
+
+        Shape::
+
+            {
+                "cost_usd": float,
+                "elapsed_seconds": float,
+                "tokens_in": int,
+                "tokens_out": int,
+                "breakdown": {slot: {cost_usd, tokens_in, tokens_out}, ...},
+            }
+        """
+        return {
+            "cost_usd": self._cost,
+            "elapsed_seconds": self.elapsed,
+            "tokens_in": self._tokens_in,
+            "tokens_out": self._tokens_out,
+            "breakdown": self.breakdown,
+        }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -370,15 +461,30 @@ class AgentRuntime:
             tracer.add_hook(AnnotationHook(self._annotation_store))
         return tracer
 
-    async def _run_agent_with_tracer(self, agent_id: str, task: str, tracer: Tracer, run_id: str):
+    async def _run_agent_with_tracer(
+        self,
+        agent_id: str,
+        task: str,
+        tracer: Tracer,
+        run_id: str,
+        *,
+        guard: BudgetGuard | None = None,
+    ):
         """
         Internal: run a single agent using a pre-built tracer.
         The caller is responsible for tracer.start_run() / tracer.end_run().
+
+        ``guard`` lets dispatch / run_routed reuse the guard that already
+        captured classifier / router spending, so per-call-site breakdown
+        is intact end-to-end. When None, a fresh guard is created (used by
+        direct ``run_agent_stream`` callers where there's no preceding
+        classifier or router call).
         """
         from agents.base import BaseAgent
 
-        guard = BudgetGuard(self._guardrail_config)
-        self._attach_budget(guard)
+        if guard is None:
+            guard = BudgetGuard(self._guardrail_config)
+            self._attach_budget(guard)
 
         config = self._agent_registry.get(agent_id)
         agent = BaseAgent(
@@ -578,18 +684,29 @@ class AgentRuntime:
             return await self.resume_orchestration(key)
         return await self.resume_agent(key)
 
-    def _build_orchestrator(self, run_id: str | None = None):
-        """Construct fresh tracer, guard, agents, and orchestrator for one run."""
+    def _build_orchestrator(
+        self,
+        run_id: str | None = None,
+        *,
+        guard: BudgetGuard | None = None,
+    ):
+        """Construct fresh tracer, guard, agents, and orchestrator for one run.
+
+        ``guard`` lets dispatch hand down the guard that already captured
+        classifier spending. When None, a fresh guard is created — the
+        normal path for direct ``run_stream`` callers.
+        """
         from agents.base import BaseAgent
         from orchestrator.planner import EvalConfig, Orchestrator
 
         tracer = self._make_tracer()
-        guard = BudgetGuard(self._guardrail_config)
-
-        # Adapters that implement set_budget(guard) (e.g. OpenAILLM) get the
-        # fresh per-run guard so they can call add_cost() on every completion.
-        # Duck-typed so users can plug in any LLM client that doesn't.
-        self._attach_budget(guard)
+        if guard is None:
+            guard = BudgetGuard(self._guardrail_config)
+            # Adapters that implement set_budget(guard) (e.g. OpenAILLM) get
+            # the fresh per-run guard so they can call add_cost() on every
+            # completion. Duck-typed so users can plug in any LLM client
+            # that doesn't.
+            self._attach_budget(guard)
 
         # state lives in memory, not agents — instantiate fresh per run
         agents = {
@@ -642,6 +759,7 @@ class AgentRuntime:
             system=_CLASSIFIER_SYSTEM.format(agent_descriptions=agent_descriptions),
             messages=[{"role": "user", "content": f"Goal: {goal}"}],
             response_format={"type": "json_object"},
+            source="classifier",
         )
         data = _parse_json_response(response)
         complexity = data.get("complexity", "simple")
@@ -676,6 +794,13 @@ class AgentRuntime:
                         yield event
                     return
 
+            # Create the budget guard up-front so the classifier and router
+            # LLM calls (which fire before any agent runs) land in the
+            # per-call-site breakdown alongside planner / synthesizer / agent
+            # spending. Downstream stream methods reuse this same guard.
+            guard = BudgetGuard(self._guardrail_config)
+            self._attach_budget(guard)
+
             complexity = await self._classify(goal)
             path = "routed" if complexity == "simple" else "orchestrated"
             yield BusEvent(
@@ -700,7 +825,9 @@ class AgentRuntime:
                         agent_id=agent_id,
                         payload={"agent_id": agent_id, "rationale": rationale},
                     )
-                    async for event in self._run_agent_with_tracer(agent_id, goal, tracer, run_id):
+                    async for event in self._run_agent_with_tracer(
+                        agent_id, goal, tracer, run_id, guard=guard
+                    ):
                         yield event
                 finally:
                     tracer.end_run()
@@ -708,7 +835,7 @@ class AgentRuntime:
                 # Orchestrated path owns its own trace via _build_orchestrator.
                 # run_stream re-enters _steering_lifecycle as nullcontext when
                 # the factory is already active (idempotent), so no double-start.
-                async for event in self.run_stream(goal):
+                async for event in self.run_stream(goal, guard=guard):
                     yield event
 
     async def dispatch(self, goal: str) -> dict:
@@ -745,6 +872,7 @@ class AgentRuntime:
             system=_ROUTER_SYSTEM.format(agent_descriptions=agent_descriptions),
             messages=[{"role": "user", "content": f"Goal: {goal}"}],
             response_format={"type": "json_object"},
+            source="router",
         )
 
         data = _parse_json_response(response)
@@ -774,6 +902,11 @@ class AgentRuntime:
             tracer = self._make_tracer()
             run_id = str(uuid.uuid4())
             tracer.start_run(run_id, goal)
+            # Same hoisting as dispatch_stream — the router call below
+            # otherwise fires before the budget guard is attached, dropping
+            # source="router" from the breakdown.
+            guard = BudgetGuard(self._guardrail_config)
+            self._attach_budget(guard)
             try:
                 agent_id, rationale = await self.route(goal)
                 logger.info("Router → %s (%s)", agent_id, rationale)
@@ -783,7 +916,9 @@ class AgentRuntime:
                     agent_id=agent_id,
                     payload={"agent_id": agent_id, "rationale": rationale},
                 )
-                async for event in self._run_agent_with_tracer(agent_id, goal, tracer, run_id):
+                async for event in self._run_agent_with_tracer(
+                    agent_id, goal, tracer, run_id, guard=guard
+                ):
                     yield event
             finally:
                 tracer.end_run()
@@ -842,13 +977,10 @@ class AgentRuntime:
             if event.type == EventType.DONE:
                 result = event.payload
         result["trace"] = tracer.dump()
-        result["budget"] = {
-            "elapsed_seconds": guard.elapsed,
-            "cost_usd": guard.cost,
-        }
+        result["budget"] = guard.snapshot()
         return result
 
-    async def run_stream(self, goal: str):
+    async def run_stream(self, goal: str, *, guard: BudgetGuard | None = None):
         """
         Yield BusEvents as the orchestrator runs. Caller consumes events live
         for UI / partial-result display. The final DONE event's payload is the
@@ -857,6 +989,11 @@ class AgentRuntime:
 
         Auto-resume: when --resume <key> is in sys.argv and a checkpoint store is
         configured, the saved run is transparently restored and streamed.
+
+        ``guard`` lets dispatch reuse the budget guard that already captured
+        classifier-slot spending, so the breakdown remains coherent across
+        classify → plan → synth. When None, ``_build_orchestrator`` creates
+        a fresh guard — the normal path for direct ``run_stream`` callers.
         """
         async with self._steering_lifecycle():
             if self._checkpoint_store is not None:
@@ -867,7 +1004,7 @@ class AgentRuntime:
                     async for event in self.resume_stream(resume_key):
                         yield event
                     return
-            orchestrator, _tracer, _guard = self._build_orchestrator()
+            orchestrator, _tracer, _guard = self._build_orchestrator(guard=guard)
             async for event in orchestrator.run_stream(goal):
                 yield event
 
@@ -904,7 +1041,7 @@ class AgentRuntime:
             if event.type == EventType.DONE:
                 result = event.payload
         result["trace"] = tracer.dump()
-        result["budget"] = {"elapsed_seconds": guard.elapsed, "cost_usd": guard.cost}
+        result["budget"] = guard.snapshot()
         return result
 
 

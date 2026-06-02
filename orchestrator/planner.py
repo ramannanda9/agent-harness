@@ -486,8 +486,12 @@ class Orchestrator:
                 "conflicts": synthesis.get("conflicts", []),
                 "unknowns": synthesis.get("unknowns", []),
                 "replan_count": replan_count,
+                # Flat fields preserved for back-compat; ``budget`` is the
+                # forward-looking dict carrying tokens + per-call-site
+                # breakdown alongside cost/time.
                 "cost_usd": self._guard.cost,
                 "elapsed_seconds": self._guard.elapsed,
+                "budget": self._guard.snapshot(),
                 "task_results": [
                     {
                         "task_id": r.task_id,
@@ -555,6 +559,7 @@ class Orchestrator:
             system=PLAN_SYSTEM.format(agent_descriptions=agent_descriptions),
             messages=[{"role": "user", "content": prompt}],
             response_format={"type": "json_object"},
+            source="planner",
         )
         plan = _parse_plan(response)
         validate_plan(plan, set(self._agents.keys()))
@@ -602,6 +607,7 @@ class Orchestrator:
             ),
             messages=[{"role": "user", "content": replan_prompt}],
             response_format={"type": "json_object"},
+            source="planner",
         )
         plan = _parse_plan(response)
         validate_plan(plan, set(self._agents.keys()))
@@ -757,6 +763,7 @@ class Orchestrator:
                     }
                 ],
                 response_format={"type": "json_object"},
+                source="synthesizer",
             )
             return parse_llm_json(response)
         except Exception as e:

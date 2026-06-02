@@ -26,12 +26,24 @@ class _RecordingLLM:
     phrases ("task complexity classifier", "routing agent", "planning
     agent", "synthesis agent") which lets the test confirm which slot
     each call landed in.
+
+    ``per_call_tokens`` controls how many (in, out) tokens each call
+    reports to the budget guard so per-call-site breakdown tests can
+    assert non-zero attribution.
     """
 
-    def __init__(self, *, name: str, answer: dict) -> None:
+    def __init__(
+        self,
+        *,
+        name: str,
+        answer: dict,
+        per_call_tokens: tuple[int, int] = (0, 0),
+    ) -> None:
         self.name = name
         self._answer = answer
+        self._per_call_tokens = per_call_tokens
         self.systems: list[str] = []
+        self.sources: list[str | None] = []
         self.budget: Any = None
 
     def set_budget(self, guard: Any) -> None:
@@ -39,9 +51,17 @@ class _RecordingLLM:
 
     async def complete(self, system, messages, **kwargs) -> dict:
         self.systems.append(system or "")
+        source = kwargs.get("source")
+        self.sources.append(source)
+        tokens_in, tokens_out = self._per_call_tokens
+        if self.budget is not None and (tokens_in or tokens_out):
+            self.budget.add_tokens(tokens_in, tokens_out, source=source)
         import json
 
-        return {"text": json.dumps(self._answer), "usage": {}}
+        return {
+            "text": json.dumps(self._answer),
+            "usage": {"tokens_in": tokens_in, "tokens_out": tokens_out},
+        }
 
 
 def _build_two_agent_runtime(
@@ -287,3 +307,114 @@ async def test_router_call_routes_to_router_llm():
     )
     assert not any("routing agent" in s for s in main.systems)
     assert not any("routing agent" in s for s in classifier.systems)
+
+
+# ── Source kwarg + breakdown attribution ─────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_classifier_call_passes_source_kwarg():
+    """The classifier call site tags itself ``source="classifier"`` so the
+    budget guard's breakdown shows per-call-site spending."""
+    cheap = _RecordingLLM(name="cheap", answer={"complexity": "simple"})
+    main = _RecordingLLM(
+        name="main",
+        answer={"thought": "done", "action": {"tool": "finish", "args": {"answer": "ok"}}},
+    )
+    runtime = _build_two_agent_runtime(llm=main, classifier_llm=cheap)
+
+    async for _event in runtime.dispatch_stream("hello"):
+        pass
+
+    assert "classifier" in cheap.sources, (
+        f"classifier_llm did not receive source='classifier'; got: {cheap.sources!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_dispatch_populates_budget_breakdown_with_classifier_and_router():
+    """End-to-end: a dispatch with distinct classifier/router LLMs that report
+    tokens should land in the BudgetGuard's per-source breakdown under the
+    right keys."""
+    classifier = _RecordingLLM(
+        name="classifier",
+        answer={"complexity": "simple"},
+        per_call_tokens=(100, 10),
+    )
+    router = _RecordingLLM(
+        name="router",
+        answer={"agent_id": "alpha", "rationale": "alpha is best"},
+        per_call_tokens=(200, 20),
+    )
+    main = _RecordingLLM(
+        name="main",
+        answer={"thought": "done", "action": {"tool": "finish", "args": {"answer": "ok"}}},
+        per_call_tokens=(500, 100),  # ReAct call(s); untagged
+    )
+    runtime = _build_two_agent_runtime(
+        llm=main,
+        classifier_llm=classifier,
+        router_llm=router,
+    )
+
+    async for _event in runtime.dispatch_stream("simple task"):
+        pass
+
+    # The guard is created internally per-run; we read it back via the LLM
+    # that received set_budget (any of them — they all share the same guard).
+    guard = classifier.budget
+    assert guard is not None
+    breakdown = guard.breakdown
+    assert breakdown["classifier"]["tokens_in"] == 100
+    assert breakdown["classifier"]["tokens_out"] == 10
+    assert breakdown["router"]["tokens_in"] == 200
+    assert breakdown["router"]["tokens_out"] == 20
+    # BaseAgent tags its ReAct calls with `agent:<agent_id>`, so the
+    # main LLM's spending lands under that key.
+    assert "agent:alpha" in breakdown, (
+        f"ReAct should attribute under 'agent:alpha'; got: {list(breakdown)!r}"
+    )
+    assert guard.tokens_in >= 100 + 200 + 500  # classifier + router + ≥1 ReAct call
+
+
+@pytest.mark.asyncio
+async def test_terminal_event_payload_exposes_budget_snapshot():
+    """``dispatch_stream`` consumers should be able to read the budget
+    snapshot off the terminal event payload — no need to hold a reference
+    to the guard themselves."""
+    classifier = _RecordingLLM(
+        name="classifier",
+        answer={"complexity": "simple"},
+        per_call_tokens=(100, 10),
+    )
+    router = _RecordingLLM(
+        name="router",
+        answer={"agent_id": "alpha", "rationale": "alpha is best"},
+        per_call_tokens=(200, 20),
+    )
+    # BaseAgent's finish format: {"thought", "action": "finish", "answer", "confidence"}
+    main = _RecordingLLM(
+        name="main",
+        answer={"thought": "done", "action": "finish", "answer": "ok", "confidence": 1.0},
+    )
+    runtime = _build_two_agent_runtime(
+        llm=main,
+        classifier_llm=classifier,
+        router_llm=router,
+    )
+
+    terminal = None
+    async for event in runtime.dispatch_stream("simple task"):
+        if event.type in (EventType.TASK_DONE, EventType.DONE):
+            terminal = event
+
+    assert terminal is not None
+    budget = terminal.payload.get("budget")
+    assert budget is not None, (
+        "terminal event must expose `budget` snapshot for streaming consumers"
+    )
+    assert budget["breakdown"]["classifier"]["tokens_in"] == 100
+    assert budget["breakdown"]["router"]["tokens_in"] == 200
+    assert budget["tokens_in"] >= 300  # classifier + router (+ any untagged ReAct)
+    assert "cost_usd" in budget
+    assert "elapsed_seconds" in budget

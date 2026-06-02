@@ -1,7 +1,9 @@
 # react-agent-harness
 
 Bring-your-own-LLM multi-agent harness: hybrid DAG planning with replan-on-failure,
-two-tier memory (semantic KV + episodic vector), and a streaming-primary event model.
+two-tier memory (semantic KV + episodic vector), a streaming-primary event model,
+and cost/token budgets with per-call-site attribution (classifier, router,
+planner, synthesizer, agent).
 
 Config-driven — register tools and agents, run any goal. No subclassing.
 
@@ -33,15 +35,21 @@ events to stdout and prints elapsed time + cost at the end.
 ## Architecture
 
 ```
-harness/runtime.py          AgentRuntime — single entry point, wire once run anything
+harness/runtime.py          AgentRuntime — single entry point; BudgetGuard with cost/token caps + per-call-site breakdown
 harness/events.py           BusEvent + EventType — canonical event vocabulary
-harness/llm/openai.py       OpenAILLM — OpenAI adapter with usage + cost tracking
+harness/llm/openai.py       OpenAILLM — OpenAI API-key adapter with usage + cost tracking
+harness/llm/anthropic.py    AnthropicLLM — direct Anthropic API-key adapter with prompt-caching support
+harness/llm/claude_code.py  ClaudeCodeLLM — Claude subscription OAuth adapter (experimental, ToS caveats)
+harness/llm/openai_codex.py OpenAICodexLLM — ChatGPT subscription OAuth adapter (experimental, ToS caveats)
+harness/llm/auth.py         Shared OAuth + auth-file primitives for the subscription adapters
 harness/llm/fallback.py     FallbackLLM — transparent retry on transient upstream errors
 harness/llm/routing.py      RoutingLLM — dispatch calls to different adapters by a selector
+harness/trace.py            JSONL trace recorder + replay — durable, per-event flush
+harness/trace_viewer.py     Local web timeline viewer for recorded JSONL traces
 harness/annotation.py       Annotation store + AnnotationHook — RLHF trajectory capture
 harness/hitl.py             HITL approval gate — interactive CLI, session-allow list
 harness/tool_policy.py      Persistent tool policy — user-scoped allow rules, CLI management
-harness/console.py          ConsoleRenderer — centralised BusEvent formatting for CLI apps
+harness/console.py          ConsoleRenderer — centralised BusEvent formatting + render_budget helper
 harness/steering.py         Async steering — agent.steer(text), StdinRouter pub/sub, FileSteer, factory helpers
 harness/checkpoint.py       CheckpointStore + _ResumeHint + maybe_resume_key — pluggable run-state persistence (file + Redis); auto-resume built into dispatch_stream / run_stream
 harness/otel.py             OTELHook — OpenTelemetry span exporter (opt-in)
@@ -56,7 +64,8 @@ memory/redis_store.py       Redis semantic store — durable KV with TTL
 memory/stores.py            InMemory stores — local dev default, no deps
 tools/builtin/http_fetch.py HTTPFetch — minimal read-only GET tool
 tools/builtin/fetch_image.py FetchImage — fetch URL and return OpenAI image_url block
-tools/mcp/adapter.py        MCP tool adapter — connect any MCP server
+tools/mcp/adapter.py        MCP tool adapter — stdio, SSE, streamable-HTTP transports
+tools/mcp/auth.py           ApiKeyMCPAuth + BrowserOAuthMCPAuth — auth primitives for remote MCP servers
 ```
 
 Execution is **streaming-primary**: every path yields `BusEvent`s for
@@ -589,6 +598,92 @@ async for event in runtime.dispatch_stream(goal):
 Cost ceiling fires on the *next* `check()` (start of next ReAct step or
 orchestrator batch), not synchronously mid-call — accept this for 0.0.1, the
 guard's job is preventing runaway loops, not bounding individual calls.
+
+### Token limits + per-call-site breakdown
+
+`GuardrailConfig.max_input_tokens` / `max_output_tokens` cap raw token
+usage independently of dollar cost. This is the only enforcement available
+to subscription-auth runs (`ClaudeCodeLLM`, `OpenAICodexLLM`) — those tiers
+don't expose pricing, so cost stays 0 and only token caps can fire.
+
+```python
+runtime = AgentRuntime(
+    ...,
+    guardrail_config=GuardrailConfig(
+        max_total_cost_usd=2.0,
+        max_input_tokens=100_000,
+        max_output_tokens=20_000,
+    ),
+)
+```
+
+Per-call-site attribution lives on the terminal event's `budget` payload
+— a snapshot of spending bucketed by the LLM slot that ran each call.
+The runtime tags classifier / router / planner / synthesizer calls
+automatically; ReAct agent calls go into the totals but don't get a
+bucket. So `cheap` (used for both `classifier_llm` and `router_llm`) and
+`premium` (used for `planner_llm`) report separately even though one is
+the same physical LLM instance shared across slots:
+
+```python
+async for event in runtime.dispatch_stream(goal):
+    # Routed (simple) goals terminate with TASK_DONE; orchestrated goals
+    # with DONE. Both carry the same ``budget`` shape.
+    if event.type in (EventType.TASK_DONE, EventType.DONE):
+        budget = event.payload["budget"]
+        print(f"total: in={budget['tokens_in']} out={budget['tokens_out']} "
+              f"${budget['cost_usd']:.4f}")
+        for slot, stats in budget["breakdown"].items():
+            print(f"  {slot}: in={stats['tokens_in']} out={stats['tokens_out']}")
+```
+
+The same `budget` dict is attached to `runtime.run(...)` and
+`runtime.dispatch(...)` return values under the `budget` key, so blocking
+callers don't need to read events.
+
+Anthropic / Claude Code adapters count input tokens as the *total* that
+hit the wire (non-cached + cache-creation + cache-read), so token caps
+reflect actual consumption regardless of cache hit rate. Cost calculation
+via `cost_fn` still respects cache pricing.
+
+### Evals via the trace recorder
+
+There's no shipped evals framework — opinions on scorers, judge models,
+and golden-set management belong outside the orchestration core. The
+[trace recorder](#trace-recorder--replay--local-viewer) already writes
+per-event token/cost/latency to JSONL, so a few lines of glue cover most
+in-house eval setups:
+
+```python
+import json
+from harness.trace import record_trace
+
+# 1. Record traces while running a fixture set.
+for fixture in fixtures:
+    async for _event in record_trace(
+        runtime.dispatch_stream(fixture["input"]),
+        path=f"runs/{fixture['id']}.jsonl",
+    ):
+        pass
+
+# 2. Score offline by replaying.
+def score_run(path: str, expected: str) -> dict:
+    answer = ""
+    budget = {"tokens_in": 0, "tokens_out": 0, "cost_usd": 0.0, "breakdown": {}}
+    for line in open(path):
+        event = json.loads(line)
+        if event["type"] in ("done", "task_done"):
+            answer = event["payload"].get("answer", "")
+            budget = event["payload"].get("budget", budget)
+    return {
+        "success": expected.lower() in answer.lower(),
+        **budget,  # tokens_in, tokens_out, cost_usd, breakdown
+    }
+```
+
+Plug in your own scorer (exact-match, LLM-judge, semantic similarity) on
+top. External tools like Braintrust, LangSmith, and Weave are
+purpose-built for this and ingest the same JSONL shape directly.
 
 ## Tool execution
 
