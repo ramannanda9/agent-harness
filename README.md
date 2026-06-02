@@ -590,6 +590,92 @@ Cost ceiling fires on the *next* `check()` (start of next ReAct step or
 orchestrator batch), not synchronously mid-call — accept this for 0.0.1, the
 guard's job is preventing runaway loops, not bounding individual calls.
 
+### Token limits + per-call-site breakdown
+
+`GuardrailConfig.max_input_tokens` / `max_output_tokens` cap raw token
+usage independently of dollar cost. This is the only enforcement available
+to subscription-auth runs (`ClaudeCodeLLM`, `OpenAICodexLLM`) — those tiers
+don't expose pricing, so cost stays 0 and only token caps can fire.
+
+```python
+runtime = AgentRuntime(
+    ...,
+    guardrail_config=GuardrailConfig(
+        max_total_cost_usd=2.0,
+        max_input_tokens=100_000,
+        max_output_tokens=20_000,
+    ),
+)
+```
+
+Per-call-site attribution lives on the terminal event's `budget` payload
+— a snapshot of spending bucketed by the LLM slot that ran each call.
+The runtime tags classifier / router / planner / synthesizer calls
+automatically; ReAct agent calls go into the totals but don't get a
+bucket. So `cheap` (used for both `classifier_llm` and `router_llm`) and
+`premium` (used for `planner_llm`) report separately even though one is
+the same physical LLM instance shared across slots:
+
+```python
+async for event in runtime.dispatch_stream(goal):
+    # Routed (simple) goals terminate with TASK_DONE; orchestrated goals
+    # with DONE. Both carry the same ``budget`` shape.
+    if event.type in (EventType.TASK_DONE, EventType.DONE):
+        budget = event.payload["budget"]
+        print(f"total: in={budget['tokens_in']} out={budget['tokens_out']} "
+              f"${budget['cost_usd']:.4f}")
+        for slot, stats in budget["breakdown"].items():
+            print(f"  {slot}: in={stats['tokens_in']} out={stats['tokens_out']}")
+```
+
+The same `budget` dict is attached to `runtime.run(...)` and
+`runtime.dispatch(...)` return values under the `budget` key, so blocking
+callers don't need to read events.
+
+Anthropic / Claude Code adapters count input tokens as the *total* that
+hit the wire (non-cached + cache-creation + cache-read), so token caps
+reflect actual consumption regardless of cache hit rate. Cost calculation
+via `cost_fn` still respects cache pricing.
+
+### Evals via the trace recorder
+
+There's no shipped evals framework — opinions on scorers, judge models,
+and golden-set management belong outside the orchestration core. The
+[trace recorder](#trace-recorder--replay--local-viewer) already writes
+per-event token/cost/latency to JSONL, so a few lines of glue cover most
+in-house eval setups:
+
+```python
+import json
+from harness.trace import record_trace
+
+# 1. Record traces while running a fixture set.
+for fixture in fixtures:
+    async for _event in record_trace(
+        runtime.dispatch_stream(fixture["input"]),
+        path=f"runs/{fixture['id']}.jsonl",
+    ):
+        pass
+
+# 2. Score offline by replaying.
+def score_run(path: str, expected: str) -> dict:
+    answer = ""
+    budget = {"tokens_in": 0, "tokens_out": 0, "cost_usd": 0.0, "breakdown": {}}
+    for line in open(path):
+        event = json.loads(line)
+        if event["type"] in ("done", "task_done"):
+            answer = event["payload"].get("answer", "")
+            budget = event["payload"].get("budget", budget)
+    return {
+        "success": expected.lower() in answer.lower(),
+        **budget,  # tokens_in, tokens_out, cost_usd, breakdown
+    }
+```
+
+Plug in your own scorer (exact-match, LLM-judge, semantic similarity) on
+top. External tools like Braintrust, LangSmith, and Weave are
+purpose-built for this and ingest the same JSONL shape directly.
+
 ## Tool execution
 
 Tools that shell out (`kubectl`, `curl`, `sh -c …`) should not run inside the

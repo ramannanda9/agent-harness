@@ -101,6 +101,8 @@ class OpenAILLM:
         self,
         system: str | None,
         messages: list[dict],
+        *,
+        source: str | None = None,
         **kwargs: Any,
     ) -> dict:
         full_messages = _prepend_system(system, messages)
@@ -120,7 +122,7 @@ class OpenAILLM:
         resp = raw.parse()
         headers = _headers_dict(raw)
         usage = self._build_usage(resp, headers)
-        self._record_cost(usage)
+        self._record_usage(usage, source=source)
         self.last_usage = usage
 
         content = resp.choices[0].message.content or ""
@@ -156,7 +158,7 @@ class OpenAILLM:
 
         if final_chunk is not None:
             usage = self._build_usage(final_chunk, headers)
-            self._record_cost(usage)
+            self._record_usage(usage, source=None)
             self.last_usage = usage
 
     # ── Internals ─────────────────────────────────────────────────────────────
@@ -185,12 +187,24 @@ class OpenAILLM:
             usage["cost_usd"] = cost
         return usage
 
-    def _record_cost(self, usage: dict) -> None:
-        if not self._budget:
+    def _record_usage(self, usage: dict, *, source: str | None) -> None:
+        """Forward usage to the budget guard.
+
+        Tokens are reported on every call (even when no ``cost_fn`` is wired)
+        so token-based caps still fire. Cost is forwarded only when known.
+        Both calls accept the per-call-site ``source`` tag so the guard's
+        breakdown attributes spending to the right slot.
+        """
+        guard = self._budget
+        if not guard:
             return
+        tokens_in = int(usage.get("tokens_in") or 0)
+        tokens_out = int(usage.get("tokens_out") or 0)
+        if (tokens_in or tokens_out) and hasattr(guard, "add_tokens"):
+            guard.add_tokens(tokens_in, tokens_out, source=source)
         cost = usage.get("cost_usd")
         if cost and cost > 0:
-            self._budget.add_cost(cost)
+            guard.add_cost(cost, source=source)
 
 
 # ── Module-level helpers ─────────────────────────────────────────────────────

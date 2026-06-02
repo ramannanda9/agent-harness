@@ -422,6 +422,12 @@ class BaseAgent:
                         "summarizations": self._working_memory.summarization_count,
                     },
                 }
+                # Attach the current budget snapshot so dispatch_stream
+                # consumers can read totals + per-call-site breakdown off
+                # the routed path's terminal event, same shape as the
+                # orchestrator's DONE event.
+                if self._guard is not None and hasattr(self._guard, "snapshot"):
+                    result["budget"] = self._guard.snapshot()
                 logger.info(
                     "Agent %s completed: steps=%d confidence=%.2f summarizations=%d",
                     self.config.agent_id,

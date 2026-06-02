@@ -47,12 +47,24 @@ class OpenAICodexLLM:
         self._client = http_client
         self._owns_client = http_client is None
         self._codex_originator = codex_originator
+        self._budget: Any = None
         self.last_usage: dict | None = None
+
+    def set_budget(self, guard: Any) -> None:
+        """Inject a BudgetGuard so token caps fire on subscription-auth runs.
+
+        Cost stays 0 (no pricing schedule available for the subscription
+        tier), but ``add_tokens`` still lands so ``max_input_tokens`` /
+        ``max_output_tokens`` are enforced.
+        """
+        self._budget = guard
 
     async def complete(
         self,
         system: str | None,
         messages: list[dict],
+        *,
+        source: str | None = None,
         **kwargs: Any,
     ) -> dict:
         """Collect the streaming response into a single text + usage dict.
@@ -62,7 +74,7 @@ class OpenAICodexLLM:
         only returns SSE; we just buffer the deltas before returning.
         """
         text_parts: list[str] = []
-        async for delta in self._iter_stream(system, messages, extra=kwargs):
+        async for delta in self._iter_stream(system, messages, extra=kwargs, source=source):
             text_parts.append(delta)
         text = "".join(text_parts)
         usage = self.last_usage or {}
@@ -76,7 +88,7 @@ class OpenAICodexLLM:
         messages: list[dict],
     ) -> AsyncGenerator[str, None]:
         """Yield each `response.output_text.delta` token as it arrives."""
-        async for delta in self._iter_stream(system, messages, extra={}):
+        async for delta in self._iter_stream(system, messages, extra={}, source=None):
             yield delta
 
     async def aclose(self) -> None:
@@ -91,6 +103,7 @@ class OpenAICodexLLM:
         messages: list[dict],
         *,
         extra: dict[str, Any],
+        source: str | None = None,
     ) -> AsyncGenerator[str, None]:
         """Single source of truth: open an SSE stream, yield deltas, set
         `self.last_usage` from the final event. Auth refresh on 401/403
@@ -153,9 +166,26 @@ class OpenAICodexLLM:
                         if text:
                             yield text
                 self.last_usage = usage
+                self._record_usage(usage, source=source)
                 return
 
         raise RuntimeError("Codex authentication failed after refresh")
+
+    def _record_usage(self, usage: dict, *, source: str | None) -> None:
+        """Report token totals to the budget guard.
+
+        Codex backend reports `tokens_in` / `tokens_out` directly; cached
+        input tokens are tracked separately but billed at the same wall-clock
+        rate from the user's perspective, so they count toward
+        ``max_input_tokens`` too. No cost is reported.
+        """
+        guard = self._budget
+        if not guard or not hasattr(guard, "add_tokens"):
+            return
+        tokens_in = int(usage.get("tokens_in") or 0) + int(usage.get("cached_input_tokens") or 0)
+        tokens_out = int(usage.get("tokens_out") or 0)
+        if tokens_in or tokens_out:
+            guard.add_tokens(tokens_in, tokens_out, source=source)
 
     async def _get_client(self) -> Any:
         if self._client is None:

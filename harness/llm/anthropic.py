@@ -91,6 +91,8 @@ class AnthropicLLM:
         self,
         system: str | None,
         messages: list[dict],
+        *,
+        source: str | None = None,
         **kwargs: Any,
     ) -> dict:
         max_tokens = int(kwargs.pop("max_tokens", self._max_tokens))
@@ -110,7 +112,7 @@ class AnthropicLLM:
         cost = _compute_cost(usage, self._cost_fn)
         if cost is not None:
             usage["cost_usd"] = cost
-        self._record_cost(usage)
+        self._record_usage(usage, source=source)
         self.last_usage = usage
 
         text = _collect_text(resp.content)
@@ -143,17 +145,34 @@ class AnthropicLLM:
             cost = _compute_cost(usage, self._cost_fn)
             if cost is not None:
                 usage["cost_usd"] = cost
-            self._record_cost(usage)
+            self._record_usage(usage, source=None)
             self.last_usage = usage
 
     # ── Internals ─────────────────────────────────────────────────────────────
 
-    def _record_cost(self, usage: dict) -> None:
-        if not self._budget:
+    def _record_usage(self, usage: dict, *, source: str | None) -> None:
+        """Forward usage to the budget guard.
+
+        Token count for budget purposes is the total input that hit the wire
+        — non-cached + cache-creation + cache-read — so token caps reflect
+        real wall-clock consumption regardless of cache hit rate. Cost
+        (which respects cache pricing via ``cost_fn``) is reported when
+        known.
+        """
+        guard = self._budget
+        if not guard:
             return
+        tokens_in = (
+            int(usage.get("tokens_in") or 0)
+            + int(usage.get("cache_read_tokens") or 0)
+            + int(usage.get("cache_creation_tokens") or 0)
+        )
+        tokens_out = int(usage.get("tokens_out") or 0)
+        if (tokens_in or tokens_out) and hasattr(guard, "add_tokens"):
+            guard.add_tokens(tokens_in, tokens_out, source=source)
         cost = usage.get("cost_usd")
         if cost and cost > 0:
-            self._budget.add_cost(cost)
+            guard.add_cost(cost, source=source)
 
 
 # ── Module-level helpers ──────────────────────────────────────────────────────

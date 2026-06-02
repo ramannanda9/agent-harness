@@ -68,12 +68,24 @@ class ClaudeCodeLLM:
         self._user_agent = user_agent or _default_user_agent()
         self._betas = betas
         self._prompt_caching = prompt_caching
+        self._budget: Any = None
         self.last_usage: dict | None = None
+
+    def set_budget(self, guard: Any) -> None:
+        """Inject a BudgetGuard so token caps fire on subscription-auth runs.
+
+        Cost stays 0 (no pricing schedule available for the subscription
+        tier), but ``add_tokens`` still lands so ``max_input_tokens`` /
+        ``max_output_tokens`` are enforced.
+        """
+        self._budget = guard
 
     async def complete(
         self,
         system: str | None,
         messages: list[dict],
+        *,
+        source: str | None = None,
         **kwargs: Any,
     ) -> dict:
         """Collect the streaming response into a single text + usage dict.
@@ -84,7 +96,9 @@ class ClaudeCodeLLM:
         """
         max_tokens = int(kwargs.pop("max_tokens", self._max_tokens))
         parts: list[str] = []
-        async for delta in self._iter_stream(system, messages, max_tokens=max_tokens, extra=kwargs):
+        async for delta in self._iter_stream(
+            system, messages, max_tokens=max_tokens, extra=kwargs, source=source
+        ):
             parts.append(delta)
         text = "".join(parts)
         if not text:
@@ -97,7 +111,7 @@ class ClaudeCodeLLM:
         messages: list[dict],
     ) -> AsyncGenerator[str, None]:
         async for delta in self._iter_stream(
-            system, messages, max_tokens=self._max_tokens, extra={}
+            system, messages, max_tokens=self._max_tokens, extra={}, source=None
         ):
             yield delta
 
@@ -114,6 +128,7 @@ class ClaudeCodeLLM:
         *,
         max_tokens: int,
         extra: dict[str, Any],
+        source: str | None = None,
     ) -> AsyncGenerator[str, None]:
         """Single source of truth: open Anthropic SSE stream, yield text
         deltas, populate `self.last_usage`. Auth refresh on 401/403
@@ -182,9 +197,30 @@ class ClaudeCodeLLM:
                     "total_tokens": tokens_in + tokens_out,
                     "provider": "claude-code",
                 }
+                self._record_usage(self.last_usage, source=source)
                 return
 
         raise RuntimeError("Claude Code authentication failed after refresh")
+
+    def _record_usage(self, usage: dict, *, source: str | None) -> None:
+        """Report token totals to the budget guard.
+
+        Tokens budgeted = total input that hit the wire (non-cached +
+        cache-creation + cache-read) plus output tokens — so ``max_input_tokens``
+        / ``max_output_tokens`` reflect real consumption regardless of cache
+        hit rate. No cost is reported (subscription auth, no pricing).
+        """
+        guard = self._budget
+        if not guard or not hasattr(guard, "add_tokens"):
+            return
+        tokens_in = (
+            int(usage.get("tokens_in") or 0)
+            + int(usage.get("cache_read_tokens") or 0)
+            + int(usage.get("cache_creation_tokens") or 0)
+        )
+        tokens_out = int(usage.get("tokens_out") or 0)
+        if tokens_in or tokens_out:
+            guard.add_tokens(tokens_in, tokens_out, source=source)
 
     async def _get_client(self) -> Any:
         if self._client is None:
