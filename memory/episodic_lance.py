@@ -24,7 +24,11 @@ Schema (Lance/Arrow):
   metadata     string (JSON)
   timestamp    float64 (unix)
   agent_id     string
+  memory_scope string
+  memory_kind  string
+  shared       bool
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -40,32 +44,34 @@ import pyarrow as pa
 logger = logging.getLogger(__name__)
 
 # ── Embedding dimension constants ─────────────────────────────────────────────
-DIM_MINI    = 384    # all-MiniLM-L6-v2 — fast, good quality
-DIM_LARGE   = 768    # all-mpnet-base-v2 — slower, better quality
-DIM_OPENAI  = 1536   # text-embedding-3-small
-DIM_MOCK    = 64     # for tests
+DIM_MINI = 384  # all-MiniLM-L6-v2 — fast, good quality
+DIM_LARGE = 768  # all-mpnet-base-v2 — slower, better quality
+DIM_OPENAI = 1536  # text-embedding-3-small
+DIM_MOCK = 64  # for tests
 
 
 # ── Embedder Protocol ─────────────────────────────────────────────────────────
 
+
 @runtime_checkable
 class Embedder(Protocol):
     dim: int
+
     async def embed(self, texts: list[str]) -> list[list[float]]: ...
 
 
 # ── Embedder Implementations ──────────────────────────────────────────────────
 
+
 class MockEmbedder:
     """Random embeddings — for tests and local dev without ML deps."""
+
     dim = DIM_MOCK
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
         import random
-        return [
-            [random.gauss(0, 1) for _ in range(self.dim)]
-            for _ in texts
-        ]
+
+        return [[random.gauss(0, 1) for _ in range(self.dim)] for _ in texts]
 
 
 class LocalEmbedder:
@@ -75,15 +81,17 @@ class LocalEmbedder:
     First call downloads model (~90MB for MiniLM).
     Subsequent calls: ~5ms per batch on CPU, ~0.5ms on GPU.
     """
+
     dim = DIM_MINI
 
     def __init__(self, model_name: str = "all-MiniLM-L6-v2") -> None:
         self._model_name = model_name
-        self._model = None   # lazy load
+        self._model = None  # lazy load
 
     def _load(self):
         if self._model is None:
             from sentence_transformers import SentenceTransformer
+
             self._model = SentenceTransformer(self._model_name)
             logger.info("Loaded embedding model: %s (dim=%d)", self._model_name, self.dim)
 
@@ -91,8 +99,7 @@ class LocalEmbedder:
         self._load()
         loop = asyncio.get_event_loop()
         embeddings = await loop.run_in_executor(
-            None,
-            lambda: self._model.encode(texts, convert_to_numpy=True).tolist()
+            None, lambda: self._model.encode(texts, convert_to_numpy=True).tolist()
         )
         return embeddings
 
@@ -103,6 +110,7 @@ class OpenAIEmbedder:
     pip install openai
     Batched: max 2048 texts per API call.
     """
+
     dim = DIM_OPENAI
 
     def __init__(self, model: str = "text-embedding-3-small") -> None:
@@ -110,17 +118,19 @@ class OpenAIEmbedder:
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
         import openai
+
         client = openai.AsyncOpenAI()
         # batch in chunks of 2048
         all_embeddings = []
         for i in range(0, len(texts), 2048):
-            chunk = texts[i:i + 2048]
+            chunk = texts[i : i + 2048]
             resp = await client.embeddings.create(input=chunk, model=self._model)
             all_embeddings.extend([e.embedding for e in resp.data])
         return all_embeddings
 
 
 # ── Write Buffer ──────────────────────────────────────────────────────────────
+
 
 @dataclass
 class EpisodeRecord:
@@ -130,6 +140,9 @@ class EpisodeRecord:
     metadata: dict
     timestamp: float
     agent_id: str
+    memory_scope: str
+    memory_kind: str
+    shared: bool
 
 
 class WriteBuffer:
@@ -147,7 +160,7 @@ class WriteBuffer:
 
     def __init__(
         self,
-        flush_fn,                          # async callable(list[EpisodeRecord])
+        flush_fn,  # async callable(list[EpisodeRecord])
         flush_batch_size: int = 50,
         flush_interval_seconds: float = 5.0,
     ) -> None:
@@ -190,17 +203,49 @@ class WriteBuffer:
 
 # ── LanceDB Episodic Store ────────────────────────────────────────────────────
 
+
 # Arrow schema — fixed at creation time
 # embedding dim must match embedder.dim
 def _make_schema(dim: int) -> pa.Schema:
-    return pa.schema([
-        pa.field("episode_id", pa.string()),
-        pa.field("text",       pa.string()),
-        pa.field("embedding",  pa.list_(pa.float32(), dim)),
-        pa.field("metadata",   pa.string()),   # JSON blob
-        pa.field("timestamp",  pa.float64()),
-        pa.field("agent_id",   pa.string()),
-    ])
+    return pa.schema(
+        [
+            pa.field("episode_id", pa.string()),
+            pa.field("text", pa.string()),
+            pa.field("embedding", pa.list_(pa.float32(), dim)),
+            pa.field("metadata", pa.string()),  # JSON blob
+            pa.field("timestamp", pa.float64()),
+            pa.field("agent_id", pa.string()),
+            pa.field("memory_scope", pa.string()),
+            pa.field("memory_kind", pa.string()),
+            pa.field("shared", pa.bool_()),
+        ]
+    )
+
+
+def _sql_quote(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _build_where(
+    *,
+    memory_scope: str | None,
+    agent_id: str | None,
+    include_shared: bool,
+    include_legacy: bool,
+) -> str:
+    clauses: list[str] = []
+    if memory_scope is not None:
+        clauses.append(f"memory_scope = {_sql_quote(memory_scope)}")
+    else:
+        clauses.append("memory_scope = ''")
+    if agent_id is not None:
+        agent_parts = [f"agent_id = {_sql_quote(agent_id)}"]
+        if include_shared:
+            agent_parts.append("shared = true")
+        if include_legacy:
+            agent_parts.append("(memory_kind = '' AND agent_id = '')")
+        clauses.append("(" + " OR ".join(agent_parts) + ")")
+    return " AND ".join(clauses)
 
 
 class LanceDBEpisodicStore:
@@ -226,9 +271,9 @@ class LanceDBEpisodicStore:
         results = await store.search("GPU latency spike", top_k=3)
     """
 
-    MIN_ROWS_FOR_INDEX = 256    # below this, brute-force scan beats IVF_PQ overhead
-    IVF_PARTITIONS    = 32      # IVF partitions — sqrt(num_rows) is a good heuristic
-    PQ_SUB_VECTORS    = 16      # product quantization sub-vectors — dim/PQ_SUB_VECTORS >= 4
+    MIN_ROWS_FOR_INDEX = 256  # below this, brute-force scan beats IVF_PQ overhead
+    IVF_PARTITIONS = 32  # IVF partitions — sqrt(num_rows) is a good heuristic
+    PQ_SUB_VECTORS = 16  # product quantization sub-vectors — dim/PQ_SUB_VECTORS >= 4
 
     def __init__(
         self,
@@ -257,27 +302,38 @@ class LanceDBEpisodicStore:
         await loop.run_in_executor(None, self._open_or_create)
         logger.info(
             "LanceDBEpisodicStore initialized: uri=%s table=%s dim=%d",
-            self._uri, self._table_name, self._embedder.dim,
+            self._uri,
+            self._table_name,
+            self._embedder.dim,
         )
 
     def _open_or_create(self) -> None:
         import lancedb
+
         self._db = lancedb.connect(self._uri)
         existing = self._db.table_names()
         if self._table_name in existing:
             self._table = self._db.open_table(self._table_name)
-            logger.debug("Opened existing Lance table: %s (%d rows)",
-                         self._table_name, self._table.count_rows())
+            logger.debug(
+                "Opened existing Lance table: %s (%d rows)",
+                self._table_name,
+                self._table.count_rows(),
+            )
         else:
             # create with empty batch to establish schema
-            empty = pa.table({
-                "episode_id": pa.array([], type=pa.string()),
-                "text":       pa.array([], type=pa.string()),
-                "embedding":  pa.array([], type=pa.list_(pa.float32(), self._embedder.dim)),
-                "metadata":   pa.array([], type=pa.string()),
-                "timestamp":  pa.array([], type=pa.float64()),
-                "agent_id":   pa.array([], type=pa.string()),
-            })
+            empty = pa.table(
+                {
+                    "episode_id": pa.array([], type=pa.string()),
+                    "text": pa.array([], type=pa.string()),
+                    "embedding": pa.array([], type=pa.list_(pa.float32(), self._embedder.dim)),
+                    "metadata": pa.array([], type=pa.string()),
+                    "timestamp": pa.array([], type=pa.float64()),
+                    "agent_id": pa.array([], type=pa.string()),
+                    "memory_scope": pa.array([], type=pa.string()),
+                    "memory_kind": pa.array([], type=pa.string()),
+                    "shared": pa.array([], type=pa.bool_()),
+                }
+            )
             self._table = self._db.create_table(self._table_name, data=empty)
             logger.debug("Created new Lance table: %s", self._table_name)
 
@@ -301,6 +357,9 @@ class LanceDBEpisodicStore:
             metadata=metadata,
             timestamp=time.time(),
             agent_id=agent_id,
+            memory_scope=str(metadata.get("memory_scope") or ""),
+            memory_kind=str(metadata.get("memory_kind") or ""),
+            shared=bool(metadata.get("shared") is True),
         )
         # non-blocking — buffer handles flush
         await self._write_buffer.add(record)
@@ -314,17 +373,22 @@ class LanceDBEpisodicStore:
         await self._maybe_build_index()
 
     def _do_write_batch(self, records: list[EpisodeRecord]) -> None:
-        batch = pa.table({
-            "episode_id": pa.array([r.episode_id for r in records], type=pa.string()),
-            "text":       pa.array([r.text for r in records],       type=pa.string()),
-            "embedding":  pa.array(
-                [r.embedding for r in records],
-                type=pa.list_(pa.float32(), self._embedder.dim),
-            ),
-            "metadata":   pa.array([json.dumps(r.metadata) for r in records], type=pa.string()),
-            "timestamp":  pa.array([r.timestamp for r in records],  type=pa.float64()),
-            "agent_id":   pa.array([r.agent_id for r in records],   type=pa.string()),
-        })
+        batch = pa.table(
+            {
+                "episode_id": pa.array([r.episode_id for r in records], type=pa.string()),
+                "text": pa.array([r.text for r in records], type=pa.string()),
+                "embedding": pa.array(
+                    [r.embedding for r in records],
+                    type=pa.list_(pa.float32(), self._embedder.dim),
+                ),
+                "metadata": pa.array([json.dumps(r.metadata) for r in records], type=pa.string()),
+                "timestamp": pa.array([r.timestamp for r in records], type=pa.float64()),
+                "agent_id": pa.array([r.agent_id for r in records], type=pa.string()),
+                "memory_scope": pa.array([r.memory_scope for r in records], type=pa.string()),
+                "memory_kind": pa.array([r.memory_kind for r in records], type=pa.string()),
+                "shared": pa.array([r.shared for r in records], type=pa.bool_()),
+            }
+        )
         self._table.add(batch)
 
     # ── Index Management ──────────────────────────────────────────────────────
@@ -358,7 +422,16 @@ class LanceDBEpisodicStore:
 
     # ── Search ────────────────────────────────────────────────────────────────
 
-    async def search(self, query: str, top_k: int = 3) -> list[dict]:
+    async def search(
+        self,
+        query: str,
+        top_k: int = 3,
+        *,
+        memory_scope: str | None = None,
+        agent_id: str | None = None,
+        include_shared: bool = True,
+        include_legacy: bool = True,
+    ) -> list[dict]:
         """
         ANN vector search — returns top_k most similar episodes.
         Uses IVF_PQ index if available, brute-force otherwise.
@@ -373,23 +446,43 @@ class LanceDBEpisodicStore:
         loop = asyncio.get_event_loop()
         rows = await loop.run_in_executor(
             None,
-            lambda: self._do_search(query_vec, top_k),
+            lambda: self._do_search(
+                query_vec,
+                top_k,
+                memory_scope=memory_scope,
+                agent_id=agent_id,
+                include_shared=include_shared,
+                include_legacy=include_legacy,
+            ),
         )
         return rows
 
-    def _do_search(self, query_vec: list[float], top_k: int) -> list[dict]:
-        results = (
-            self._table
-            .search(query_vec, vector_column_name="embedding")
-            .limit(top_k)
-            .to_list()
+    def _do_search(
+        self,
+        query_vec: list[float],
+        top_k: int,
+        *,
+        memory_scope: str | None,
+        agent_id: str | None,
+        include_shared: bool,
+        include_legacy: bool,
+    ) -> list[dict]:
+        query = self._table.search(query_vec, vector_column_name="embedding")
+        where = _build_where(
+            memory_scope=memory_scope,
+            agent_id=agent_id,
+            include_shared=include_shared,
+            include_legacy=include_legacy,
         )
+        if where:
+            query = query.where(where)
+        results = query.limit(top_k).to_list()
         return [
             {
-                "id":       row["episode_id"],
-                "text":     row["text"],
+                "id": row["episode_id"],
+                "text": row["text"],
                 "metadata": json.loads(row["metadata"]) if row["metadata"] else {},
-                "score":    row.get("_distance", 0.0),
+                "score": row.get("_distance", 0.0),
                 "agent_id": row["agent_id"],
             }
             for row in results
@@ -401,20 +494,14 @@ class LanceDBEpisodicStore:
         loop = asyncio.get_event_loop()
         rows = await loop.run_in_executor(
             None,
-            lambda: (
-                self._table
-                .search()
-                .where(f"episode_id = '{episode_id}'")
-                .limit(1)
-                .to_list()
-            ),
+            lambda: (self._table.search().where(f"episode_id = '{episode_id}'").limit(1).to_list()),
         )
         if not rows:
             return None
         row = rows[0]
         return {
-            "id":       row["episode_id"],
-            "text":     row["text"],
+            "id": row["episode_id"],
+            "text": row["text"],
             "metadata": json.loads(row["metadata"]) if row["metadata"] else {},
             "agent_id": row["agent_id"],
         }

@@ -49,8 +49,17 @@ class SemanticStore(Protocol):
 
 @runtime_checkable
 class EpisodicStore(Protocol):
-    async def write(self, text: str, metadata: dict) -> str: ...  # returns episode_id
-    async def search(self, query: str, top_k: int = 3) -> list[dict]: ...
+    async def write(self, text: str, metadata: dict, agent_id: str = "") -> str: ...
+    async def search(
+        self,
+        query: str,
+        top_k: int = 3,
+        *,
+        memory_scope: str | None = None,
+        agent_id: str | None = None,
+        include_shared: bool = True,
+        include_legacy: bool = True,
+    ) -> list[dict]: ...
     async def get(self, episode_id: str) -> dict | None: ...
 
 
@@ -279,7 +288,7 @@ class MemoryManager:
         }
         if self._memory_scope is not None:
             metadata["memory_scope"] = self._memory_scope
-        await self._episodic.write(text=text, metadata=metadata)
+        await self._episodic.write(text=text, metadata=metadata, agent_id=agent_id)
 
     async def _extract_memory(
         self,
@@ -370,6 +379,7 @@ class MemoryManager:
         return await self._episodic.write(
             text=req.episodic_summary,
             metadata=metadata,
+            agent_id="",
         )
 
     # ── Read path ─────────────────────────────────────────────────────────────
@@ -424,40 +434,14 @@ class MemoryManager:
 
     async def _search_scoped_episodes(self, goal: str, agent_id: str | None) -> list[dict]:
         """Search episodic memory, filtering to scope and agent when configured."""
-        if self._memory_scope is None:
-            raw = await self._episodic.search(goal, top_k=max(self._context_max_episodes * 5, 10))
-            return self._filter_agent_episodes(raw, agent_id)[: self._context_max_episodes]
-
-        # Ask for more than we need so scoped rows are not crowded out by
-        # unrelated durable memories that happen to rank nearby.
-        raw = await self._episodic.search(goal, top_k=max(self._context_max_episodes * 5, 10))
-        scoped: list[dict] = []
-        for ep in raw:
-            metadata = ep.get("metadata", {})
-            if metadata.get("memory_scope") != self._memory_scope:
-                continue
-            scoped.append(ep)
-        return self._filter_agent_episodes(scoped, agent_id)[: self._context_max_episodes]
-
-    def _filter_agent_episodes(self, episodes: list[dict], agent_id: str | None) -> list[dict]:
-        """Keep shared, matching-agent, and legacy untagged episodes."""
-        if agent_id is None:
-            return episodes
-        filtered: list[dict] = []
-        for ep in episodes:
-            metadata = ep.get("metadata", {})
-            if metadata.get("shared") is True:
-                filtered.append(ep)
-                continue
-            if metadata.get("agent_id") == agent_id:
-                filtered.append(ep)
-                continue
-            if agent_id in (metadata.get("agent_ids") or []):
-                filtered.append(ep)
-                continue
-            if not metadata.get("memory_kind") and not metadata.get("agent_id"):
-                filtered.append(ep)
-        return filtered
+        return await self._episodic.search(
+            goal,
+            top_k=self._context_max_episodes,
+            memory_scope=self._memory_scope,
+            agent_id=agent_id,
+            include_shared=True,
+            include_legacy=self._memory_scope is None,
+        )
 
     def _semantic_scope_prefix(self) -> str:
         assert self._memory_scope is not None

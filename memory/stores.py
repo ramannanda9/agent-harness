@@ -8,6 +8,7 @@ For production:
   Semantic  → RedisSemanticStore  (swap in, same protocol)
   Episodic  → ChromaEpisodicStore or PineconeEpisodicStore
 """
+
 from __future__ import annotations
 
 import time
@@ -15,6 +16,7 @@ import uuid
 from typing import Any
 
 # ── In-Memory Semantic Store ──────────────────────────────────────────────────
+
 
 class InMemorySemanticStore:
     """
@@ -63,6 +65,7 @@ class InMemorySemanticStore:
 
 # ── In-Memory Episodic Store ──────────────────────────────────────────────────
 
+
 class InMemoryEpisodicStore:
     """
     List-backed episodic store with keyword similarity search.
@@ -77,17 +80,29 @@ class InMemoryEpisodicStore:
     def __init__(self) -> None:
         self._episodes: list[dict] = []
 
-    async def write(self, text: str, metadata: dict) -> str:
+    async def write(self, text: str, metadata: dict, agent_id: str = "") -> str:
         episode_id = str(uuid.uuid4())
-        self._episodes.append({
-            "id": episode_id,
-            "text": text,
-            "metadata": metadata,
-            "timestamp": time.time(),
-        })
+        self._episodes.append(
+            {
+                "id": episode_id,
+                "text": text,
+                "metadata": metadata,
+                "agent_id": agent_id,
+                "timestamp": time.time(),
+            }
+        )
         return episode_id
 
-    async def search(self, query: str, top_k: int = 3) -> list[dict]:
+    async def search(
+        self,
+        query: str,
+        top_k: int = 3,
+        *,
+        memory_scope: str | None = None,
+        agent_id: str | None = None,
+        include_shared: bool = True,
+        include_legacy: bool = True,
+    ) -> list[dict]:
         if not self._episodes:
             return []
 
@@ -101,7 +116,18 @@ class InMemoryEpisodicStore:
             union = len(query_tokens | ep_tokens)
             return intersection / union if union > 0 else 0.0
 
-        scored = sorted(self._episodes, key=score, reverse=True)
+        candidates = [
+            episode
+            for episode in self._episodes
+            if _episode_matches(
+                episode,
+                memory_scope=memory_scope,
+                agent_id=agent_id,
+                include_shared=include_shared,
+                include_legacy=include_legacy,
+            )
+        ]
+        scored = sorted(candidates, key=score, reverse=True)
         return scored[:top_k]
 
     async def get(self, episode_id: str) -> dict | None:
@@ -109,3 +135,29 @@ class InMemoryEpisodicStore:
 
     def count(self) -> int:
         return len(self._episodes)
+
+
+def _episode_matches(
+    episode: dict,
+    *,
+    memory_scope: str | None,
+    agent_id: str | None,
+    include_shared: bool,
+    include_legacy: bool,
+) -> bool:
+    metadata = episode.get("metadata") or {}
+    if memory_scope is not None and metadata.get("memory_scope") != memory_scope:
+        return False
+    if memory_scope is None and metadata.get("memory_scope") is not None:
+        return False
+    if agent_id is None:
+        return True
+    if include_shared and metadata.get("shared") is True:
+        return True
+    if metadata.get("agent_id") == agent_id or episode.get("agent_id") == agent_id:
+        return True
+    if agent_id in (metadata.get("agent_ids") or []):
+        return True
+    if include_legacy and not metadata.get("memory_kind") and not metadata.get("agent_id"):
+        return True
+    return False
