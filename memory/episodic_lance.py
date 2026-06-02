@@ -26,7 +26,10 @@ Schema (Lance/Arrow):
   agent_id     string
   memory_scope string
   memory_kind  string
+  memory_key   string
+  memory_policy string
   shared       bool
+  active       bool
 """
 
 from __future__ import annotations
@@ -142,7 +145,10 @@ class EpisodeRecord:
     agent_id: str
     memory_scope: str
     memory_kind: str
+    memory_key: str
+    memory_policy: str
     shared: bool
+    active: bool
 
 
 class WriteBuffer:
@@ -217,7 +223,10 @@ def _make_schema(dim: int) -> pa.Schema:
             pa.field("agent_id", pa.string()),
             pa.field("memory_scope", pa.string()),
             pa.field("memory_kind", pa.string()),
+            pa.field("memory_key", pa.string()),
+            pa.field("memory_policy", pa.string()),
             pa.field("shared", pa.bool_()),
+            pa.field("active", pa.bool_()),
         ]
     )
 
@@ -234,6 +243,7 @@ def _build_where(
     include_legacy: bool,
 ) -> str:
     clauses: list[str] = []
+    clauses.append("active = true")
     if memory_scope is not None:
         clauses.append(f"memory_scope = {_sql_quote(memory_scope)}")
     else:
@@ -331,7 +341,10 @@ class LanceDBEpisodicStore:
                     "agent_id": pa.array([], type=pa.string()),
                     "memory_scope": pa.array([], type=pa.string()),
                     "memory_kind": pa.array([], type=pa.string()),
+                    "memory_key": pa.array([], type=pa.string()),
+                    "memory_policy": pa.array([], type=pa.string()),
                     "shared": pa.array([], type=pa.bool_()),
+                    "active": pa.array([], type=pa.bool_()),
                 }
             )
             self._table = self._db.create_table(self._table_name, data=empty)
@@ -349,6 +362,9 @@ class LanceDBEpisodicStore:
         # embed synchronously within async context — LocalEmbedder uses executor
         embeddings = await self._embedder.embed([text])
         embedding = embeddings[0]
+        metadata = {**metadata, "active": metadata.get("active", True)}
+        if metadata.get("memory_policy") == "latest" and metadata.get("memory_key"):
+            await self._deactivate_memory_key(str(metadata["memory_key"]))
 
         record = EpisodeRecord(
             episode_id=episode_id,
@@ -359,7 +375,10 @@ class LanceDBEpisodicStore:
             agent_id=agent_id,
             memory_scope=str(metadata.get("memory_scope") or ""),
             memory_kind=str(metadata.get("memory_kind") or ""),
+            memory_key=str(metadata.get("memory_key") or ""),
+            memory_policy=str(metadata.get("memory_policy") or ""),
             shared=bool(metadata.get("shared") is True),
+            active=bool(metadata.get("active") is True),
         )
         # non-blocking — buffer handles flush
         await self._write_buffer.add(record)
@@ -386,10 +405,22 @@ class LanceDBEpisodicStore:
                 "agent_id": pa.array([r.agent_id for r in records], type=pa.string()),
                 "memory_scope": pa.array([r.memory_scope for r in records], type=pa.string()),
                 "memory_kind": pa.array([r.memory_kind for r in records], type=pa.string()),
+                "memory_key": pa.array([r.memory_key for r in records], type=pa.string()),
+                "memory_policy": pa.array([r.memory_policy for r in records], type=pa.string()),
                 "shared": pa.array([r.shared for r in records], type=pa.bool_()),
+                "active": pa.array([r.active for r in records], type=pa.bool_()),
             }
         )
         self._table.add(batch)
+
+    async def _deactivate_memory_key(self, memory_key: str) -> None:
+        if self._table is None:
+            return
+        where = f"memory_key = {_sql_quote(memory_key)} AND active = true"
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None, lambda: self._table.update(where=where, values={"active": False})
+        )
 
     # ── Index Management ──────────────────────────────────────────────────────
 
@@ -494,7 +525,7 @@ class LanceDBEpisodicStore:
         loop = asyncio.get_event_loop()
         rows = await loop.run_in_executor(
             None,
-            lambda: (self._table.search().where(f"episode_id = '{episode_id}'").limit(1).to_list()),
+            lambda: self._table.search().where(f"episode_id = '{episode_id}'").limit(1).to_list(),
         )
         if not rows:
             return None

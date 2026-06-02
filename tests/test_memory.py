@@ -297,6 +297,64 @@ async def test_build_context_filters_agent_task_episodes_without_memory_scope():
     assert "Legacy untagged memory" in rendered
 
 
+async def test_latest_policy_supersedes_older_matching_episode():
+    store = InMemoryEpisodicStore()
+    await store.write(
+        "old audit summary",
+        {
+            "memory_kind": "run_summary",
+            "memory_policy": "latest",
+            "memory_key": "run_summary:repo",
+            "shared": True,
+        },
+    )
+    await store.write(
+        "new audit summary",
+        {
+            "memory_kind": "run_summary",
+            "memory_policy": "latest",
+            "memory_key": "run_summary:repo",
+            "shared": True,
+        },
+    )
+
+    hits = await store.search("audit summary", top_k=5, agent_id="analyst")
+
+    assert [hit["text"] for hit in hits] == ["new audit summary"]
+
+
+async def test_write_run_end_uses_latest_policy_for_same_subject():
+    calls = 0
+
+    def extract(system, messages, kwargs):
+        nonlocal calls
+        calls += 1
+        return {
+            "semantic_facts": {},
+            "episodic_summary": f"run summary {calls}",
+            "metadata": {},
+            "ttl_seconds": None,
+        }
+
+    llm = ScriptedLLM(routes={"memory extraction": extract})
+    semantic = InMemorySemanticStore()
+    episodic = InMemoryEpisodicStore()
+    mgr = MemoryManager(
+        semantic_store=semantic,
+        episodic_store=episodic,
+        llm=llm,
+        memory_scope="sysaudit",
+        memory_subject="repo",
+    )
+
+    await mgr.write_run_end(goal="audit repo", agent_results=[{"confidence": 1.0}], trace=[])
+    await mgr.write_run_end(goal="audit repo", agent_results=[{"confidence": 1.0}], trace=[])
+    ctx = await mgr.build_context(goal="audit repo", agent_id="analyst")
+
+    assert "run summary 2" in ctx.render()
+    assert "run summary 1" not in ctx.render()
+
+
 async def test_write_agent_task_end_writes_agent_scoped_episode():
     llm = ScriptedLLM()
     semantic = InMemorySemanticStore()

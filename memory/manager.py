@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Protocol, runtime_checkable
@@ -171,6 +172,7 @@ class MemoryManager:
         context_max_episodes: int = 3,
         context_max_semantic_keys: int = 20,
         memory_scope: str | None = None,
+        memory_subject: str | None = None,
     ) -> None:
         self._semantic = semantic_store
         self._episodic = episodic_store
@@ -179,6 +181,7 @@ class MemoryManager:
         self._context_max_episodes = context_max_episodes
         self._context_max_semantic_keys = context_max_semantic_keys
         self._memory_scope = memory_scope
+        self._memory_subject = memory_subject
         self._conflict_log: list[dict] = []
 
     # ── Agent-level write (during run, no LLM) ────────────────────────────────
@@ -282,6 +285,8 @@ class MemoryManager:
             "agent_id": agent_id,
             "agent_ids": [agent_id],
             "memory_kind": "agent_task",
+            "memory_policy": "append",
+            "memory_key": f"agent_task:{agent_id}",
             "shared": False,
             "confidence": confidence,
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -368,6 +373,8 @@ class MemoryManager:
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "agent_ids": [r.get("agent_id") for r in agent_results],
             "memory_kind": "run_summary",
+            "memory_policy": "latest",
+            "memory_key": f"run_summary:{self._memory_subject or _memory_key_fragment(goal)}",
             "shared": True,
             "outcome": "success"
             if any(r.get("confidence", 0) > 0.5 for r in agent_results)
@@ -462,3 +469,7 @@ class MemoryManager:
     async def lookup(self, key: str) -> Any | None:
         """Direct semantic lookup — used by memory_lookup tool in ReAct loop."""
         return await self._semantic.read(key)
+
+
+def _memory_key_fragment(value: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_.:-]+", "-", value.strip().lower()).strip("-")[:120] or "default"

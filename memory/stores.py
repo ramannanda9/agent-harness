@@ -82,6 +82,12 @@ class InMemoryEpisodicStore:
 
     async def write(self, text: str, metadata: dict, agent_id: str = "") -> str:
         episode_id = str(uuid.uuid4())
+        if metadata.get("memory_policy") == "latest" and metadata.get("memory_key"):
+            for episode in self._episodes:
+                ep_meta = episode.get("metadata") or {}
+                if ep_meta.get("memory_key") == metadata["memory_key"]:
+                    ep_meta["active"] = False
+        metadata = {**metadata, "active": metadata.get("active", True)}
         self._episodes.append(
             {
                 "id": episode_id,
@@ -146,6 +152,8 @@ def _episode_matches(
     include_legacy: bool,
 ) -> bool:
     metadata = episode.get("metadata") or {}
+    if metadata.get("active") is False:
+        return False
     if memory_scope is not None and metadata.get("memory_scope") != memory_scope:
         return False
     if memory_scope is None and metadata.get("memory_scope") is not None:
