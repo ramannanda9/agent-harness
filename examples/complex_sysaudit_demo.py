@@ -337,6 +337,7 @@ async def main() -> None:
         async for event in audit_runtime.dispatch_stream(AUDIT_GOAL):
             if event.type == EventType.DONE:
                 p = event.payload
+                budget = p.get("budget") or {}
                 print()
                 _renderer.sep("═")
                 print("PROJECT HEALTH REPORT")
@@ -347,9 +348,13 @@ async def main() -> None:
                     f"Confidence: {p.get('confidence', 0):.2f}  |  "
                     f"Tasks: {len(task_results)}  |  "
                     f"Replans: {p.get('replan_count', 0)}  |  "
-                    f"Cost: ${p.get('cost_usd', 0):.4f}  |  "
-                    f"Time: {p.get('elapsed_seconds', 0):.1f}s"
+                    f"Cost: ${budget.get('cost_usd', p.get('cost_usd', 0)):.4f}  |  "
+                    f"Time: {budget.get('elapsed_seconds', p.get('elapsed_seconds', 0)):.1f}s"
                 )
+                # Tokens + per-call-site breakdown — visible only when the
+                # adapter reported usage to the BudgetGuard. Subscription
+                # adapters surface tokens here even though cost stays $0.
+                _renderer.render_budget(budget)
             elif event.type == EventType.TASK_DONE:
                 task_results.append(event.payload)
                 _renderer.render(event)
@@ -407,6 +412,7 @@ async def main() -> None:
                     f"Steps: {p.get('steps', '?')}  "
                     f"(fewer steps = agent answered from memory, not tools)"
                 )
+                _renderer.render_budget(p.get("budget"))
             else:
                 _renderer.render(event)
 

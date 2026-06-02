@@ -190,28 +190,41 @@ class ConsoleRenderer:
                 f"Time: {elapsed:.1f}s",
                 file=self._out,
             )
-            tokens_in = budget.get("tokens_in")
-            tokens_out = budget.get("tokens_out")
-            if tokens_in is not None or tokens_out is not None:
-                print(
-                    f"Tokens:     in={int(tokens_in or 0):,}  out={int(tokens_out or 0):,}",
-                    file=self._out,
-                )
-            breakdown = budget.get("breakdown") or {}
-            if breakdown:
-                # Right-pad the slot label so columns line up — matters when
-                # the demo prints multiple slots in sequence.
-                width = max(len(name) for name in breakdown)
-                for slot, stats in breakdown.items():
-                    print(
-                        f"  {slot:<{width}}  "
-                        f"in={int(stats.get('tokens_in', 0)):>7,}  "
-                        f"out={int(stats.get('tokens_out', 0)):>6,}",
-                        file=self._out,
-                    )
+            self.render_budget(budget)
 
         elif t == EventType.ERROR:
             print(f"\n[error]      {event.error}", file=sys.stderr)
+
+    def render_budget(self, budget: dict | None) -> None:
+        """Print tokens + per-call-site breakdown from a ``BudgetGuard.snapshot()``
+        dict. Safe to call with ``{}`` or ``None`` — prints nothing when
+        there's no usage to show.
+
+        Exposed publicly so demos and other consumers that own their own
+        DONE / TASK_DONE rendering can still surface the breakdown without
+        duplicating the formatting.
+        """
+        if not budget:
+            return
+        tokens_in = budget.get("tokens_in")
+        tokens_out = budget.get("tokens_out")
+        if tokens_in is not None or tokens_out is not None:
+            print(
+                f"Tokens:     in={int(tokens_in or 0):,}  out={int(tokens_out or 0):,}",
+                file=self._out,
+            )
+        breakdown = budget.get("breakdown") or {}
+        if breakdown:
+            # Right-pad the slot label so columns line up — matters when
+            # the demo prints multiple slots in sequence.
+            width = max(len(name) for name in breakdown)
+            for slot, stats in breakdown.items():
+                print(
+                    f"  {slot:<{width}}  "
+                    f"in={int(stats.get('tokens_in', 0)):>7,}  "
+                    f"out={int(stats.get('tokens_out', 0)):>6,}",
+                    file=self._out,
+                )
 
     # ── private helpers ───────────────────────────────────────────────────────
 

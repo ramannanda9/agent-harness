@@ -68,6 +68,36 @@ def test_console_renderer_done_event_renders_budget_breakdown():
     assert "classifier" in text and "8,432" in text
 
 
+def test_render_budget_handles_empty_input():
+    """Demos call ``render_budget`` directly with whatever they pulled off
+    the payload; ``None`` and ``{}`` must be no-ops, not crashes."""
+    out = StringIO()
+    renderer = ConsoleRenderer(out=out)
+    renderer.render_budget(None)
+    renderer.render_budget({})
+    assert out.getvalue() == ""
+
+
+def test_render_budget_helper_emits_tokens_and_breakdown():
+    out = StringIO()
+    renderer = ConsoleRenderer(out=out)
+    renderer.render_budget(
+        {
+            "tokens_in": 1234,
+            "tokens_out": 567,
+            "breakdown": {
+                "classifier": {"tokens_in": 100, "tokens_out": 10},
+                "planner": {"tokens_in": 800, "tokens_out": 400},
+            },
+        }
+    )
+    text = out.getvalue()
+    assert "in=1,234" in text
+    assert "out=567" in text
+    assert "classifier" in text
+    assert "planner" in text
+
+
 def test_console_renderer_done_event_back_compat_without_budget():
     """Old-shape DONE events without a ``budget`` key still render cost/time
     from the legacy flat fields — no breakdown printed."""
