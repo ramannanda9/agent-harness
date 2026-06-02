@@ -1,4 +1,8 @@
-"""Tests for ``RoutingLLM`` — dispatch each call to a different adapter."""
+"""Tests for ``RoutingLLM`` — bring-your-own-selector LLM dispatcher.
+
+The shipped surface is intentionally small: a selector callable, a routes
+dict, and a default. No baked-in selectors that encourage misrouting.
+"""
 
 from __future__ import annotations
 
@@ -7,7 +11,7 @@ from typing import Any
 
 import pytest
 
-from harness.llm.routing import RoutingLLM, by_role, by_system_keyword, by_token_count
+from harness.llm.routing import RoutingLLM
 
 
 class _StubLLM:
@@ -32,7 +36,7 @@ class _StubLLM:
 
 
 class _CompleteOnlyLLM:
-    """Adapter without stream_complete — to test fallback in RoutingLLM."""
+    """Adapter without stream_complete — verifies RoutingLLM's fallback path."""
 
     def __init__(self, *, text: str = "") -> None:
         self._text = text
@@ -107,21 +111,6 @@ async def test_complete_falls_back_to_default_when_selector_raises():
     assert result["text"] == "default"
 
 
-async def test_complete_strips_call_role_kwarg_before_forwarding():
-    """call_role is consumed by the selector — don't pass it through to the
-    SDK or it'll reject the unknown kwarg."""
-
-    class _StrictLLM(_StubLLM):
-        async def complete(self, system, messages, **kwargs):
-            assert "call_role" not in kwargs, "call_role must not be forwarded"
-            return await super().complete(system, messages, **kwargs)
-
-    strict = _StrictLLM(text="ok")
-    llm = RoutingLLM({"x": strict}, selector=lambda s, m: "x", default_route="x")
-    result = await llm.complete(None, [], call_role="planner")
-    assert result["text"] == "ok"
-
-
 async def test_set_budget_forwards_to_every_route():
     a = _StubLLM()
     b = _StubLLM()
@@ -130,6 +119,22 @@ async def test_set_budget_forwards_to_every_route():
     llm.set_budget(guard)
     assert a.budget is guard
     assert b.budget is guard
+
+
+async def test_selector_receives_system_and_messages():
+    """Custom selectors get the full call context — verify the wiring."""
+    seen: list[tuple[str | None, list[dict]]] = []
+
+    def remember(system, messages):
+        seen.append((system, messages))
+        return "x"
+
+    a = _StubLLM(text="x")
+    llm = RoutingLLM({"x": a}, selector=remember, default_route="x")
+    msgs = [{"role": "user", "content": "hello"}]
+    await llm.complete("a system", msgs)
+
+    assert seen == [("a system", msgs)]
 
 
 # ── stream_complete() ────────────────────────────────────────────────────────
@@ -157,61 +162,3 @@ async def test_stream_falls_back_to_complete_for_route_without_streaming():
     chunks = [c async for c in llm.stream_complete(None, [])]
     assert chunks == ["non-streaming result"]
     assert no_stream.calls == 1
-
-
-# ── by_system_keyword ────────────────────────────────────────────────────────
-
-
-def test_by_system_keyword_matches_first_keyword():
-    sel = by_system_keyword({"planner": "cheap", "agent": "pricey"}, default="default")
-    assert sel("You are a planner that...", []) == "cheap"
-    assert sel("You are an agent that...", []) == "pricey"
-    assert sel("You are something else", []) == "default"
-    assert sel(None, []) == "default"
-
-
-def test_by_system_keyword_is_case_insensitive():
-    sel = by_system_keyword({"Planner": "cheap"}, default="default")
-    assert sel("YOU ARE A PLANNER", []) == "cheap"
-
-
-# ── by_token_count ───────────────────────────────────────────────────────────
-
-
-def test_by_token_count_routes_small_to_cheap_large_to_pricey():
-    sel = by_token_count(threshold=100, small="cheap", large="pricey")
-    assert sel("short", [{"content": "hi"}]) == "cheap"
-    assert sel("x" * 1000, [{"content": "y" * 1000}]) == "pricey"
-
-
-def test_by_token_count_handles_multimodal_content_blocks():
-    """messages may carry a list of content blocks (e.g. vision) — token
-    estimate must walk into them."""
-    sel = by_token_count(threshold=10, small="cheap", large="pricey")
-    msgs = [{"content": [{"type": "text", "text": "x" * 200}]}]
-    assert sel(None, msgs) == "pricey"
-
-
-def test_by_token_count_uses_custom_counter_when_supplied():
-    sel = by_token_count(
-        threshold=10,
-        small="cheap",
-        large="pricey",
-        counter=lambda s: 100,  # always says 100 tokens
-    )
-    assert sel("a", []) == "pricey"
-
-
-# ── by_role ──────────────────────────────────────────────────────────────────
-
-
-def test_by_role_routes_from_call_role_metadata_on_message():
-    sel = by_role({"planner": "cheap", "agent": "pricey"}, default="default")
-    msgs = [{"role": "user", "content": "x", "call_role": "planner"}]
-    assert sel(None, msgs) == "cheap"
-
-
-def test_by_role_falls_back_to_default_without_metadata():
-    sel = by_role({"planner": "cheap"}, default="default")
-    msgs = [{"role": "user", "content": "x"}]
-    assert sel(None, msgs) == "default"

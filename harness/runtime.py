@@ -286,11 +286,36 @@ class AgentRuntime:
         annotation_store: Any | None = None,  # InMemoryAnnotationStore or compatible
         checkpoint_store: Any | None = None,  # FileCheckpointStore / RedisCheckpointStore
         steering_source_factory: Any | None = None,  # passed to each spawned BaseAgent
+        # ── Optional per-call-site LLM overrides ──────────────────────────────
+        # Each defaults to ``llm`` when unset. The dispatch classifier and the
+        # single-agent router both see only the goal + agent descriptions
+        # (~300 tokens) and emit a one-token decision — they're the natural
+        # candidates for a cheaper model. The planner and synthesiser produce
+        # structured DAGs and final answers and should usually stay on the
+        # main model. See README "Smart routing + fallback" for the pattern.
+        classifier_llm: Any | None = None,
+        router_llm: Any | None = None,
+        planner_llm: Any | None = None,
+        synthesizer_llm: Any | None = None,
     ) -> None:
         self._agent_registry = agent_registry
         self._tool_registry = tool_registry
         self._memory = memory
         self._llm = llm
+        self._classifier_llm = classifier_llm or llm
+        self._router_llm = router_llm or llm
+        self._planner_llm = planner_llm or llm
+        self._synthesizer_llm = synthesizer_llm or llm
+        # ``set_budget`` should reach every distinct LLM instance — if the
+        # user injected the same wrapper into multiple slots, dedupe by
+        # object identity so we don't call it N times.
+        self._budget_targets: list[Any] = []
+        for candidate in (llm, classifier_llm, router_llm, planner_llm, synthesizer_llm):
+            if candidate is None:
+                continue
+            if any(candidate is existing for existing in self._budget_targets):
+                continue
+            self._budget_targets.append(candidate)
         self._guardrail_config = guardrail_config or GuardrailConfig()
         self._enable_otel = enable_otel
         self._annotation_store = annotation_store
@@ -306,6 +331,16 @@ class AgentRuntime:
 
             checkpoint_store = FileCheckpointStore()
         self._checkpoint_store = checkpoint_store
+
+    def _attach_budget(self, guard: Any) -> None:
+        """Wire the per-run budget guard into every distinct LLM instance.
+
+        Duck-typed: adapters that don't implement ``set_budget`` (e.g. a
+        bare custom client) are skipped silently.
+        """
+        for target in self._budget_targets:
+            if hasattr(target, "set_budget"):
+                target.set_budget(guard)
 
     def _steering_lifecycle(self):
         """Wrap the dispatch in the steering factory's lifecycle if it has one.
@@ -343,8 +378,7 @@ class AgentRuntime:
         from agents.base import BaseAgent
 
         guard = BudgetGuard(self._guardrail_config)
-        if hasattr(self._llm, "set_budget"):
-            self._llm.set_budget(guard)
+        self._attach_budget(guard)
 
         config = self._agent_registry.get(agent_id)
         agent = BaseAgent(
@@ -393,8 +427,7 @@ class AgentRuntime:
 
         config = self._agent_registry.get(checkpoint["agent_id"])
         guard = BudgetGuard(self._guardrail_config)
-        if hasattr(self._llm, "set_budget"):
-            self._llm.set_budget(guard)
+        self._attach_budget(guard)
         tracer = self._make_tracer()
 
         agent = BaseAgent(
@@ -557,8 +590,7 @@ class AgentRuntime:
         # Adapters that implement set_budget(guard) (e.g. OpenAILLM) get the
         # fresh per-run guard so they can call add_cost() on every completion.
         # Duck-typed so users can plug in any LLM client that doesn't.
-        if hasattr(self._llm, "set_budget"):
-            self._llm.set_budget(guard)
+        self._attach_budget(guard)
 
         # state lives in memory, not agents — instantiate fresh per run
         agents = {
@@ -583,6 +615,8 @@ class AgentRuntime:
             tracer=tracer,
             guard=guard,
             llm=self._llm,
+            planner_llm=self._planner_llm,
+            synthesizer_llm=self._synthesizer_llm,
             eval_config=EvalConfig(
                 confidence_threshold=self._guardrail_config.confidence_threshold,
                 max_replan_count=self._guardrail_config.max_replan_count,
@@ -605,7 +639,7 @@ class AgentRuntime:
             f"  {aid}: {self._agent_registry.get(aid).role}"
             for aid in self._agent_registry.all_ids()
         )
-        response = await self._llm.complete(
+        response = await self._classifier_llm.complete(
             system=_CLASSIFIER_SYSTEM.format(agent_descriptions=agent_descriptions),
             messages=[{"role": "user", "content": f"Goal: {goal}"}],
             response_format={"type": "json_object"},
@@ -708,7 +742,7 @@ class AgentRuntime:
         agent_descriptions = "\n".join(
             f"  {aid}: {self._agent_registry.get(aid).role}" for aid in all_ids
         )
-        response = await self._llm.complete(
+        response = await self._router_llm.complete(
             system=_ROUTER_SYSTEM.format(agent_descriptions=agent_descriptions),
             messages=[{"role": "user", "content": f"Goal: {goal}"}],
             response_format={"type": "json_object"},
