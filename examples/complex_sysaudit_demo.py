@@ -383,7 +383,16 @@ async def main() -> None:
             print(f"  {k}: {trunc(str(v), 100)}")
 
         # Episodic search works across both in-memory and LanceDB stores.
-        recent_episodes = await episodic_store.search(AUDIT_GOAL, top_k=5)
+        # Must pass ``memory_scope`` — episodes written under a scope are
+        # excluded from scope-less searches (``_episode_matches`` filter:
+        # "memory_scope is None and metadata.get('memory_scope') is not
+        # None → False"). The demo writes everything under "sysaudit", so
+        # a bare ``search(...)`` returns 0 even when episodes exist.
+        recent_episodes = await episodic_store.search(
+            AUDIT_GOAL,
+            top_k=5,
+            memory_scope="sysaudit",
+        )
         print(f"\nEpisodic summaries ({len(recent_episodes)}):")
         for ep in recent_episodes:
             ts = ep.get("metadata", {}).get("timestamp", "?")

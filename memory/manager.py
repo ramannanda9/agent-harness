@@ -199,10 +199,24 @@ Action semantics:
 - NOOP  — duplicate or redundant; nothing to do.
 
 Rules:
+- Facts MUST generalize across future runs. Omit anything run-specific or
+  snapshot-of-this-moment. Examples of what NOT to write as semantic facts:
+    * current metrics (free memory, CPU load, uptime, latency numbers)
+    * timestamps, dates, "now" values
+    * commit hashes, branch state, current git log
+    * directory listings, file modification times
+    * "could not determine X" / "X unknown" absence-of-data findings
+  Those belong in the episodic summary, not as keyed semantic facts.
+- A good semantic fact answers "what is generally true about this entity?"
+  e.g. "service:redis:port", "host:gpu-07:gpu_model", "deploy:ci_runner:os".
+  A bad one answers "what was the value of X at this instant?"
 - Prefer NOOP over redundant UPDATE — don't write something already true.
-- Use DELETE only when new evidence directly contradicts; otherwise prefer UPDATE/MERGE.
+- Use DELETE only when new evidence directly contradicts; otherwise prefer
+  UPDATE/MERGE.
 - For semantic keys, use colon-separated namespacing (e.g. "redis:port").
-- Episodic memory_key should be stable per subject (e.g. "run_summary:<topic>").
+- Episodic memory_key should be stable per subject (e.g.
+  "run_summary:<topic>"). The episodic summary IS the right place for the
+  snapshot-y stuff (current metrics, what happened in this run).
 - Return JSON only. No preamble, no markdown fences.
 """
 
