@@ -82,12 +82,16 @@ class InMemoryEpisodicStore:
 
     async def write(self, text: str, metadata: dict, agent_id: str = "") -> str:
         episode_id = str(uuid.uuid4())
+        # ``latest`` policy: hard-delete prior episodes with the same
+        # ``memory_key`` so the store stays bounded — no soft-delete tombstones
+        # accumulating per run.
         if metadata.get("memory_policy") == "latest" and metadata.get("memory_key"):
-            for episode in self._episodes:
-                ep_meta = episode.get("metadata") or {}
-                if ep_meta.get("memory_key") == metadata["memory_key"]:
-                    ep_meta["active"] = False
-        metadata = {**metadata, "active": metadata.get("active", True)}
+            target = metadata["memory_key"]
+            self._episodes = [
+                ep
+                for ep in self._episodes
+                if (ep.get("metadata") or {}).get("memory_key") != target
+            ]
         self._episodes.append(
             {
                 "id": episode_id,
@@ -139,6 +143,21 @@ class InMemoryEpisodicStore:
     async def get(self, episode_id: str) -> dict | None:
         return next((e for e in self._episodes if e["id"] == episode_id), None)
 
+    async def invalidate(self, memory_key: str) -> int:
+        """Hard-delete every episode with the given ``memory_key``. Returns count.
+
+        Used by the reconciler's DELETE action and called transitively by
+        ``latest``-policy writes. Hard-delete so the store doesn't balloon
+        with superseded records over many runs.
+        """
+        before = len(self._episodes)
+        self._episodes = [
+            ep
+            for ep in self._episodes
+            if (ep.get("metadata") or {}).get("memory_key") != memory_key
+        ]
+        return before - len(self._episodes)
+
     def count(self) -> int:
         return len(self._episodes)
 
@@ -152,6 +171,8 @@ def _episode_matches(
     include_legacy: bool,
 ) -> bool:
     metadata = episode.get("metadata") or {}
+    # Back-compat: any episodes written before the hard-delete switch may
+    # still carry active=False from the old soft-delete path. Filter them.
     if metadata.get("active") is False:
         return False
     if memory_scope is not None and metadata.get("memory_scope") != memory_scope:

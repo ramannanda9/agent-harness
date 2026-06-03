@@ -364,7 +364,7 @@ class LanceDBEpisodicStore:
         embedding = embeddings[0]
         metadata = {**metadata, "active": metadata.get("active", True)}
         if metadata.get("memory_policy") == "latest" and metadata.get("memory_key"):
-            await self._deactivate_memory_key(str(metadata["memory_key"]))
+            await self._delete_memory_key(str(metadata["memory_key"]))
 
         record = EpisodeRecord(
             episode_id=episode_id,
@@ -413,14 +413,23 @@ class LanceDBEpisodicStore:
         )
         self._table.add(batch)
 
-    async def _deactivate_memory_key(self, memory_key: str) -> None:
+    async def _delete_memory_key(self, memory_key: str) -> int:
+        """Hard-delete all rows for ``memory_key`` and return the count.
+
+        Bounded storage: rather than carrying ``active=False`` tombstones
+        forever, supersede actually removes the row. The ``active`` column
+        is kept in the schema for back-compat with previously-written rows;
+        new writes are always active=True.
+        """
         if self._table is None:
-            return
-        where = f"memory_key = {_sql_quote(memory_key)} AND active = true"
+            return 0
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(
-            None, lambda: self._table.update(where=where, values={"active": False})
-        )
+        where = f"memory_key = {_sql_quote(memory_key)}"
+        count = await loop.run_in_executor(None, lambda: self._table.count_rows(filter=where))
+        if count == 0:
+            return 0
+        await loop.run_in_executor(None, lambda: self._table.delete(where))
+        return int(count)
 
     # ── Index Management ──────────────────────────────────────────────────────
 
@@ -536,6 +545,18 @@ class LanceDBEpisodicStore:
             "metadata": json.loads(row["metadata"]) if row["metadata"] else {},
             "agent_id": row["agent_id"],
         }
+
+    async def invalidate(self, memory_key: str) -> int:
+        """Hard-delete all episodes with ``memory_key``. Returns count.
+
+        Used by the reconciler's DELETE action; shares ``_delete_memory_key``
+        with the ``latest``-policy supersede so soft-delete tombstones never
+        accumulate.
+        """
+        if self._table is None:
+            return 0
+        await self._write_buffer.flush_all()  # see un-flushed writes
+        return await self._delete_memory_key(memory_key)
 
     # ── Maintenance ───────────────────────────────────────────────────────────
 
