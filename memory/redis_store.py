@@ -20,6 +20,7 @@ Usage:
 The client must be created with `decode_responses=True` so SCAN/GET return
 strings rather than bytes.
 """
+
 from __future__ import annotations
 
 import json

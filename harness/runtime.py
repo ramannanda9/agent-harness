@@ -497,8 +497,26 @@ class AgentRuntime:
             checkpoint_store=self._checkpoint_store,
             steering_source_factory=self._steering_source_factory,
         )
+        from harness.events import EventType
+        from harness.utils import fire
+
+        final_result: dict | None = None
         async for event in agent.run_stream(task, run_id=run_id):
+            if event.type == EventType.TASK_DONE:
+                final_result = event.payload
             yield event
+
+        # Routed-path durable write — previously the orchestrated path was the
+        # only one that called ``write_run_end``, so single-agent dispatches
+        # learned nothing. Reconcile applies here too when enabled.
+        if final_result is not None:
+            fire(
+                self._memory.write_run_end(
+                    goal=task,
+                    agent_results=[final_result],
+                    trace=tracer.dump(),
+                )
+            )
 
     async def resume_agent(self, ckp_id: str) -> dict:
         """

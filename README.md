@@ -340,6 +340,45 @@ crashing the loop.
 - **During run**: `write_working_fact()` — lightweight KV, namespaced, short TTL
 - **End of run**: `write_run_end()` — LLM extraction → global semantic + episodic vector
 
+### Memory reconciliation (default-on)
+
+`write_run_end` runs the LLM-arbitrated reconciler by default: instead of
+extract-and-overwrite, the LLM sees existing relevant memory + new evidence
+and emits a plan of per-fact actions (`ADD` / `UPDATE` / `MERGE` / `DELETE`
+/ `NOOP`). Same call count as the legacy extraction step; the prompt is
+larger only when there's existing context to reconcile against.
+
+```python
+manager = MemoryManager(
+    semantic_store=…,
+    episodic_store=…,
+    llm=…,
+    reconcile_on_write=True,           # default — set False for legacy extract path
+    allow_destructive_reconcile=False, # default — DELETE actions demoted to NOOP
+    auto_compact_threshold={"agent_task": 20},  # optional — fire compact()
+                                                # when an agent accumulates this
+                                                # many task episodes
+)
+```
+
+`allow_destructive_reconcile=False` keeps the LLM from removing data unless
+you've vetted that DELETE actions are sensible for your workload — demoted
+decisions land in `manager.get_conflict_log()` so you can audit.
+
+`manager.compact(goal="…", agent_id="…")` is the same primitive with no
+new evidence — a pure cleanup pass that consolidates accumulated episodes
+and prunes redundant facts. Triggered automatically by
+`auto_compact_threshold`, or call it explicitly.
+
+Episodic supersede is now **hard-delete** (no `active=False` tombstones
+accumulating per run): `memory_policy="latest"` writes and reconciler
+`DELETE` actions both remove rows.
+
+If the LLM returns a response that doesn't parse as a reconcile plan
+(older / smaller models that don't follow the multi-action schema),
+`write_run_end` silently falls back to the legacy extract-and-overwrite
+path — no crash, no missed run-end write.
+
 ### Tool-result caching (opt-in, per run)
 
 `AgentConfig.cache_tool_results = True` memoizes tool calls within a single
