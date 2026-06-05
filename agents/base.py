@@ -567,6 +567,9 @@ class BaseAgent:
                                 )
                                 continue
                             t_obj._agent._subagent_depth = self._subagent_depth + 1
+                            # Share the run-level guard — see the matching
+                            # comment in ``_run_streaming_tool_gated``.
+                            t_obj._agent._guard = self._guard
                         streaming_indices.append(i)
                         streaming_factories.append(_freeze_factory(t_obj, t_args))
                     else:
@@ -785,10 +788,16 @@ class BaseAgent:
         react_source = f"agent:{self.config.agent_id}"
         try:
             if hasattr(self._llm, "stream_complete"):
+                # Pass response_format on the streaming path too — without it,
+                # OpenAI's JSON mode is off and the model can drift into
+                # prose, which then fails _parse_action_json. Adapters that
+                # don't take the kwarg (older custom stubs) get it via
+                # ``**kwargs`` and ignore it.
                 async for token in self._llm.stream_complete(
                     system=None,
                     messages=messages,
                     source=react_source,
+                    response_format={"type": "json_object"},
                 ):
                     accumulated += token
                     if self.config.stream_tokens:
@@ -1032,6 +1041,12 @@ class BaseAgent:
                 )
                 return
             tool._agent._subagent_depth = next_depth
+            # Share the parent's guard so the sub-agent's check() enforces
+            # the run-level budget and its bubbled TASK_DONE snapshot
+            # reflects real token usage. Without this, sub-agents track an
+            # empty local guard while the LLM reports tokens to the
+            # runtime's guard (the one ``_attach_budget`` actually wired).
+            tool._agent._guard = self._guard
 
         approval = await self._gate_tool(run_id, step, tool_name, tool_args, response)
         if approval is not None:

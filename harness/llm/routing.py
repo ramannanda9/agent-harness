@@ -125,17 +125,18 @@ class RoutingLLM:
         messages: list[dict],
         *,
         source: str | None = None,
+        **kwargs: Any,
     ) -> AsyncGenerator[str, None]:
         key, llm = self._pick(system, messages)
         self.last_route = key
         if not hasattr(llm, "stream_complete"):
             # Fall back to non-streaming for routes that don't implement it.
-            result = await llm.complete(system, messages, source=source)
+            result = await llm.complete(system, messages, source=source, **kwargs)
             text = result.get("text", "") if isinstance(result, dict) else str(result)
             if text:
                 yield text
             self.last_usage = getattr(llm, "last_usage", None)
             return
-        async for chunk in llm.stream_complete(system, messages, source=source):
+        async for chunk in llm.stream_complete(system, messages, source=source, **kwargs):
             yield chunk
         self.last_usage = getattr(llm, "last_usage", None)

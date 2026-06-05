@@ -136,17 +136,25 @@ class OpenAILLM:
         messages: list[dict],
         *,
         source: str | None = None,
+        response_format: dict | None = None,
     ) -> AsyncGenerator[str, None]:
         full_messages = _prepend_system(system, messages)
         # include_usage adds a final SSE chunk with the same usage block as
         # non-streaming responses. Without it, streaming responses have no
         # per-request token data.
-        raw = await self._client.chat.completions.with_raw_response.create(
-            model=self._model,
-            messages=full_messages,
-            stream=True,
-            stream_options={"include_usage": True},
-        )
+        request_kwargs: dict[str, Any] = {
+            "model": self._model,
+            "messages": full_messages,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+        # Match the non-streaming path: when the caller asks for JSON mode,
+        # forward it so the model's output is constrained. Skipping this on
+        # the streaming path was the root cause of BaseAgent's ReAct loop
+        # accepting prose responses and crashing in ``_parse_action_json``.
+        if response_format is not None:
+            request_kwargs["response_format"] = response_format
+        raw = await self._client.chat.completions.with_raw_response.create(**request_kwargs)
         headers = _headers_dict(raw)
         stream = raw.parse()
         final_chunk = None

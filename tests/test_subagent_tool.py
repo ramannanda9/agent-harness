@@ -344,6 +344,36 @@ async def test_subagent_tool_rejects_missing_task_arg():
 
 
 @pytest.mark.asyncio
+async def test_parent_guard_is_shared_with_subagent_on_delegate():
+    """The sub-agent's ``_guard`` should be reassigned to the parent's
+    guard when delegation starts — so ``check()`` enforces the run-level
+    cap and the bubbled TASK_DONE budget snapshot reflects real usage,
+    not the sub-agent's stale construction-time guard."""
+    sub_llm = _CannedLLM(
+        [{"thought": "go", "action": "finish", "answer": "done", "confidence": 1.0}]
+    )
+    sub = _build_agent(agent_id="sub", llm=sub_llm)
+    sub_local_guard = sub._guard  # captured before delegation
+    tool = SubAgentTool(sub, name="delegate_sub")
+
+    parent_llm = _CannedLLM(
+        [
+            {"thought": "go", "action": "delegate_sub", "args": {"task": "do thing"}},
+            {"thought": "done", "action": "finish", "answer": "ok", "confidence": 1.0},
+        ]
+    )
+    parent = _build_agent(agent_id="parent", llm=parent_llm, tools={tool.name: tool})
+
+    async for _ in parent.run_stream("go"):
+        pass
+
+    # After the run, the sub-agent's _guard should now be the parent's
+    # guard, not its original local one.
+    assert sub._guard is parent._guard
+    assert sub._guard is not sub_local_guard
+
+
+@pytest.mark.asyncio
 async def test_subagent_tool_uses_custom_task_arg_name():
     sub_llm = _CannedLLM([{"thought": "go", "action": "finish", "answer": "ok", "confidence": 1.0}])
     sub = _build_agent(agent_id="sub", llm=sub_llm)

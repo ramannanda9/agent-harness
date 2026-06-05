@@ -272,3 +272,29 @@ async def test_stream_complete_sets_include_usage(monkeypatch):
     [t async for t in llm.stream_complete(system=None, messages=[])]
     assert raw.calls[0]["stream"] is True
     assert raw.calls[0]["stream_options"] == {"include_usage": True}
+
+
+async def test_stream_complete_forwards_response_format(monkeypatch):
+    """Without this, OpenAI's JSON mode is off on the streaming path and
+    the model is free to drift into prose — which then breaks
+    BaseAgent._parse_action_json. Lock in the wiring."""
+    llm, raw = _build(monkeypatch)
+    raw.next_stream_chunks = [_fake_chunk(usage=_FakeUsage(1, 1))]
+    [
+        t
+        async for t in llm.stream_complete(
+            system=None,
+            messages=[],
+            response_format={"type": "json_object"},
+        )
+    ]
+    assert raw.calls[0]["response_format"] == {"type": "json_object"}
+
+
+async def test_stream_complete_omits_response_format_when_not_requested(monkeypatch):
+    """Back-compat: callers that don't pass response_format shouldn't
+    suddenly start sending one."""
+    llm, raw = _build(monkeypatch)
+    raw.next_stream_chunks = [_fake_chunk(usage=_FakeUsage(1, 1))]
+    [t async for t in llm.stream_complete(system=None, messages=[])]
+    assert "response_format" not in raw.calls[0]

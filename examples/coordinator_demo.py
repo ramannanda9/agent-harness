@@ -186,7 +186,11 @@ async def main() -> None:
         # the sub-agent's id; the human can see indentation by reading
         # `event.parent_agent_id` themselves if they want deeper formatting.
         renderer.render(event)
-        if event.type == EventType.TASK_DONE:
+        # Only fire the FINAL ANSWER banner on the *top-level* TASK_DONE —
+        # sub-agent TASK_DONEs bubble up through the parent's stream
+        # (carrying ``parent_agent_id``) and would otherwise trigger the
+        # banner once per delegation, with stale budget snapshots.
+        if event.type == EventType.TASK_DONE and not event.parent_agent_id:
             renderer.sep("═")
             print("\nFINAL ANSWER\n")
             print(event.payload.get("answer", "(no answer)"))
