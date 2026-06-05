@@ -55,6 +55,7 @@ harness/checkpoint.py       CheckpointStore + _ResumeHint + maybe_resume_key —
 harness/otel.py             OTELHook — OpenTelemetry span exporter (opt-in)
 harness/executor_bridge.py  ExecutorBridge + ExecutorTool — controlled subprocess launcher with optional Docker sandboxing
 harness/oauth_browser.py    Localhost OAuth callback server + open_or_print_url — shared by MCP browser-OAuth and LLM login flows
+harness/persistent.py       PersistentAgent + SQLiteSessionStore — durable chat sessions around user-built agents
 orchestrator/planner.py     Hybrid DAG orchestrator — plan, replan, synthesize
 agents/base.py              Generic BaseAgent — ReAct loop, no subclassing needed
 memory/manager.py           MemoryManager — semantic KV + episodic vector
@@ -93,6 +94,7 @@ explicit control.
 | `examples/mcp_auth_demo.py` | Connects to an authenticated remote MCP server using bearer or auth-file credentials. | `OPENAI_API_KEY`, `[openai,mcp]`, `MCP_URL`, `MCP_BEARER_TOKEN` or `MCP_AUTH_PROVIDER` |
 | `examples/subscription_auth_demo.py` | Runs an agent through subscription-backed providers: direct `openai-codex` OAuth or direct `claude-code` OAuth. | `agent-harness login openai-codex` or `agent-harness login claude-code` |
 | `examples/coordinator_demo.py` | Sub-agent-as-tool pattern: a `coordinator` ReAct agent delegates dynamically to `researcher` / `analyst` / `reporter` via `SubAgentTool`. Demonstrates parallel delegation through `actions: [...]`. | `OPENAI_API_KEY`, `[openai,http]` |
+| `examples/persistent_agent_demo.py` | Persistent chat wrapper: SQLite session transcript + rolling summary around a user-built coordinator/sub-agent graph. Researcher drives a real Chromium browser via `@playwright/mcp` so JS-rendered + bot-walled news sites work. | `OPENAI_API_KEY`, `[openai,mcp]`, `npx` (Node 18+); first run downloads ~150 MB Chromium |
 
 ## Adding a new domain (3 steps)
 
@@ -616,6 +618,47 @@ single sequence even when multiple sub-agents are working concurrently.
 Both are first-class. Most real systems combine them — the orchestrator
 plans a high-level DAG, individual tasks within it use sub-agent tools
 for finer dynamic decomposition.
+
+### 6. Persistent chat sessions — `PersistentAgent`
+
+`PersistentAgent` is a wrapper around a coordinator `BaseAgent`, not a new
+agent constructor. Build agents, sub-agents, MCP tools, and auth exactly as
+usual; then wrap the top-level coordinator to add durable chat/session state.
+
+```python
+from harness.persistent import PersistentAgent, SQLiteSessionStore
+
+app = PersistentAgent(
+    coordinator=coordinator_agent,
+    session_store=SQLiteSessionStore(".agent_harness_sessions.sqlite"),
+    memory=memory_manager,
+    llm=llm,
+)
+
+async for event in app.chat("I like the above; can you do X?", session_id="thread-1"):
+    renderer.render(event)
+```
+
+Use `app.capabilities()` to inspect the already-wired coordinator,
+sub-agents, and MCP tools. The demo exposes this with
+`--show-capabilities`.
+
+Each chat turn gets a fresh `WorkingMemory`. Continuity comes from the
+SQLite session state (rolling summary + recent messages) and normal
+`MemoryManager` recall, not from carrying old ReAct scratchpads forever.
+
+The wrapper owns cadence:
+
+- session transcript is written every turn without an LLM;
+- `MemoryManager.write_run_end(...)` is called only when the turn has a
+  durable signal, tool/sub-agent work, errors, or the configured interval
+  has elapsed;
+- session compaction runs at message/turn thresholds and updates the
+  stored summary.
+
+For MCP, put MCP tools on the coordinator or sub-agents before wrapping.
+`PersistentAgent` does not special-case MCP auth; it preserves the existing
+tool wiring model.
 
 ---
 
