@@ -83,7 +83,7 @@ async def main() -> None:
 
     from harness.llm.openai import OpenAILLM  # noqa: PLC0415 — optional dep
 
-    llm = OpenAILLM(model="gpt-4o-mini")
+    llm = OpenAILLM(model="gpt-5.4-mini")
     semantic = InMemorySemanticStore()
     episodic = InMemoryEpisodicStore()
     memory = MemoryManager(
