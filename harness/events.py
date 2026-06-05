@@ -67,3 +67,7 @@ class BusEvent:
     token: str = ""  # set on TOKEN events
     error: str = ""  # set on ERROR events
     timestamp: float = field(default_factory=time.time)
+    # Set on events emitted by a sub-agent run launched via SubAgentTool.
+    # Lets renderers and tracers indent/group nested agent work without
+    # losing the originating agent_id. Empty for top-level events.
+    parent_agent_id: str = ""
