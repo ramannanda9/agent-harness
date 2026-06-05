@@ -72,6 +72,11 @@ class SubAgentTool:
         self._agent = agent
         self.name = name or f"delegate_{agent.config.agent_id}"
         self._task_arg = task_arg
+        # The invoking agent's id. ``BaseAgent`` sets this before calling
+        # ``execute_stream`` so bubbled events carry the *parent*'s id
+        # in ``parent_agent_id``, not the sub-agent's own id. Default
+        # empty for direct callers (e.g. tests) — "no known parent".
+        self._invoking_agent_id: str = ""
 
     @property
     def agent_id(self) -> str:
@@ -120,13 +125,17 @@ class SubAgentTool:
         # run.
         run_id = str(uuid.uuid4())
 
+        # The invoking agent's id (set by BaseAgent before this call). For
+        # nested delegations, the inner SubAgentTool already populated
+        # ``parent_agent_id`` on its own bubbled events to point at the
+        # immediate parent — we preserve that, so a top-level consumer can
+        # walk one level up by reading ``parent_agent_id``.
+        invoking_parent = self._invoking_agent_id
+
         last_done: dict | None = None
         last_error: str | None = None
         try:
             async for event in self._agent.run_stream(task=task, run_id=run_id):
-                # Tag the event with the sub's own id as the "parent" marker —
-                # downstream renderers detect parent_agent_id != "" to know
-                # this is nested work.
                 tagged = BusEvent(
                     type=event.type,
                     agent_id=event.agent_id,
@@ -134,7 +143,7 @@ class SubAgentTool:
                     token=event.token,
                     error=event.error,
                     timestamp=event.timestamp,
-                    parent_agent_id=event.parent_agent_id or self.agent_id,
+                    parent_agent_id=event.parent_agent_id or invoking_parent,
                 )
                 yield tagged
                 if event.type == EventType.TASK_DONE:

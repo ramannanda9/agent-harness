@@ -152,9 +152,19 @@ async def test_subagent_events_bubble_with_parent_agent_id_tag():
         if e.parent_agent_id  # only sub-agent-tagged events
     ]
     assert bubbled, "expected at least one bubbled sub-agent event"
-    assert all(e.parent_agent_id == "researcher" for e in bubbled)
-    # THOUGHT from the researcher should be among them.
-    assert any(e.type == EventType.THOUGHT and e.agent_id == "researcher" for e in bubbled)
+    # parent_agent_id must be the INVOKING parent's id ("coord"), NOT the
+    # sub-agent's own id — otherwise renderers can't group / indent by
+    # actual parent, and a sub-agent's events look orphaned.
+    assert all(e.parent_agent_id == "coord" for e in bubbled), (
+        f"expected parent_agent_id='coord' on all bubbled events; got "
+        f"{set(e.parent_agent_id for e in bubbled)!r}"
+    )
+    # THOUGHT from the researcher should be among them — and agent_id
+    # should still be the sub's own id (researcher), separate from parent.
+    assert any(
+        e.type == EventType.THOUGHT and e.agent_id == "researcher" and e.parent_agent_id == "coord"
+        for e in bubbled
+    )
 
 
 # ── Parallel delegation ──────────────────────────────────────────────────────
@@ -341,6 +351,61 @@ async def test_subagent_tool_rejects_missing_task_arg():
     assert len(collected) == 1
     assert collected[0]["success"] is False
     assert "missing required arg" in collected[0]["error"]
+
+
+@pytest.mark.asyncio
+async def test_parallel_mixed_streaming_and_plain_tools_runs():
+    """A parallel batch mixing a streaming sub-agent tool and a plain
+    awaitable tool must run both branches to completion.
+
+    Pins the fix for ``asyncio.create_task(asyncio.gather(...))`` — in
+    modern Python ``gather`` returns a Future, not a coroutine, and
+    ``create_task`` rejects it with TypeError. The bug was invisible to
+    pure-streaming batches; this test exercises the mixed path
+    specifically."""
+
+    class _PlainEcho:
+        name = "plain_echo"
+
+        async def execute(self, msg: str = "") -> dict:
+            return {"echoed": msg}
+
+    sub_llm = _CannedLLM(
+        [{"thought": "go", "action": "finish", "answer": "from-sub", "confidence": 0.9}]
+    )
+    sub = _build_agent(agent_id="sub", llm=sub_llm)
+    delegate = SubAgentTool(sub, name="delegate_sub")
+
+    parent_llm = _CannedLLM(
+        [
+            {
+                "thought": "parallel mix",
+                "actions": [
+                    {"tool": "delegate_sub", "args": {"task": "work"}},
+                    {"tool": "plain_echo", "args": {"msg": "hello"}},
+                ],
+            },
+            {
+                "thought": "done",
+                "action": "finish",
+                "answer": "combined",
+                "confidence": 1.0,
+            },
+        ]
+    )
+    parent = _build_agent(
+        agent_id="coord",
+        llm=parent_llm,
+        tools={delegate.name: delegate, "plain_echo": _PlainEcho()},
+    )
+
+    events = [e async for e in parent.run_stream("mixed")]
+    parent_obs = [e for e in events if e.type == EventType.OBSERVATION and e.agent_id == "coord"]
+    # Both observations must land in the parent's stream.
+    assert parent_obs
+    combined = " ".join(str(e.payload.get("observation", "")) for e in parent_obs)
+    assert "from-sub" in combined
+    assert "hello" in combined
 
 
 @pytest.mark.asyncio

@@ -570,6 +570,9 @@ class BaseAgent:
                             # Share the run-level guard — see the matching
                             # comment in ``_run_streaming_tool_gated``.
                             t_obj._agent._guard = self._guard
+                            # Tag bubbled events with the real invoking
+                            # parent so renderers can group / indent.
+                            t_obj._invoking_agent_id = self.config.agent_id
                         streaming_indices.append(i)
                         streaming_factories.append(_freeze_factory(t_obj, t_args))
                     else:
@@ -579,9 +582,13 @@ class BaseAgent:
                 if streaming_factories:
                     from harness.streaming import fan_in
 
-                    plain_future = (
-                        asyncio.create_task(asyncio.gather(*plain_tasks)) if plain_tasks else None
-                    )
+                    # ``asyncio.gather`` already schedules its argument
+                    # coroutines via ensure_future, so the plain tasks
+                    # start running immediately when this line executes —
+                    # no extra ``create_task`` wrapper needed (and modern
+                    # ``create_task`` rejects gather's Future return value
+                    # with TypeError).
+                    plain_future = asyncio.gather(*plain_tasks) if plain_tasks else None
                     try:
                         async for fan_idx, item in fan_in(streaming_factories):
                             real_idx = streaming_indices[fan_idx]
@@ -1047,6 +1054,13 @@ class BaseAgent:
             # empty local guard while the LLM reports tokens to the
             # runtime's guard (the one ``_attach_budget`` actually wired).
             tool._agent._guard = self._guard
+            # Tell the tool who's invoking so its bubbled events carry the
+            # actual parent's id in ``parent_agent_id``. Without this the
+            # tool defaults to its own sub-agent id, which makes
+            # ``agent_id == parent_agent_id`` for the immediate sub —
+            # technically a "nested" marker but useless to renderers that
+            # want indentation or grouping by real parent.
+            tool._invoking_agent_id = self.config.agent_id
 
         approval = await self._gate_tool(run_id, step, tool_name, tool_args, response)
         if approval is not None:
