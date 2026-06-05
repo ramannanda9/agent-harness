@@ -42,7 +42,7 @@ from tools.builtin.subagent import SubAgentTool
 
 GOAL = (
     "Find the current Python release on python.org's downloads page, "
-    "evaluate whether agent-harness's >=3.10 requirement is reasonable, "
+    "evaluate whether react-agent-harness's >=3.10 requirement is reasonable, "
     "and produce a one-paragraph reporter-style summary."
 )
 
