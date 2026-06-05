@@ -111,7 +111,10 @@ class ClaudeCodeLLM:
         messages: list[dict],
         *,
         source: str | None = None,
+        **_kwargs: Any,
     ) -> AsyncGenerator[str, None]:
+        # ``_kwargs`` swallows OpenAI-style hints like ``response_format``;
+        # Claude Code (Anthropic underneath) doesn't expose an equivalent.
         async for delta in self._iter_stream(
             system, messages, max_tokens=self._max_tokens, extra={}, source=source
         ):

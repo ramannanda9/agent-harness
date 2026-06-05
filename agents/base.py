@@ -50,6 +50,17 @@ logger = logging.getLogger(__name__)
 _HITL_CORRECTION: Final = object()
 
 
+def _freeze_factory(tool: Any, args: dict) -> Any:
+    """Bind ``tool`` and ``args`` into a zero-arg factory the fan-in helper
+    can call to spawn one driver per parallel streaming tool.
+
+    Defined at module scope (not inline) so the late-binding closure trap —
+    every lambda capturing the same final loop variable — is avoided in
+    the parallel-actions fan-out.
+    """
+    return lambda: tool.execute_stream(**args)
+
+
 # ── Agent Config ──────────────────────────────────────────────────────────────
 
 
@@ -73,6 +84,13 @@ class AgentConfig:
     # other's lookups (HTTPFetch on stable URLs, ``kubectl get …`` style
     # discovery, MCP filesystem reads).
     cache_tool_results: bool = False
+    # Hard cap on how deep a SubAgentTool chain may recurse. Depth 0 = the
+    # top-level agent invoked by AgentRuntime; depth 1 = a sub-agent
+    # delegated to from the top; depth 2 = a sub-agent that itself
+    # delegated. The default is conservative — most production setups want
+    # one or two levels and a hard stop against an LLM hallucinating an
+    # infinite delegation chain.
+    max_subagent_depth: int = 3
 
     def __post_init__(self):
         if self.hitl_tools is None:
@@ -173,6 +191,13 @@ class BaseAgent:
         self._tool_cache: dict[tuple[str, str], Any] | None = (
             {} if config.cache_tool_results else None
         )
+        # SubAgentTool nesting depth. The top-level agent stays at 0; each
+        # delegation hop bumps the sub-agent's depth by one. A
+        # ``SubAgentTool.execute_stream`` invocation refuses if bumping
+        # would exceed ``config.max_subagent_depth``, so an LLM that
+        # hallucinates a recursive delegation chain gets stopped at a
+        # bounded level rather than hanging the framework.
+        self._subagent_depth: int = 0
 
     # ── Async steering ────────────────────────────────────────────────────────
 
@@ -512,13 +537,76 @@ class BaseAgent:
                         },
                     )
 
-                # Fan out all approved tool calls concurrently.
-                observations = await asyncio.gather(
-                    *[
-                        self._execute_tool(act.get("tool", ""), act.get("args", {}))
-                        for act in parallel_actions
-                    ]
-                )
+                # Fan out all approved tool calls concurrently. Mixed
+                # batches (some streaming sub-agent tools, some plain) are
+                # supported — the fan-in helper bubbles streaming events
+                # in arrival order while plain awaitables resolve in
+                # parallel under a single gather.
+                observations: list[Any] = [None] * len(parallel_actions)
+                streaming_indices: list[int] = []
+                streaming_factories: list[Any] = []
+                plain_indices: list[int] = []
+                plain_tasks: list[Any] = []
+
+                for i, act in enumerate(parallel_actions):
+                    t_name = act.get("tool", "")
+                    t_args = act.get("args", {})
+                    t_obj = self._tools.get(t_name)
+                    if t_obj is not None and hasattr(t_obj, "execute_stream"):
+                        # Recursion guard fires here for the parallel path.
+                        # Refused delegations land as their own observation
+                        # so the rest of the batch still runs.
+                        from tools.builtin.subagent import SubAgentTool
+
+                        if isinstance(t_obj, SubAgentTool):
+                            if self._subagent_depth + 1 > self.config.max_subagent_depth:
+                                observations[i] = (
+                                    f"Refused to delegate to {t_obj.name!r}: "
+                                    f"max sub-agent depth "
+                                    f"{self.config.max_subagent_depth} would be exceeded."
+                                )
+                                continue
+                            t_obj._agent._subagent_depth = self._subagent_depth + 1
+                            # Share the run-level guard — see the matching
+                            # comment in ``_run_streaming_tool_gated``.
+                            t_obj._agent._guard = self._guard
+                            # Tag bubbled events with the real invoking
+                            # parent so renderers can group / indent.
+                            t_obj._invoking_agent_id = self.config.agent_id
+                        streaming_indices.append(i)
+                        streaming_factories.append(_freeze_factory(t_obj, t_args))
+                    else:
+                        plain_indices.append(i)
+                        plain_tasks.append(self._execute_tool(t_name, t_args))
+
+                if streaming_factories:
+                    from harness.streaming import fan_in
+
+                    # ``asyncio.gather`` already schedules its argument
+                    # coroutines via ensure_future, so the plain tasks
+                    # start running immediately when this line executes —
+                    # no extra ``create_task`` wrapper needed (and modern
+                    # ``create_task`` rejects gather's Future return value
+                    # with TypeError).
+                    plain_future = asyncio.gather(*plain_tasks) if plain_tasks else None
+                    try:
+                        async for fan_idx, item in fan_in(streaming_factories):
+                            real_idx = streaming_indices[fan_idx]
+                            if isinstance(item, BusEvent):
+                                yield item
+                            else:
+                                observations[real_idx] = item
+                        plain_results = await plain_future if plain_future is not None else []
+                    except Exception:
+                        if plain_future is not None:
+                            plain_future.cancel()
+                        raise
+                    for slot, val in zip(plain_indices, plain_results, strict=False):
+                        observations[slot] = val
+                else:
+                    plain_results = await asyncio.gather(*plain_tasks)
+                    for slot, val in zip(plain_indices, plain_results, strict=False):
+                        observations[slot] = val
                 await self._commit_checkpoint(run_id, step)
 
                 combined: list[dict] = []
@@ -585,11 +673,30 @@ class BaseAgent:
                     payload={"step": step, "tool": tool_name, "args": tool_args},
                 )
 
-                observation = await self._run_tool_gated(
-                    run_id, step, tool_name, tool_args, response
-                )
-                if observation is _HITL_CORRECTION:
-                    continue
+                tool_obj = self._tools.get(tool_name)
+                if tool_obj is not None and hasattr(tool_obj, "execute_stream"):
+                    # Streaming tool — bubble its events into the parent stream,
+                    # collect the terminal observation. HITL gate + recursion
+                    # guard are inside _run_streaming_tool_gated.
+                    correction_fired = False
+                    observation = None
+                    async for kind, value in self._run_streaming_tool_gated(
+                        run_id, step, tool_name, tool_args, response, tool_obj
+                    ):
+                        if kind == "event":
+                            yield value
+                        elif kind == "correction":
+                            correction_fired = True
+                        elif kind == "result":
+                            observation = value
+                    if correction_fired:
+                        continue
+                else:
+                    observation = await self._run_tool_gated(
+                        run_id, step, tool_name, tool_args, response
+                    )
+                    if observation is _HITL_CORRECTION:
+                        continue
 
                 obs_display = "[image]" if _is_image_block(observation) else str(observation)[:500]
                 self._tracer.log(
@@ -688,10 +795,16 @@ class BaseAgent:
         react_source = f"agent:{self.config.agent_id}"
         try:
             if hasattr(self._llm, "stream_complete"):
+                # Pass response_format on the streaming path too — without it,
+                # OpenAI's JSON mode is off and the model can drift into
+                # prose, which then fails _parse_action_json. Adapters that
+                # don't take the kwarg (older custom stubs) get it via
+                # ``**kwargs`` and ignore it.
                 async for token in self._llm.stream_complete(
                     system=None,
                     messages=messages,
                     source=react_source,
+                    response_format={"type": "json_object"},
                 ):
                     accumulated += token
                     if self.config.stream_tokens:
@@ -894,6 +1007,91 @@ class BaseAgent:
             # Non-HITL tools leave the step checkpoint intact for the next iteration.
             await self._commit_checkpoint(run_id, step)
         return obs
+
+    async def _run_streaming_tool_gated(
+        self,
+        run_id: str,
+        step: int,
+        tool_name: str,
+        tool_args: dict,
+        response: dict,
+        tool: Any,
+    ):
+        """Async-iterator variant of ``_run_tool_gated`` for tools that
+        implement ``execute_stream``.
+
+        Yields a sequence of ``("event", BusEvent)`` items as the underlying
+        streaming tool emits events, and ends with exactly one of:
+
+          ``("result", obs)``     — the observation the ReAct loop records
+          ``("correction", None)`` — HITL injected a correction; caller
+                                     must ``continue`` the loop. WM is
+                                     already updated.
+
+        Recursion guard fires here: if invoking the tool would push a
+        sub-agent past ``config.max_subagent_depth``, the tool is refused
+        and an error string surfaces as the observation instead.
+        """
+        from tools.builtin.subagent import SubAgentTool
+
+        # Recursion guard for sub-agent delegation specifically.
+        if isinstance(tool, SubAgentTool):
+            next_depth = self._subagent_depth + 1
+            if next_depth > self.config.max_subagent_depth:
+                yield (
+                    "result",
+                    (
+                        f"Refused to delegate to {tool.name!r}: "
+                        f"max sub-agent depth {self.config.max_subagent_depth} "
+                        f"would be exceeded (current depth {self._subagent_depth})."
+                    ),
+                )
+                return
+            tool._agent._subagent_depth = next_depth
+            # Share the parent's guard so the sub-agent's check() enforces
+            # the run-level budget and its bubbled TASK_DONE snapshot
+            # reflects real token usage. Without this, sub-agents track an
+            # empty local guard while the LLM reports tokens to the
+            # runtime's guard (the one ``_attach_budget`` actually wired).
+            tool._agent._guard = self._guard
+            # Tell the tool who's invoking so its bubbled events carry the
+            # actual parent's id in ``parent_agent_id``. Without this the
+            # tool defaults to its own sub-agent id, which makes
+            # ``agent_id == parent_agent_id`` for the immediate sub —
+            # technically a "nested" marker but useless to renderers that
+            # want indentation or grouping by real parent.
+            tool._invoking_agent_id = self.config.agent_id
+
+        approval = await self._gate_tool(run_id, step, tool_name, tool_args, response)
+        if approval is not None:
+            if approval.correction:
+                await self._inject_human_guidance(response, approval.correction, run_id, step)
+                yield ("correction", None)
+                return
+            if not approval.approved:
+                await self._commit_checkpoint(run_id, step)
+                yield (
+                    "result",
+                    f"Tool rejected by human: {approval.correction or 'no reason given'}",
+                )
+                return
+
+        observation: Any = None
+        try:
+            async for item in tool.execute_stream(**tool_args):
+                if isinstance(item, BusEvent):
+                    yield ("event", item)
+                else:
+                    # Streaming tools yield exactly one non-BusEvent terminal
+                    # value — the dict observation the parent records.
+                    observation = item
+        except Exception as e:  # noqa: BLE001 — surface to the loop, not crash
+            logger.error("Streaming tool %s failed: %s", tool_name, e)
+            observation = f"Tool error ({tool_name}): {e}"
+
+        if approval is not None:
+            await self._commit_checkpoint(run_id, step)
+        yield ("result", observation)
 
     async def _inject_human_guidance(
         self, response: dict, correction: str, run_id: str, step: int

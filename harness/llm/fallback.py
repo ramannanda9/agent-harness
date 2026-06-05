@@ -125,6 +125,7 @@ class FallbackLLM:
         messages: list[dict],
         *,
         source: str | None = None,
+        **kwargs: Any,
     ) -> AsyncGenerator[str, None]:
         """Stream from the first adapter that doesn't fail before yielding.
 
@@ -138,7 +139,7 @@ class FallbackLLM:
             if not hasattr(llm, "stream_complete"):
                 continue
             try:
-                gen = llm.stream_complete(system, messages, source=source)
+                gen = llm.stream_complete(system, messages, source=source, **kwargs)
                 first = await _peek_first(gen)
             except BaseException as exc:
                 if i == len(self._llms) - 1 or not self._is_transient(exc):

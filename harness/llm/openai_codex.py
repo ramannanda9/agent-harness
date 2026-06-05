@@ -88,8 +88,15 @@ class OpenAICodexLLM:
         messages: list[dict],
         *,
         source: str | None = None,
+        **_kwargs: Any,
     ) -> AsyncGenerator[str, None]:
-        """Yield each `response.output_text.delta` token as it arrives."""
+        """Yield each `response.output_text.delta` token as it arrives.
+
+        ``_kwargs`` accepts OpenAI-style hints like ``response_format`` so
+        the same ReAct-driving caller works against this adapter and the
+        public ``OpenAILLM``; Codex's responses backend wires JSON output
+        differently and the kwarg is intentionally ignored here.
+        """
         async for delta in self._iter_stream(system, messages, extra={}, source=source):
             yield delta
 

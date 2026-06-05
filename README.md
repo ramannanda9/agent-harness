@@ -64,8 +64,10 @@ memory/redis_store.py       Redis semantic store — durable KV with TTL
 memory/stores.py            InMemory stores — local dev default, no deps
 tools/builtin/http_fetch.py HTTPFetch — minimal read-only GET tool
 tools/builtin/fetch_image.py FetchImage — fetch URL and return OpenAI image_url block
+tools/builtin/subagent.py   SubAgentTool — expose a BaseAgent as a parent-callable streaming tool
 tools/mcp/adapter.py        MCP tool adapter — stdio, SSE, streamable-HTTP transports
 tools/mcp/auth.py           ApiKeyMCPAuth + BrowserOAuthMCPAuth — auth primitives for remote MCP servers
+harness/streaming.py        Multi-producer fan-in for parallel streaming tools (sub-agents)
 ```
 
 Execution is **streaming-primary**: every path yields `BusEvent`s for
@@ -90,6 +92,7 @@ explicit control.
 | `examples/mcp_demo.py` | Connects to an MCP filesystem server and gives the agent its tools. | `OPENAI_API_KEY`, `[openai,mcp]`, `npx` |
 | `examples/mcp_auth_demo.py` | Connects to an authenticated remote MCP server using bearer or auth-file credentials. | `OPENAI_API_KEY`, `[openai,mcp]`, `MCP_URL`, `MCP_BEARER_TOKEN` or `MCP_AUTH_PROVIDER` |
 | `examples/subscription_auth_demo.py` | Runs an agent through subscription-backed providers: direct `openai-codex` OAuth or direct `claude-code` OAuth. | `agent-harness login openai-codex` or `agent-harness login claude-code` |
+| `examples/coordinator_demo.py` | Sub-agent-as-tool pattern: a `coordinator` ReAct agent delegates dynamically to `researcher` / `analyst` / `reporter` via `SubAgentTool`. Demonstrates parallel delegation through `actions: [...]`. | `OPENAI_API_KEY`, `[openai,http]` |
 
 ## Adding a new domain (3 steps)
 
@@ -540,6 +543,79 @@ agents themselves still read from memory.
 
 If a task fails mid-run and `on_failure="replan"`, the replan call does
 go to the LLM — the bypass is for the *initial* plan only.
+
+### 5. Sub-agents as tools — `SubAgentTool`
+
+A different decomposition model from the orchestrator. Instead of a
+separate planner LLM deciding the DAG upfront, **one main agent's ReAct
+loop decides per step whether to delegate** and to whom. Use when the
+path is exploratory — you don't know which specialist you'll need until
+you've seen partial results.
+
+```python
+from tools.builtin.subagent import SubAgentTool
+
+researcher = BaseAgent(config=researcher_config, ...)
+analyst    = BaseAgent(config=analyst_config, ...)
+
+main_agent = BaseAgent(
+    config=AgentConfig(
+        agent_id="coordinator",
+        role="decides what to research and analyses results",
+        system_prompt="...",
+        allowed_tools=["delegate_research", "delegate_analyse"],
+        max_subagent_depth=3,   # bounds the delegation chain
+    ),
+    tools={
+        "delegate_research": SubAgentTool(researcher),
+        "delegate_analyse":  SubAgentTool(analyst),
+    },
+    ...
+)
+
+async for event in main_agent.run_stream(goal):
+    # Sub-agent THOUGHT / ACTION / OBSERVATION events bubble up tagged
+    # with event.parent_agent_id so renderers can indent or group them.
+    ...
+```
+
+When the main agent's LLM emits `{"action": "delegate_research", "args":
+{"task": "..."}}`, the wrapped sub-agent runs its own ReAct loop with a
+**fresh `WorkingMemory`**; the sub's final answer becomes the main agent's
+next observation. Each delegation = a fresh sub run; cross-delegation
+continuity flows through long-term memory (`MemoryManager.build_context(
+agent_id=…)`), not through WM carry-over — same model as the
+orchestrator's per-task agents.
+
+Parallel delegation works via the existing `actions: [...]` shape:
+
+```json
+{
+  "thought": "research and analyse can run in parallel",
+  "actions": [
+    {"tool": "delegate_research", "args": {"task": "find baseline metrics"}},
+    {"tool": "delegate_analyse",  "args": {"task": "score recent incidents"}}
+  ]
+}
+```
+
+Both sub-agent streams interleave through a fan-in helper
+(`harness/streaming.py:fan_in`) so the parent's event stream stays a
+single sequence even when multiple sub-agents are working concurrently.
+
+**Sub-agents as tools vs. Orchestrator — which to pick?**
+
+| | Sub-agents as tools | Orchestrator |
+|---|---|---|
+| Plan timing | Per step (dynamic) | Upfront DAG |
+| Who plans | The main agent's LLM | A separate planner LLM |
+| Best for | Exploratory work, "I don't know what I need until I see partial results" | Known workflows (audits, ETL, scheduled jobs) |
+| Replan-on-failure | Implicit — main agent reacts to sub's failure | Explicit `on_failure="replan"` |
+| Recursion guard | `max_subagent_depth` on `AgentConfig` | N/A — DAG is flat |
+
+Both are first-class. Most real systems combine them — the orchestrator
+plans a high-level DAG, individual tasks within it use sub-agent tools
+for finer dynamic decomposition.
 
 ---
 

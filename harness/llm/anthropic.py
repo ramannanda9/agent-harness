@@ -126,7 +126,12 @@ class AnthropicLLM:
         messages: list[dict],
         *,
         source: str | None = None,
+        **_kwargs: Any,
     ) -> AsyncGenerator[str, None]:
+        # ``_kwargs`` swallows OpenAI-style hints like ``response_format`` —
+        # Anthropic doesn't expose an equivalent (structure is enforced via
+        # prefill or system prompt). Accept and ignore so a caller wiring
+        # the same ReAct prompt at both adapters doesn't crash here.
         sys_blocks = _system_blocks(system, prompt_caching=self._prompt_caching)
         built_messages = _build_messages(messages, prompt_caching=self._prompt_caching)
 

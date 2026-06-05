@@ -37,7 +37,7 @@ Requires:
 Optional:
   OTEL_ENABLED=1          — send traces to Jaeger on localhost:4318
   PROJECT_DIR=...         — project root to audit (defaults to repo root)
-  PYPI_PACKAGE=...        — PyPI package name to fetch (defaults to agent-harness)
+  PYPI_PACKAGE=...        — PyPI package name to fetch (defaults to react-agent-harness)
   HITL_CHECKPOINT_DIR=... — override checkpoint directory (default ~/.agent-harness/checkpoints)
   DEBUG_MEMORY_CONTEXT=1  — print memory context injected into each agent prompt
 """
@@ -64,7 +64,7 @@ from tools.builtin.http_fetch import HTTPFetch
 
 MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.4-mini")
 PROJECT_DIR = Path(os.environ.get("PROJECT_DIR", Path(__file__).parent.parent)).resolve()
-PYPI_PACKAGE = os.environ.get("PYPI_PACKAGE", "agent-harness")
+PYPI_PACKAGE = os.environ.get("PYPI_PACKAGE", "react-agent-harness")
 
 # Persistent store config — set these to enable durable memory across runs.
 # Without them the demo falls back to in-memory stores (lost on exit).
