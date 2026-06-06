@@ -23,6 +23,8 @@ Run:
     OPENAI_API_KEY=sk-... python examples/persistent_agent_demo.py --headed   # see the browser
     python -m harness.cli login openai-codex
     python examples/persistent_agent_demo.py --provider openai-codex
+    python -m harness.cli login claude-code
+    python examples/persistent_agent_demo.py --provider claude-code
 """
 
 from __future__ import annotations
@@ -112,11 +114,11 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run a persistent coordinator chat session.")
     parser.add_argument(
         "--provider",
-        choices=("openai", "openai-codex"),
+        choices=("openai", "openai-codex", "claude-code"),
         default=os.environ.get("AGENT_LLM_PROVIDER", "openai"),
         help=(
             "LLM provider to use. 'openai' uses OPENAI_API_KEY; "
-            "'openai-codex' uses stored subscription OAuth credentials."
+            "'openai-codex' and 'claude-code' use stored subscription OAuth credentials."
         ),
     )
     parser.add_argument(
@@ -182,6 +184,22 @@ def _build_llm(provider: str):
             sys.exit(2)
         model = os.environ.get("OPENAI_CODEX_MODEL", "gpt-5.5")
         return OpenAICodexLLM(model=model, auth_file=auth_file), f"openai-codex:{model}"
+
+    if provider == "claude-code":
+        from harness.llm.claude_code import ClaudeCodeLLM  # noqa: PLC0415
+
+        auth_file = Path(
+            os.environ.get("CLAUDE_CODE_AUTH_FILE", "~/.agent-harness/auth/auth.json")
+        ).expanduser()
+        if not auth_file.exists():
+            print(
+                "ERROR: Claude Code credentials not found. Run: "
+                "python -m harness.cli login claude-code",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        model = os.environ.get("CLAUDE_CODE_MODEL", "claude-sonnet-4-6")
+        return ClaudeCodeLLM(model=model, auth_file=auth_file), f"claude-code:{model}"
 
     raise ValueError(f"unsupported provider: {provider}")
 

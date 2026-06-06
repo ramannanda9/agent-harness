@@ -94,7 +94,7 @@ explicit control.
 | `examples/mcp_auth_demo.py` | Connects to an authenticated remote MCP server using bearer or auth-file credentials. | `OPENAI_API_KEY`, `[openai,mcp]`, `MCP_URL`, `MCP_BEARER_TOKEN` or `MCP_AUTH_PROVIDER` |
 | `examples/subscription_auth_demo.py` | Runs an agent through subscription-backed providers: direct `openai-codex` OAuth or direct `claude-code` OAuth. | `agent-harness login openai-codex` or `agent-harness login claude-code` |
 | `examples/coordinator_demo.py` | Sub-agent-as-tool pattern: a `coordinator` ReAct agent delegates dynamically to `researcher` / `analyst` / `reporter` via `SubAgentTool`. Demonstrates parallel delegation through `actions: [...]`. | `OPENAI_API_KEY`, `[openai,http]` |
-| `examples/persistent_agent_demo.py` | Persistent local assistant: SQLite session + semantic memory, Lance episodic memory, shell tool, and a browser researcher via `@playwright/mcp`. Supports `--provider openai` or `--provider openai-codex`. | `[openai,mcp,lance]`, `OPENAI_API_KEY` or `python -m harness.cli login openai-codex`, `ah-executor`, `npx` (Node 18+) |
+| `examples/persistent_agent_demo.py` | Persistent local assistant: SQLite session + semantic memory, Lance episodic memory, shell tool, and a browser researcher via `@playwright/mcp`. Supports `--provider openai`, `--provider openai-codex`, or `--provider claude-code`. | `[openai,mcp,lance]`, `OPENAI_API_KEY` or `python -m harness.cli login openai-codex` / `claude-code`, `ah-executor`, `npx` (Node 18+) |
 
 ## Adding a new domain (3 steps)
 
@@ -658,6 +658,13 @@ To run it with stored OpenAI subscription credentials instead:
 ```bash
 python -m harness.cli login openai-codex
 python examples/persistent_agent_demo.py --provider openai-codex
+```
+
+Or with stored Claude Code credentials:
+
+```bash
+python -m harness.cli login claude-code
+python examples/persistent_agent_demo.py --provider claude-code
 ```
 
 The wrapper owns cadence:

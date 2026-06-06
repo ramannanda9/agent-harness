@@ -170,6 +170,21 @@ def test_persistent_demo_parser_accepts_codex_provider(monkeypatch):
     assert args.provider == "openai-codex"
 
 
+def test_persistent_demo_parser_accepts_claude_code_provider(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "persistent_agent_demo.py",
+            "--provider",
+            "claude-code",
+        ],
+    )
+
+    args = _parse_args()
+
+    assert args.provider == "claude-code"
+
+
 def test_persistent_agent_capabilities_lists_subagents_and_mcp_tools():
     llm = _ChatLLM()
     memory = _SpyMemory(llm)
