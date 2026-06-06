@@ -92,7 +92,11 @@ def _build_agent(
     llm,
     memory: MemoryManager,
     guard: BudgetGuard,
-    max_steps: int = 6,
+    # Match the framework default. The previous 6 left no headroom for
+    # realistic browser flows where consent banners, slow page loads,
+    # and one-source retries each cost a ReAct step. Override per-agent
+    # when more is needed (the researcher does — see below).
+    max_steps: int = 10,
 ) -> BaseAgent:
     return BaseAgent(
         config=AgentConfig(
@@ -298,7 +302,12 @@ async def main() -> None:
             llm=llm,
             memory=memory,
             guard=guard,
-            max_steps=10,
+            # Browser-driving headroom: a typical "navigate → snapshot →
+            # follow link → snapshot → extract → finish" flow already uses
+            # 6 steps. Real pages add consent banners, slow loads, and
+            # one-source-fails-try-alternate retries; 15 leaves a comfortable
+            # margin without inviting infinite loops.
+            max_steps=15,
         )
         delegate_research = SubAgentTool(researcher, name="delegate_research")
 
