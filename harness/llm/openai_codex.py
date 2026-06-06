@@ -30,6 +30,11 @@ class OpenAICodexLLM:
         request_timeout_seconds: float = 120.0,
         http_client: Any | None = None,
         codex_originator: str = "agent-harness",
+        # Matches OpenAILLM / AnthropicLLM's bumped default. Codex used to
+        # rely on the API's own ceiling; an explicit cap keeps long ReAct
+        # ``thought`` fields + finish answers from clipping mid-stream.
+        # Per-call override via ``complete(..., max_output_tokens=N)``.
+        max_output_tokens: int | None = 4096,
     ) -> None:
         if credential_provider is None:
             if auth_file is None:
@@ -47,6 +52,7 @@ class OpenAICodexLLM:
         self._client = http_client
         self._owns_client = http_client is None
         self._codex_originator = codex_originator
+        self._max_output_tokens = max_output_tokens
         self._budget: Any = None
         self.last_usage: dict | None = None
 
@@ -73,8 +79,14 @@ class OpenAICodexLLM:
         there is no separate non-streaming code path. The Codex backend
         only returns SSE; we just buffer the deltas before returning.
         """
+        # Inject the constructor's max_output_tokens unless the caller
+        # explicitly overrode it. ``_build_payload`` picks the key up from
+        # ``extra`` and forwards it to the Codex Responses API.
+        extra = dict(kwargs)
+        if self._max_output_tokens is not None and "max_output_tokens" not in extra:
+            extra["max_output_tokens"] = self._max_output_tokens
         text_parts: list[str] = []
-        async for delta in self._iter_stream(system, messages, extra=kwargs, source=source):
+        async for delta in self._iter_stream(system, messages, extra=extra, source=source):
             text_parts.append(delta)
         text = "".join(text_parts)
         usage = self.last_usage or {}
@@ -88,16 +100,21 @@ class OpenAICodexLLM:
         messages: list[dict],
         *,
         source: str | None = None,
-        **_kwargs: Any,
+        **kwargs: Any,
     ) -> AsyncGenerator[str, None]:
         """Yield each `response.output_text.delta` token as it arrives.
 
-        ``_kwargs`` accepts OpenAI-style hints like ``response_format`` so
+        ``kwargs`` accepts OpenAI-style hints like ``response_format`` so
         the same ReAct-driving caller works against this adapter and the
         public ``OpenAILLM``; Codex's responses backend wires JSON output
-        differently and the kwarg is intentionally ignored here.
+        differently and the kwarg is intentionally ignored. The
+        ``max_output_tokens`` knob IS forwarded so streaming responses
+        get the same headroom as the non-streaming path.
         """
-        async for delta in self._iter_stream(system, messages, extra={}, source=source):
+        extra = dict(kwargs)
+        if self._max_output_tokens is not None and "max_output_tokens" not in extra:
+            extra["max_output_tokens"] = self._max_output_tokens
+        async for delta in self._iter_stream(system, messages, extra=extra, source=source):
             yield delta
 
     async def aclose(self) -> None:

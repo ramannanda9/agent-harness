@@ -22,3 +22,4 @@ tasks/
 # Runtime artifacts from examples/persistent_agent_demo.py
 .agent_harness_sessions.sqlite
 .agent_harness_sessions.sqlite-*
+.playwright-mcp/

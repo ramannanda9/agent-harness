@@ -125,6 +125,40 @@ async def test_agent_forwards_token_events_when_llm_streams(agent_factory):
     assert events[-1].payload["answer"] == "ok"
 
 
+async def test_agent_retries_non_streaming_when_stream_json_is_truncated(agent_factory):
+    class TruncatedStreamingLLM:
+        def __init__(self):
+            self.complete_calls = 0
+
+        async def complete(self, system, messages, **kwargs):
+            self.complete_calls += 1
+            return {
+                "action": "finish",
+                "answer": "recovered",
+                "confidence": 0.8,
+                "thought": "retry worked",
+            }
+
+        async def stream_complete(self, system, messages, **_kwargs):
+            yield '{"thought":"too long and then cut off'
+
+    llm = TruncatedStreamingLLM()
+    cfg = AgentConfig(
+        agent_id="a",
+        role="r",
+        system_prompt="ReAct.",
+        allowed_tools=[],
+    )
+    agent = agent_factory(cfg)
+    agent._llm = llm
+
+    events = [e async for e in agent.run_stream("hi")]
+
+    assert llm.complete_calls == 1
+    assert events[-1].type == EventType.TASK_DONE
+    assert events[-1].payload["answer"] == "recovered"
+
+
 # ── Orchestrator.run_stream event sequence ──────────────────────────────────
 
 

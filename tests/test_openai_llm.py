@@ -178,6 +178,24 @@ async def test_complete_forwards_response_format(monkeypatch):
     assert raw.calls[0]["response_format"] == {"type": "json_object"}
 
 
+async def test_complete_forwards_default_max_completion_tokens(monkeypatch):
+    llm, raw = _build(monkeypatch)
+    raw.next_body = _fake_response("{}")
+    await llm.complete(system=None, messages=[])
+    assert raw.calls[0]["max_completion_tokens"] == 4096
+
+
+async def test_complete_allows_max_completion_tokens_override_and_opt_out(monkeypatch):
+    llm, raw = _build(monkeypatch)
+    raw.next_body = _fake_response("{}")
+    await llm.complete(system=None, messages=[], max_completion_tokens=123)
+    assert raw.calls[0]["max_completion_tokens"] == 123
+
+    raw.next_body = _fake_response("{}")
+    await llm.complete(system=None, messages=[], max_completion_tokens=None)
+    assert "max_completion_tokens" not in raw.calls[1]
+
+
 # ── cost: gateway header takes precedence ────────────────────────────────────
 
 
@@ -289,6 +307,24 @@ async def test_stream_complete_forwards_response_format(monkeypatch):
         )
     ]
     assert raw.calls[0]["response_format"] == {"type": "json_object"}
+
+
+async def test_stream_complete_forwards_default_max_completion_tokens(monkeypatch):
+    llm, raw = _build(monkeypatch)
+    raw.next_stream_chunks = [_fake_chunk(usage=_FakeUsage(1, 1))]
+    [t async for t in llm.stream_complete(system=None, messages=[])]
+    assert raw.calls[0]["max_completion_tokens"] == 4096
+
+
+async def test_stream_complete_allows_max_completion_tokens_override_and_opt_out(monkeypatch):
+    llm, raw = _build(monkeypatch)
+    raw.next_stream_chunks = [_fake_chunk(usage=_FakeUsage(1, 1))]
+    [t async for t in llm.stream_complete(system=None, messages=[], max_completion_tokens=321)]
+    assert raw.calls[0]["max_completion_tokens"] == 321
+
+    raw.next_stream_chunks = [_fake_chunk(usage=_FakeUsage(1, 1))]
+    [t async for t in llm.stream_complete(system=None, messages=[], max_completion_tokens=None)]
+    assert "max_completion_tokens" not in raw.calls[1]
 
 
 async def test_stream_complete_omits_response_format_when_not_requested(monkeypatch):

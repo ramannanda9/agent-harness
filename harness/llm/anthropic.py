@@ -60,7 +60,11 @@ class AnthropicLLM:
         *,
         model: str = "claude-sonnet-4-6",
         api_key: str | None = None,  # falls back to ANTHROPIC_API_KEY env
-        max_tokens: int = 1024,
+        # Generous default — matches OpenAILLM's max_completion_tokens=4096.
+        # ReAct ``thought`` fields + finish answers were getting clipped at
+        # 1024 once observations grew large; 4096 leaves comfortable headroom
+        # while staying below Claude 3.5 / 3.7's per-call output ceilings.
+        max_tokens: int = 4096,
         cost_fn: Callable[[dict], float] | None = None,
         prompt_caching: bool = True,
     ) -> None:

@@ -152,6 +152,22 @@ def test_persistent_demo_parser_accepts_session_controls(monkeypatch):
     assert args.session_id == "pr-review"
     assert args.db == "sessions.sqlite"
     assert args.new_session is False
+    assert args.provider == "openai"
+
+
+def test_persistent_demo_parser_accepts_codex_provider(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "persistent_agent_demo.py",
+            "--provider",
+            "openai-codex",
+        ],
+    )
+
+    args = _parse_args()
+
+    assert args.provider == "openai-codex"
 
 
 def test_persistent_agent_capabilities_lists_subagents_and_mcp_tools():

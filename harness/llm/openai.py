@@ -58,6 +58,10 @@ _GATEWAY_COST_HEADERS = (
     "x-helicone-cost-usd",
 )
 
+# Sentinel distinguishing "caller didn't pass max_completion_tokens" from
+# "caller explicitly passed None" — the latter opts out of the cap entirely.
+_SENTINEL: Any = object()
+
 
 class OpenAILLM:
     def __init__(
@@ -68,6 +72,12 @@ class OpenAILLM:
         base_url: str | None = None,  # set when routing through a gateway
         request_timeout_seconds: float = 60.0,
         cost_fn: Callable[[dict], float] | None = None,
+        # Generous default so long ReAct ``thought`` fields + structured
+        # JSON ``finish`` answers don't get clipped mid-stream — the
+        # default-None behaviour was relying on the model's own ceiling,
+        # which truncated JSON-mode responses inside ``BaseAgent``'s loop.
+        # Per-call override available via ``complete(..., max_completion_tokens=N)``.
+        max_completion_tokens: int | None = 4096,
     ) -> None:
         try:
             from openai import AsyncOpenAI
@@ -83,6 +93,7 @@ class OpenAILLM:
         )
         self._model = model
         self._cost_fn = cost_fn
+        self._max_completion_tokens = max_completion_tokens
         self._budget = None
         # Last observed usage dict. Populated after every successful call; useful
         # for streaming callers who can't read it from the return value.
@@ -114,6 +125,11 @@ class OpenAILLM:
         # supports {"type": "json_object"} to enforce strict JSON output.
         if "response_format" in kwargs:
             request["response_format"] = kwargs["response_format"]
+        # Per-call override wins over the instance default; explicit ``None``
+        # means "let the model use its own ceiling" so callers can opt out.
+        max_completion_tokens = kwargs.get("max_completion_tokens", self._max_completion_tokens)
+        if max_completion_tokens is not None:
+            request["max_completion_tokens"] = max_completion_tokens
 
         # with_raw_response gives us response headers (for gateway cost detection)
         # plus the parsed body. Both succeed identically if the gateway header
@@ -137,6 +153,7 @@ class OpenAILLM:
         *,
         source: str | None = None,
         response_format: dict | None = None,
+        max_completion_tokens: int | None = _SENTINEL,
     ) -> AsyncGenerator[str, None]:
         full_messages = _prepend_system(system, messages)
         # include_usage adds a final SSE chunk with the same usage block as
@@ -154,6 +171,16 @@ class OpenAILLM:
         # accepting prose responses and crashing in ``_parse_action_json``.
         if response_format is not None:
             request_kwargs["response_format"] = response_format
+        # Sentinel-vs-None distinction so callers can explicitly pass
+        # ``max_completion_tokens=None`` to opt out of the cap (let model
+        # use its own ceiling). The instance default fills in otherwise.
+        effective_max = (
+            self._max_completion_tokens
+            if max_completion_tokens is _SENTINEL
+            else max_completion_tokens
+        )
+        if effective_max is not None:
+            request_kwargs["max_completion_tokens"] = effective_max
         raw = await self._client.chat.completions.with_raw_response.create(**request_kwargs)
         headers = _headers_dict(raw)
         stream = raw.parse()

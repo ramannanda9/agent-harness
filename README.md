@@ -94,7 +94,7 @@ explicit control.
 | `examples/mcp_auth_demo.py` | Connects to an authenticated remote MCP server using bearer or auth-file credentials. | `OPENAI_API_KEY`, `[openai,mcp]`, `MCP_URL`, `MCP_BEARER_TOKEN` or `MCP_AUTH_PROVIDER` |
 | `examples/subscription_auth_demo.py` | Runs an agent through subscription-backed providers: direct `openai-codex` OAuth or direct `claude-code` OAuth. | `agent-harness login openai-codex` or `agent-harness login claude-code` |
 | `examples/coordinator_demo.py` | Sub-agent-as-tool pattern: a `coordinator` ReAct agent delegates dynamically to `researcher` / `analyst` / `reporter` via `SubAgentTool`. Demonstrates parallel delegation through `actions: [...]`. | `OPENAI_API_KEY`, `[openai,http]` |
-| `examples/persistent_agent_demo.py` | Persistent chat wrapper: SQLite session transcript + rolling summary around a user-built coordinator/sub-agent graph. Researcher drives a real Chromium browser via `@playwright/mcp` so JS-rendered + bot-walled news sites work. | `OPENAI_API_KEY`, `[openai,mcp]`, `npx` (Node 18+); first run downloads ~150 MB Chromium |
+| `examples/persistent_agent_demo.py` | Persistent local assistant: SQLite session + semantic memory, Lance episodic memory, shell tool, and a browser researcher via `@playwright/mcp`. Supports `--provider openai` or `--provider openai-codex`. | `[openai,mcp,lance]`, `OPENAI_API_KEY` or `python -m harness.cli login openai-codex`, `ah-executor`, `npx` (Node 18+) |
 
 ## Adding a new domain (3 steps)
 
@@ -630,7 +630,7 @@ from harness.persistent import PersistentAgent, SQLiteSessionStore
 
 app = PersistentAgent(
     coordinator=coordinator_agent,
-    session_store=SQLiteSessionStore(".agent_harness_sessions.sqlite"),
+    session_store=SQLiteSessionStore("~/.agent-harness/sessions.sqlite"),
     memory=memory_manager,
     llm=llm,
 )
@@ -646,6 +646,19 @@ sub-agents, and MCP tools. The demo exposes this with
 Each chat turn gets a fresh `WorkingMemory`. Continuity comes from the
 SQLite session state (rolling summary + recent messages) and normal
 `MemoryManager` recall, not from carrying old ReAct scratchpads forever.
+The demo stores local state under `~/.agent-harness` by default:
+
+- `sessions.sqlite` for chat/session state
+- `memory/semantic.sqlite` for semantic facts/preferences
+- `memory/lance_episodic` for searchable episodic summaries
+
+By default the demo uses `OpenAILLM` and requires `OPENAI_API_KEY`.
+To run it with stored OpenAI subscription credentials instead:
+
+```bash
+python -m harness.cli login openai-codex
+python examples/persistent_agent_demo.py --provider openai-codex
+```
 
 The wrapper owns cadence:
 

@@ -38,7 +38,10 @@ class ClaudeCodeLLM:
         credential_provider: AuthFileOAuthProvider | None = None,
         base_url: str = "https://api.anthropic.com",
         request_timeout_seconds: float = 120.0,
-        max_tokens: int = 1024,
+        # Matches AnthropicLLM's bumped default. The original 1024 cap
+        # clipped JSON-mode responses in long ReAct loops; 4096 keeps
+        # headroom without blowing through per-call budgets.
+        max_tokens: int = 4096,
         http_client: Any | None = None,
         user_agent: str | None = None,
         betas: str = CLAUDE_CODE_BETAS,
