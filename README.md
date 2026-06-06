@@ -55,6 +55,7 @@ harness/checkpoint.py       CheckpointStore + _ResumeHint + maybe_resume_key —
 harness/otel.py             OTELHook — OpenTelemetry span exporter (opt-in)
 harness/executor_bridge.py  ExecutorBridge + ExecutorTool — controlled subprocess launcher with optional Docker sandboxing
 harness/oauth_browser.py    Localhost OAuth callback server + open_or_print_url — shared by MCP browser-OAuth and LLM login flows
+harness/persistent.py       PersistentAgent + SQLiteSessionStore — durable chat sessions around user-built agents
 orchestrator/planner.py     Hybrid DAG orchestrator — plan, replan, synthesize
 agents/base.py              Generic BaseAgent — ReAct loop, no subclassing needed
 memory/manager.py           MemoryManager — semantic KV + episodic vector
@@ -93,6 +94,7 @@ explicit control.
 | `examples/mcp_auth_demo.py` | Connects to an authenticated remote MCP server using bearer or auth-file credentials. | `OPENAI_API_KEY`, `[openai,mcp]`, `MCP_URL`, `MCP_BEARER_TOKEN` or `MCP_AUTH_PROVIDER` |
 | `examples/subscription_auth_demo.py` | Runs an agent through subscription-backed providers: direct `openai-codex` OAuth or direct `claude-code` OAuth. | `agent-harness login openai-codex` or `agent-harness login claude-code` |
 | `examples/coordinator_demo.py` | Sub-agent-as-tool pattern: a `coordinator` ReAct agent delegates dynamically to `researcher` / `analyst` / `reporter` via `SubAgentTool`. Demonstrates parallel delegation through `actions: [...]`. | `OPENAI_API_KEY`, `[openai,http]` |
+| `examples/persistent_agent_demo.py` | Persistent local assistant: SQLite session + semantic memory, Lance episodic memory, shell tool, and a browser researcher via `@playwright/mcp`. Supports `--provider openai`, `--provider openai-codex`, or `--provider claude-code`. | `[openai,mcp,lance]`, `OPENAI_API_KEY` or `python -m harness.cli login openai-codex` / `claude-code`, `ah-executor`, `npx` (Node 18+) |
 
 ## Adding a new domain (3 steps)
 
@@ -617,6 +619,94 @@ Both are first-class. Most real systems combine them — the orchestrator
 plans a high-level DAG, individual tasks within it use sub-agent tools
 for finer dynamic decomposition.
 
+### 6. Persistent chat sessions — `PersistentAgent`
+
+`PersistentAgent` is a wrapper around a coordinator `BaseAgent`, not a new
+agent constructor. Build agents, sub-agents, MCP tools, and auth exactly as
+usual; then wrap the top-level coordinator to add durable chat/session state.
+
+```python
+from harness.persistent import PersistentAgent, SQLiteSessionStore
+
+app = PersistentAgent(
+    coordinator=coordinator_agent,
+    session_store=SQLiteSessionStore("~/.agent-harness/sessions.sqlite"),
+    memory=memory_manager,
+    llm=llm,
+)
+
+async for event in app.chat("I like the above; can you do X?", session_id="thread-1"):
+    renderer.render(event)
+```
+
+Use `app.capabilities()` to inspect the already-wired coordinator,
+sub-agents, and MCP tools. The demo exposes this with
+`--show-capabilities`.
+
+Each chat turn gets a fresh `WorkingMemory`. Continuity comes from the
+SQLite session state (rolling summary + recent messages) and normal
+`MemoryManager` recall, not from carrying old ReAct scratchpads forever.
+
+**Prefix-cache aware.** The full prompt stays byte-identical across plain
+chat turns within a compaction window. Three things make that work:
+
+1. The accumulated session transcript is sent to the coordinator as real
+   `user`/`assistant` role messages — not folded into one inline-rendered
+   text blob. Each turn extends the message list by exactly the previous
+   turn's user+assistant pair plus the new user task.
+2. Memory context (`MemoryManager.build_context` result) lives in a
+   pinned user-message prior, **not in the system prompt**. The system
+   prompt is now pure agent identity + tool list + ReAct format — purely
+   static. Memory context is fetched once per session, cached on the
+   `PersistentAgent`, and refreshed only at compaction or high-signal
+   reconcile (so it doesn't shift turn-to-turn just because the goal
+   changed).
+3. Long-term memory writes are **deferred to compaction**, not fired
+   periodically. The session transcript is the per-turn journal — facts
+   land in long-term memory only when we're already breaking cache (at
+   compaction or high-signal events like tool runs / "remember" terms).
+   The legacy `reconcile_every_turns` knob is a no-op.
+
+OpenAI's automatic prefix cache and Anthropic's `cache_control` markers
+both match on longest-identical prefix. Together these three changes let
+a typical session pay one cold compaction every ~12 turns plus ~K turns
+of warm-prefix hits in between, instead of paying full price every
+turn.
+
+The demo stores local state under `~/.agent-harness` by default:
+
+- `sessions.sqlite` for chat/session state
+- `memory/semantic.sqlite` for semantic facts/preferences
+- `memory/lance_episodic` for searchable episodic summaries
+
+By default the demo uses `OpenAILLM` and requires `OPENAI_API_KEY`.
+To run it with stored OpenAI subscription credentials instead:
+
+```bash
+python -m harness.cli login openai-codex
+python examples/persistent_agent_demo.py --provider openai-codex
+```
+
+Or with stored Claude Code credentials:
+
+```bash
+python -m harness.cli login claude-code
+python examples/persistent_agent_demo.py --provider claude-code
+```
+
+The wrapper owns cadence:
+
+- session transcript is written every turn without an LLM;
+- `MemoryManager.write_run_end(...)` is called only when the turn has a
+  durable signal, tool/sub-agent work, errors, or the configured interval
+  has elapsed;
+- session compaction runs at message/turn thresholds and updates the
+  stored summary.
+
+For MCP, put MCP tools on the coordinator or sub-agents before wrapping.
+`PersistentAgent` does not special-case MCP auth; it preserves the existing
+tool wiring model.
+
 ---
 
 Event types by path:
@@ -676,9 +766,27 @@ a string to `n` characters with a trailing `…`.
 
 ## Working memory budget
 
-`AgentConfig.working_memory_max_tokens` controls per-agent eviction (default
-`8000`). Counting defaults to a `chars/4` heuristic (stable for code/JSON/text
-within ~10–20% of real BPE counts, zero deps). For exact counts plug your own
+`AgentConfig.working_memory_max_tokens` controls per-agent eviction. **Default
+is `None` — auto-derived from the LLM's context window at runtime** so the
+threshold adapts when you swap models (a 128K `gpt-5.4-mini` gets ~99K of WM
+headroom; a 200K `claude-sonnet-4-6` gets ~159K; a tiny 8K fallback gets ~6K).
+Concretely the WM compacts at `0.8 × llm.input_token_budget`, leaving 20%
+headroom for system prompt, memory context, tool schemas, and tokeniser
+variance.
+
+Each shipped adapter (`OpenAILLM`, `AnthropicLLM`, `ClaudeCodeLLM`,
+`OpenAICodexLLM`) exposes `context_window` and `input_token_budget`
+properties driven by a per-provider lookup table. For models the table
+doesn't know (new releases, fine-tunes), pass `context_window=N` explicitly:
+
+```python
+llm = OpenAILLM(model="gpt-6-preview", context_window=256_000)
+# or hard-cap WM independent of the LLM:
+AgentConfig(..., working_memory_max_tokens=16_000)
+```
+
+Counting defaults to a `chars/4` heuristic (stable for code/JSON/text within
+~10–20% of real BPE counts, zero deps). For exact counts plug your own
 counter into `WorkingMemory` directly:
 
 ```python
@@ -1452,7 +1560,7 @@ agents alongside HITL on the shell tool.
 | `max_wall_time_seconds` | (guardrail) | See `GuardrailConfig` |
 | `memory_context_enabled` | `True` | Prepend relevant long-term memory to the system prompt |
 | `confidence_from_llm` | `True` | Use the `confidence` field from the LLM response; set `False` to always return `1.0` |
-| `working_memory_max_tokens` | `8000` | Token budget for in-context working memory before rolling summarisation kicks in |
+| `working_memory_max_tokens` | `None` (auto-derive from `llm.input_token_budget × 0.8`; pass an int to hard-cap) | Token budget for in-context working memory before rolling summarisation kicks in |
 | `hitl_tools` | `[]` | Tool names that require human approval before execution |
 | `checkpoint_every` | `0` | Write a crash-resumable checkpoint every N steps; `0` disables periodic checkpoints |
 | `stream_tokens` | `False` | Emit `TOKEN` events as the LLM streams. Disabled by default — enable if you want to render partial output in real time: `AgentConfig(..., stream_tokens=True)` |

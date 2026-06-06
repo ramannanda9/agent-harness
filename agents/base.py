@@ -74,7 +74,12 @@ class AgentConfig:
     memory_context_enabled: bool = True
     confidence_from_llm: bool = True  # if False, confidence=1.0 on success
     stream_tokens: bool = False  # if True, TOKEN events are emitted as the LLM streams
-    working_memory_max_tokens: int = 8000  # WorkingMemory eviction threshold; tune per agent
+    # ``None`` → derive from ``llm.input_token_budget * 0.8`` at runtime
+    # (each adapter reports a per-model context window; OpenAILLM /
+    # AnthropicLLM / etc. expose ``input_token_budget``). Pass an explicit
+    # int to hard-cap the WorkingMemory eviction threshold — useful for
+    # cost-sensitive workloads or when feeding very small models.
+    working_memory_max_tokens: int | None = None
     hitl_tools: list[str] = None  # tools requiring human approval; None = no HITL
     checkpoint_every: int = 0  # write a resumable checkpoint every N steps; 0 = disabled
     # Cache tool results within a single run, keyed by (tool_name, args).
@@ -105,7 +110,7 @@ At each step, respond with a JSON object in one of three forms:
 
 To use a single tool:
 {
-  "thought": "<reasoning about what to do next>",
+  "thought": "<brief reason, max 25 words>",
   "action": "<tool_name>",
   "args": { "<arg>": "<value>", ... }
 }
@@ -113,7 +118,7 @@ To use a single tool:
 To use multiple independent tools at once (they run in parallel — use this when \
 the calls don't depend on each other):
 {
-  "thought": "<reasoning>",
+  "thought": "<brief reason, max 25 words>",
   "actions": [
     {"tool": "<tool_name>", "args": { "<arg>": "<value>", ... }},
     {"tool": "<tool_name_2>", "args": { "<arg>": "<value>", ... }}
@@ -122,14 +127,15 @@ the calls don't depend on each other):
 
 To finish:
 {
-  "thought": "<final reasoning>",
+  "thought": "<brief reason, max 25 words>",
   "action": "finish",
   "answer": "<comprehensive answer to the task>",
   "confidence": <0.0-1.0>
 }
 
 Available tools: __TOOL_LIST__
-Return JSON only — no markdown, no preamble.
+Return JSON only — no markdown, no preamble. Keep `thought` short; put details in
+tool arguments or final `answer`, not in `thought`.
 """
 
 
@@ -247,7 +253,30 @@ class BaseAgent:
         self,
         task: str,
         run_id: str | None = None,
+        *,
+        prior_messages: list[tuple[str, str | list]] | None = None,
+        pinned_priors: int = 0,
+        precomputed_memory_context: Any = None,
     ) -> AsyncGenerator[BusEvent, None]:
+        """Run the ReAct loop on ``task``, optionally seeded with prior
+        conversation history.
+
+        ``prior_messages``
+            List of ``(role, content)`` pairs to append to WorkingMemory
+            after the system prompt and before the current task. Used by
+            ``PersistentAgent`` to feed cross-turn conversation history as
+            real role messages instead of inline-rendered text — which
+            makes the prompt prefix byte-identical between turns until
+            the next compaction, unlocking OpenAI's automatic prefix
+            cache and Anthropic's ``cache_control``.
+
+        ``pinned_priors``
+            How many of the *first* ``prior_messages`` to pin against
+            WorkingMemory eviction. Designed for ``PersistentAgent`` to
+            pin the rolling-summary priming pair so that even if a busy
+            turn's tool observations push WM into summarisation, the
+            session-level summary survives.
+        """
         run_id = run_id or str(uuid.uuid4())
         self._ckp_id = f"{run_id}:{self.config.agent_id}"
         if not self._resume_key:
@@ -258,8 +287,13 @@ class BaseAgent:
             max_tokens=self.config.working_memory_max_tokens,
         )
 
-        system = await self._build_system_prompt(task)
+        system = await self._build_system_prompt(
+            task, precomputed_memory_context=precomputed_memory_context
+        )
         await self._working_memory.append("system", system, pinned=True)
+        if prior_messages:
+            for idx, (role, content) in enumerate(prior_messages):
+                await self._working_memory.append(role, content, pinned=idx < pinned_priors)
         await self._working_memory.append("user", task)
 
         # Steering source is owned by the agent for the duration of the run.
@@ -365,10 +399,28 @@ class BaseAgent:
 
     # ── System Prompt ─────────────────────────────────────────────────────────
 
-    async def _build_system_prompt(self, task: str) -> str:
+    async def _build_system_prompt(
+        self,
+        task: str,
+        *,
+        precomputed_memory_context: Any = None,
+    ) -> str:
+        """Build the system prompt.
+
+        When ``precomputed_memory_context`` is the sentinel ``"_skip_"``
+        (passed by ``PersistentAgent``), the live ``build_context`` lookup
+        is skipped entirely — memory context is placed in user-message
+        priors instead so the system prompt stays byte-stable across
+        turns. Otherwise (the default for one-shot dispatch via
+        AgentRuntime / Orchestrator), memory is fetched + rendered inline
+        as before.
+        """
         parts = [self.config.system_prompt]
 
-        if self.config.memory_context_enabled:
+        memory_in_system_prompt = (
+            self.config.memory_context_enabled and precomputed_memory_context != "_skip_"
+        )
+        if memory_in_system_prompt:
             mem_context = await self._memory.build_context(
                 goal=task,
                 agent_id=self.config.agent_id,
@@ -813,14 +865,13 @@ class BaseAgent:
                             agent_id=self.config.agent_id,
                             token=token,
                         )
-                response = _parse_action_json(accumulated)
+                response = _normalize_response(accumulated)
                 if response is None:
-                    logger.warning(
-                        "Agent %s stream got unparseable response: %r",
-                        self.config.agent_id,
-                        accumulated[:300],
+                    response = await self._retry_complete_after_bad_stream(
+                        messages=messages,
+                        react_source=react_source,
+                        accumulated=accumulated,
                     )
-                    self._last_think_error = f"Unparseable stream response: {accumulated[:300]}"
             else:
                 raw = await self._llm.complete(
                     system=None,
@@ -879,6 +930,46 @@ class BaseAgent:
                 "action": response.get("action") if response else None,
             },
         )
+
+    async def _retry_complete_after_bad_stream(
+        self,
+        *,
+        messages: list[dict],
+        react_source: str,
+        accumulated: str,
+    ) -> dict | None:
+        """Retry once non-streaming when streamed JSON is truncated/malformed."""
+        logger.warning(
+            "Agent %s stream got unparseable response, retrying non-streaming: %r",
+            self.config.agent_id,
+            accumulated[:300],
+        )
+        try:
+            raw = await self._llm.complete(
+                system=None,
+                messages=[
+                    *messages,
+                    {
+                        "role": "user",
+                        "content": (
+                            "Your previous streamed JSON was incomplete or malformed. "
+                            "Return one complete valid ReAct JSON object now. Keep "
+                            "`thought` under 25 words."
+                        ),
+                    },
+                ],
+                response_format={"type": "json_object"},
+                source=react_source,
+            )
+            response = _normalize_response(raw)
+        except Exception as e:
+            logger.error("Agent %s retry after bad stream failed: %s", self.config.agent_id, e)
+            response = None
+            self._last_think_error = str(e)
+        else:
+            if response is None:
+                self._last_think_error = f"Unparseable stream response: {accumulated[:300]}"
+        return response
 
     # ── Tool Execution ────────────────────────────────────────────────────────
 
@@ -1188,15 +1279,33 @@ class BaseAgent:
 
 
 def _normalize_response(response: Any) -> dict | None:
-    if isinstance(response, dict) and ("action" in response or "actions" in response):
-        return response
+    if isinstance(response, dict) and "text" not in response:
+        return response if _is_valid_react_response(response) else None
     if isinstance(response, dict) and "text" in response:
         text = response["text"].strip()
     elif isinstance(response, str):
         text = response.strip()
     else:
         text = str(response).strip()
-    return _parse_action_json(text)
+    parsed = _parse_action_json(text)
+    return parsed if _is_valid_react_response(parsed) else None
+
+
+def _is_valid_react_response(response: Any) -> bool:
+    if not isinstance(response, dict):
+        return False
+    action = response.get("action")
+    if isinstance(action, str) and action.strip():
+        return True
+    actions = response.get("actions")
+    if isinstance(actions, list) and actions:
+        return all(
+            isinstance(item, dict)
+            and isinstance(item.get("tool"), str)
+            and bool(item.get("tool", "").strip())
+            for item in actions
+        )
+    return False
 
 
 def _is_image_block(obs: Any) -> bool:

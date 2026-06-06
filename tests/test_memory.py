@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from memory.manager import MemoryManager
-from memory.stores import InMemoryEpisodicStore, InMemorySemanticStore
+from memory.stores import InMemoryEpisodicStore, InMemorySemanticStore, SQLiteSemanticStore
 from tests.conftest import ScriptedLLM
 
 # ── Semantic store ────────────────────────────────────────────────────────────
@@ -37,6 +37,19 @@ async def test_semantic_search_prefix():
     await store.write("other:c", 3)
     matched = await store.search_prefix("ns:")
     assert matched == {"ns:a": 1, "ns:b": 2}
+
+
+async def test_sqlite_semantic_store_persists_and_searches_prefix(tmp_path):
+    path = tmp_path / "semantic.sqlite"
+    store = SQLiteSemanticStore(path)
+    await store.write("repo:command_policy", "prefer rtk")
+    await store.write("user:style", {"tone": "direct"})
+
+    reloaded = SQLiteSemanticStore(path)
+
+    assert await reloaded.read("repo:command_policy") == "prefer rtk"
+    assert await reloaded.read("user:style") == {"tone": "direct"}
+    assert await reloaded.search_prefix("repo:") == {"repo:command_policy": "prefer rtk"}
 
 
 # ── Episodic store ────────────────────────────────────────────────────────────

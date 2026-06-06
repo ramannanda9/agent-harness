@@ -38,11 +38,17 @@ class ClaudeCodeLLM:
         credential_provider: AuthFileOAuthProvider | None = None,
         base_url: str = "https://api.anthropic.com",
         request_timeout_seconds: float = 120.0,
-        max_tokens: int = 1024,
+        # Matches AnthropicLLM's bumped default. The original 1024 cap
+        # clipped JSON-mode responses in long ReAct loops; 4096 keeps
+        # headroom without blowing through per-call budgets.
+        max_tokens: int = 4096,
         http_client: Any | None = None,
         user_agent: str | None = None,
         betas: str = CLAUDE_CODE_BETAS,
         prompt_caching: bool = True,
+        # Explicit context window override; falls back to the Anthropic
+        # lookup table since Claude Code is Anthropic underneath.
+        context_window: int | None = None,
     ) -> None:
         if credential_provider is None:
             if auth_file is None:
@@ -68,8 +74,26 @@ class ClaudeCodeLLM:
         self._user_agent = user_agent or _default_user_agent()
         self._betas = betas
         self._prompt_caching = prompt_caching
+        # Reuse Anthropic's table — Claude Code is Anthropic underneath.
+        from harness.llm.anthropic import (  # noqa: PLC0415
+            _ANTHROPIC_TOKEN_BUDGET_SAFETY,
+            _lookup_anthropic_context_window,
+        )
+
+        self._context_window = context_window or _lookup_anthropic_context_window(self._model)
+        self._token_budget_safety = _ANTHROPIC_TOKEN_BUDGET_SAFETY
         self._budget: Any = None
         self.last_usage: dict | None = None
+
+    @property
+    def context_window(self) -> int:
+        return self._context_window
+
+    @property
+    def input_token_budget(self) -> int:
+        """Tokens available for the prompt; Anthropic semantics — context is
+        input-only, output cap is separate."""
+        return max(1024, self._context_window - self._token_budget_safety)
 
     def set_budget(self, guard: Any) -> None:
         """Inject a BudgetGuard so token caps fire on subscription-auth runs.

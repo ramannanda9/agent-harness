@@ -116,6 +116,18 @@ class TestNormalizeResponse:
         result = _normalize_response(s)
         assert result["action"] == "http_fetch"
 
+    def test_missing_action_is_invalid(self):
+        assert _normalize_response({"thought": "done", "answer": "hello"}) is None
+
+    def test_empty_action_is_invalid(self):
+        assert _normalize_response({"thought": "done", "action": "", "args": {}}) is None
+
+    def test_string_with_empty_action_is_invalid(self):
+        assert _normalize_response('{"thought": "done", "action": "", "args": {}}') is None
+
+    def test_parallel_action_with_empty_tool_is_invalid(self):
+        assert _normalize_response({"actions": [{"tool": "", "args": {}}]}) is None
+
     def test_invalid_returns_none(self):
         assert _normalize_response("not json at all") is None
 

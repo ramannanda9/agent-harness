@@ -173,6 +173,36 @@ async def test_unparseable_llm_response_returns_error(agent_factory, llm: Script
     assert "unparseable" in result["error"].lower()
 
 
+async def test_empty_action_response_returns_error_without_tool_loop(
+    agent_factory, llm: ScriptedLLM
+):
+    """A JSON object with an empty action is malformed, not a tool call to ''."""
+
+    calls = {"n": 0}
+
+    def react(system, messages, kwargs):
+        calls["n"] += 1
+        return {"thought": "I should answer", "action": "", "args": {}}
+
+    llm.routes = {"react": react}
+
+    config = AgentConfig(
+        agent_id="empty-action",
+        role="parser test",
+        system_prompt="ReAct.",
+        allowed_tools=["echo"],
+        max_steps=5,
+    )
+    agent = agent_factory(config, tools={"echo": EchoTool()})
+
+    events = [event async for event in agent.run_stream("anything")]
+
+    assert calls["n"] == 1
+    assert not [event for event in events if event.type == EventType.ACTION]
+    error = next(event for event in events if event.type == EventType.ERROR)
+    assert "unparseable" in error.error.lower()
+
+
 # ── Parallel tool calls ───────────────────────────────────────────────────────
 
 

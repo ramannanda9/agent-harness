@@ -30,6 +30,13 @@ class OpenAICodexLLM:
         request_timeout_seconds: float = 120.0,
         http_client: Any | None = None,
         codex_originator: str = "agent-harness",
+        # Reuses OpenAILLM's lookup table; pass an int when running a model
+        # the table doesn't recognise.
+        context_window: int | None = None,
+        # Output cap reserved when computing input_token_budget. Mirrors
+        # OpenAILLM's max_completion_tokens; Codex calls this
+        # max_output_tokens.
+        max_output_tokens: int | None = 4096,
     ) -> None:
         if credential_provider is None:
             if auth_file is None:
@@ -47,8 +54,32 @@ class OpenAICodexLLM:
         self._client = http_client
         self._owns_client = http_client is None
         self._codex_originator = codex_originator
+        self._max_output_tokens = max_output_tokens
+        # Reuse OpenAI's table — Codex models share the gpt-5 / o-series
+        # lineage so the same context windows apply.
+        from harness.llm.openai import (  # noqa: PLC0415
+            _OPENAI_TOKEN_BUDGET_SAFETY,
+            _lookup_openai_context_window,
+        )
+
+        self._context_window = context_window or _lookup_openai_context_window(model)
+        self._token_budget_safety = _OPENAI_TOKEN_BUDGET_SAFETY
         self._budget: Any = None
         self.last_usage: dict | None = None
+
+    @property
+    def context_window(self) -> int:
+        return self._context_window
+
+    @property
+    def input_token_budget(self) -> int:
+        """Tokens available for the prompt after reserving output capacity.
+        OpenAI semantics — context is total (input+output)."""
+        output_reserve = self._max_output_tokens or 0
+        return max(
+            1024,
+            self._context_window - output_reserve - self._token_budget_safety,
+        )
 
     def set_budget(self, guard: Any) -> None:
         """Inject a BudgetGuard so token caps fire on subscription-auth runs.
@@ -73,8 +104,10 @@ class OpenAICodexLLM:
         there is no separate non-streaming code path. The Codex backend
         only returns SSE; we just buffer the deltas before returning.
         """
+        extra = dict(kwargs)
+        extra.pop("max_output_tokens", None)
         text_parts: list[str] = []
-        async for delta in self._iter_stream(system, messages, extra=kwargs, source=source):
+        async for delta in self._iter_stream(system, messages, extra=extra, source=source):
             text_parts.append(delta)
         text = "".join(text_parts)
         usage = self.last_usage or {}
@@ -88,16 +121,20 @@ class OpenAICodexLLM:
         messages: list[dict],
         *,
         source: str | None = None,
-        **_kwargs: Any,
+        **kwargs: Any,
     ) -> AsyncGenerator[str, None]:
         """Yield each `response.output_text.delta` token as it arrives.
 
-        ``_kwargs`` accepts OpenAI-style hints like ``response_format`` so
+        ``kwargs`` accepts OpenAI-style hints like ``response_format`` so
         the same ReAct-driving caller works against this adapter and the
         public ``OpenAILLM``; Codex's responses backend wires JSON output
-        differently and the kwarg is intentionally ignored here.
+        differently and the kwarg is intentionally ignored. Codex currently
+        rejects ``max_output_tokens``, so that public Responses API option is
+        filtered out when shared harness code passes it through.
         """
-        async for delta in self._iter_stream(system, messages, extra={}, source=source):
+        extra = dict(kwargs)
+        extra.pop("max_output_tokens", None)
+        async for delta in self._iter_stream(system, messages, extra=extra, source=source):
             yield delta
 
     async def aclose(self) -> None:
@@ -261,7 +298,7 @@ def _build_payload(
         "stream": True,
         "include": [],
     }
-    for key in ("reasoning", "max_output_tokens", "temperature", "service_tier", "text"):
+    for key in ("reasoning", "temperature", "service_tier", "text"):
         if key in extra:
             payload[key] = extra[key]
     return payload

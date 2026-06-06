@@ -58,6 +58,37 @@ _GATEWAY_COST_HEADERS = (
     "x-helicone-cost-usd",
 )
 
+# Sentinel distinguishing "caller didn't pass max_completion_tokens" from
+# "caller explicitly passed None" — the latter opts out of the cap entirely.
+_SENTINEL: Any = object()
+
+
+# Known OpenAI model context windows (input + output combined). OpenAI's
+# ``/v1/models`` endpoint does NOT expose this — we maintain a table and
+# fall back conservatively for unknowns. Users running new models should
+# pass ``context_window=N`` to the constructor explicitly.
+#
+# Keep entries ordered with the most-specific prefixes first so the prefix
+# match in ``_lookup`` resolves the right cell.
+_OPENAI_CONTEXT_WINDOWS: dict[str, int] = {
+    "gpt-5.4-mini": 128_000,
+    "gpt-5.4": 128_000,
+    "gpt-5": 256_000,
+    "gpt-4o-mini": 128_000,
+    "gpt-4o": 128_000,
+    "gpt-4-turbo": 128_000,
+    "gpt-4": 8_192,
+    "gpt-3.5-turbo": 16_385,
+    "o1-mini": 128_000,
+    "o1": 200_000,
+}
+# Conservative ceiling for unknown models. Better to under-utilise context
+# than over-promise and hit a 413 in the middle of a ReAct loop.
+_OPENAI_CONTEXT_WINDOW_FALLBACK = 8_000
+# Slack reserved at the top of the context window for tool args / variance
+# in token counting (this codebase counts chars/4; tiktoken differs ~10%).
+_OPENAI_TOKEN_BUDGET_SAFETY = 512
+
 
 class OpenAILLM:
     def __init__(
@@ -68,6 +99,17 @@ class OpenAILLM:
         base_url: str | None = None,  # set when routing through a gateway
         request_timeout_seconds: float = 60.0,
         cost_fn: Callable[[dict], float] | None = None,
+        # Generous default so long ReAct ``thought`` fields + structured
+        # JSON ``finish`` answers don't get clipped mid-stream — the
+        # default-None behaviour was relying on the model's own ceiling,
+        # which truncated JSON-mode responses inside ``BaseAgent``'s loop.
+        # Per-call override available via ``complete(..., max_completion_tokens=N)``.
+        max_completion_tokens: int | None = 4096,
+        # Explicit context window override. When None (default), the
+        # adapter consults ``_OPENAI_CONTEXT_WINDOWS`` and falls back to
+        # 8K + a warning for models it doesn't recognise. Pass an int when
+        # running a new model the table doesn't know yet.
+        context_window: int | None = None,
     ) -> None:
         try:
             from openai import AsyncOpenAI
@@ -83,10 +125,31 @@ class OpenAILLM:
         )
         self._model = model
         self._cost_fn = cost_fn
+        self._max_completion_tokens = max_completion_tokens
+        self._context_window = context_window or _lookup_openai_context_window(model)
         self._budget = None
         # Last observed usage dict. Populated after every successful call; useful
         # for streaming callers who can't read it from the return value.
         self.last_usage: dict | None = None
+
+    @property
+    def context_window(self) -> int:
+        """Total context window (input + output) for the configured model."""
+        return self._context_window
+
+    @property
+    def input_token_budget(self) -> int:
+        """Tokens available for the prompt after reserving output capacity.
+
+        Used by ``WorkingMemory`` to derive its eviction threshold —
+        compacting at e.g. 80% of this value gives the LLM real headroom
+        instead of forcing premature summarisation at a hardcoded 8K.
+        """
+        output_reserve = self._max_completion_tokens or 0
+        return max(
+            1024,  # never report a negative or near-zero budget
+            self._context_window - output_reserve - _OPENAI_TOKEN_BUDGET_SAFETY,
+        )
 
     def set_budget(self, guard: Any) -> None:
         """
@@ -114,6 +177,11 @@ class OpenAILLM:
         # supports {"type": "json_object"} to enforce strict JSON output.
         if "response_format" in kwargs:
             request["response_format"] = kwargs["response_format"]
+        # Per-call override wins over the instance default; explicit ``None``
+        # means "let the model use its own ceiling" so callers can opt out.
+        max_completion_tokens = kwargs.get("max_completion_tokens", self._max_completion_tokens)
+        if max_completion_tokens is not None:
+            request["max_completion_tokens"] = max_completion_tokens
 
         # with_raw_response gives us response headers (for gateway cost detection)
         # plus the parsed body. Both succeed identically if the gateway header
@@ -137,6 +205,7 @@ class OpenAILLM:
         *,
         source: str | None = None,
         response_format: dict | None = None,
+        max_completion_tokens: int | None = _SENTINEL,
     ) -> AsyncGenerator[str, None]:
         full_messages = _prepend_system(system, messages)
         # include_usage adds a final SSE chunk with the same usage block as
@@ -154,6 +223,16 @@ class OpenAILLM:
         # accepting prose responses and crashing in ``_parse_action_json``.
         if response_format is not None:
             request_kwargs["response_format"] = response_format
+        # Sentinel-vs-None distinction so callers can explicitly pass
+        # ``max_completion_tokens=None`` to opt out of the cap (let model
+        # use its own ceiling). The instance default fills in otherwise.
+        effective_max = (
+            self._max_completion_tokens
+            if max_completion_tokens is _SENTINEL
+            else max_completion_tokens
+        )
+        if effective_max is not None:
+            request_kwargs["max_completion_tokens"] = effective_max
         raw = await self._client.chat.completions.with_raw_response.create(**request_kwargs)
         headers = _headers_dict(raw)
         stream = raw.parse()
@@ -218,6 +297,29 @@ class OpenAILLM:
 
 
 # ── Module-level helpers ─────────────────────────────────────────────────────
+
+
+def _lookup_openai_context_window(model: str) -> int:
+    """Resolve a model id to a context window via ``_OPENAI_CONTEXT_WINDOWS``.
+
+    Exact match wins; then longest-prefix match (so ``gpt-4o-mini-2024-…``
+    resolves to ``gpt-4o-mini``'s 128K, not ``gpt-4o``'s). Unknown models
+    fall back to ``_OPENAI_CONTEXT_WINDOW_FALLBACK`` plus a warning so the
+    user notices and can pass ``context_window=N`` explicitly.
+    """
+    if model in _OPENAI_CONTEXT_WINDOWS:
+        return _OPENAI_CONTEXT_WINDOWS[model]
+    # Sort prefixes by length descending so more-specific entries win.
+    for prefix in sorted(_OPENAI_CONTEXT_WINDOWS, key=len, reverse=True):
+        if model.startswith(prefix):
+            return _OPENAI_CONTEXT_WINDOWS[prefix]
+    logger.warning(
+        "OpenAILLM: unknown model %r — defaulting context_window to %d. "
+        "Pass `context_window=N` to OpenAILLM(...) for the real value.",
+        model,
+        _OPENAI_CONTEXT_WINDOW_FALLBACK,
+    )
+    return _OPENAI_CONTEXT_WINDOW_FALLBACK
 
 
 def _prepend_system(system: str | None, messages: list[dict]) -> list[dict]:
