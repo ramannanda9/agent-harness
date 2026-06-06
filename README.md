@@ -739,9 +739,27 @@ a string to `n` characters with a trailing `…`.
 
 ## Working memory budget
 
-`AgentConfig.working_memory_max_tokens` controls per-agent eviction (default
-`8000`). Counting defaults to a `chars/4` heuristic (stable for code/JSON/text
-within ~10–20% of real BPE counts, zero deps). For exact counts plug your own
+`AgentConfig.working_memory_max_tokens` controls per-agent eviction. **Default
+is `None` — auto-derived from the LLM's context window at runtime** so the
+threshold adapts when you swap models (a 128K `gpt-5.4-mini` gets ~99K of WM
+headroom; a 200K `claude-sonnet-4-6` gets ~159K; a tiny 8K fallback gets ~6K).
+Concretely the WM compacts at `0.8 × llm.input_token_budget`, leaving 20%
+headroom for system prompt, memory context, tool schemas, and tokeniser
+variance.
+
+Each shipped adapter (`OpenAILLM`, `AnthropicLLM`, `ClaudeCodeLLM`,
+`OpenAICodexLLM`) exposes `context_window` and `input_token_budget`
+properties driven by a per-provider lookup table. For models the table
+doesn't know (new releases, fine-tunes), pass `context_window=N` explicitly:
+
+```python
+llm = OpenAILLM(model="gpt-6-preview", context_window=256_000)
+# or hard-cap WM independent of the LLM:
+AgentConfig(..., working_memory_max_tokens=16_000)
+```
+
+Counting defaults to a `chars/4` heuristic (stable for code/JSON/text within
+~10–20% of real BPE counts, zero deps). For exact counts plug your own
 counter into `WorkingMemory` directly:
 
 ```python
@@ -1515,7 +1533,7 @@ agents alongside HITL on the shell tool.
 | `max_wall_time_seconds` | (guardrail) | See `GuardrailConfig` |
 | `memory_context_enabled` | `True` | Prepend relevant long-term memory to the system prompt |
 | `confidence_from_llm` | `True` | Use the `confidence` field from the LLM response; set `False` to always return `1.0` |
-| `working_memory_max_tokens` | `8000` | Token budget for in-context working memory before rolling summarisation kicks in |
+| `working_memory_max_tokens` | `None` (auto-derive from `llm.input_token_budget × 0.8`; pass an int to hard-cap) | Token budget for in-context working memory before rolling summarisation kicks in |
 | `hitl_tools` | `[]` | Tool names that require human approval before execution |
 | `checkpoint_every` | `0` | Write a crash-resumable checkpoint every N steps; `0` disables periodic checkpoints |
 | `stream_tokens` | `False` | Emit `TOKEN` events as the LLM streams. Disabled by default — enable if you want to render partial output in real time: `AgentConfig(..., stream_tokens=True)` |

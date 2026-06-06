@@ -50,6 +50,64 @@ def _wm(
     return wm, calls
 
 
+# ── max_tokens auto-derivation ───────────────────────────────────────────────
+
+
+class _LLMWithBudget:
+    """Adapter stub that reports an ``input_token_budget`` — mirrors what
+    the real ``OpenAILLM`` / ``AnthropicLLM`` expose for WM to read."""
+
+    def __init__(self, budget: int) -> None:
+        self.input_token_budget = budget
+
+    async def complete(self, system: Any, messages: Any, **_: Any) -> dict:
+        return {"text": "ok"}
+
+
+def test_max_tokens_derives_from_llm_input_budget():
+    """Default compact_at_fraction=0.8 → 80K out of 100K budget."""
+    wm = WorkingMemory(llm=_LLMWithBudget(100_000))
+    assert wm.max_tokens == 80_000
+
+
+def test_max_tokens_compact_at_fraction_is_configurable():
+    wm = WorkingMemory(llm=_LLMWithBudget(100_000), compact_at_fraction=0.5)
+    assert wm.max_tokens == 50_000
+
+
+def test_explicit_max_tokens_overrides_derivation():
+    wm = WorkingMemory(llm=_LLMWithBudget(100_000), max_tokens=4_000)
+    assert wm.max_tokens == 4_000
+
+
+def test_max_tokens_falls_back_to_32k_when_llm_lacks_budget():
+    """Test stubs and custom adapters without ``input_token_budget`` get a
+    conservative 32K default — bigger than the historical 8000 since
+    modern models have plenty of context — but not catastrophic if the
+    underlying model is actually smaller."""
+
+    class _NoBudgetLLM:
+        async def complete(self, system, messages, **_) -> dict:
+            return {"text": "ok"}
+
+    wm = WorkingMemory(llm=_NoBudgetLLM())
+    assert wm.max_tokens == 32_000
+
+
+def test_max_tokens_falls_back_to_32k_on_invalid_budget():
+    """A garbage value on ``input_token_budget`` shouldn't translate into a
+    zero or negative WM cap — fall back to 32K so the agent still runs."""
+
+    class _BadBudgetLLM:
+        input_token_budget = 0  # nonsensical
+
+        async def complete(self, system, messages, **_) -> dict:
+            return {"text": "ok"}
+
+    wm = WorkingMemory(llm=_BadBudgetLLM())
+    assert wm.max_tokens == 32_000
+
+
 # ── Role invariant ─────────────────────────────────────────────────────────────
 
 

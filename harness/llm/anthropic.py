@@ -54,6 +54,42 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+# Anthropic's ``/v1/models`` endpoint, like OpenAI's, doesn't expose
+# per-model context limits. Maintain a small lookup; users running new
+# models pass ``context_window=N`` explicitly.
+#
+# Anthropic frames "context window" as input-only — output has its own
+# ``max_tokens`` ceiling, billed separately. So ``input_token_budget``
+# below is just the window minus a safety slack.
+_ANTHROPIC_CONTEXT_WINDOWS: dict[str, int] = {
+    "claude-sonnet-4-6": 200_000,
+    "claude-sonnet-4": 200_000,
+    "claude-opus-4": 200_000,
+    "claude-haiku-4": 200_000,
+    "claude-3-7-sonnet": 200_000,
+    "claude-3-5-sonnet": 200_000,
+    "claude-3-5-haiku": 200_000,
+    "claude-3-opus": 200_000,
+}
+_ANTHROPIC_CONTEXT_WINDOW_FALLBACK = 8_000
+_ANTHROPIC_TOKEN_BUDGET_SAFETY = 512
+
+
+def _lookup_anthropic_context_window(model: str) -> int:
+    if model in _ANTHROPIC_CONTEXT_WINDOWS:
+        return _ANTHROPIC_CONTEXT_WINDOWS[model]
+    for prefix in sorted(_ANTHROPIC_CONTEXT_WINDOWS, key=len, reverse=True):
+        if model.startswith(prefix):
+            return _ANTHROPIC_CONTEXT_WINDOWS[prefix]
+    logger.warning(
+        "AnthropicLLM: unknown model %r — defaulting context_window to %d. "
+        "Pass `context_window=N` to AnthropicLLM(...) for the real value.",
+        model,
+        _ANTHROPIC_CONTEXT_WINDOW_FALLBACK,
+    )
+    return _ANTHROPIC_CONTEXT_WINDOW_FALLBACK
+
+
 class AnthropicLLM:
     def __init__(
         self,
@@ -67,6 +103,8 @@ class AnthropicLLM:
         max_tokens: int = 4096,
         cost_fn: Callable[[dict], float] | None = None,
         prompt_caching: bool = True,
+        # Explicit context window override; see ``_lookup_anthropic_context_window``.
+        context_window: int | None = None,
     ) -> None:
         try:
             import anthropic
@@ -81,9 +119,22 @@ class AnthropicLLM:
         self._max_tokens = max_tokens
         self._cost_fn = cost_fn
         self._prompt_caching = prompt_caching
+        self._context_window = context_window or _lookup_anthropic_context_window(model)
         self._budget: Any = None
         # Populated after every successful call; streaming callers read it here.
         self.last_usage: dict | None = None
+
+    @property
+    def context_window(self) -> int:
+        """Input-token context window for the configured model."""
+        return self._context_window
+
+    @property
+    def input_token_budget(self) -> int:
+        """Tokens available for the prompt. Anthropic frames context as
+        input-only; ``max_tokens`` for output is enforced separately, so
+        no output-reserve subtraction is needed here."""
+        return max(1024, self._context_window - _ANTHROPIC_TOKEN_BUDGET_SAFETY)
 
     def set_budget(self, guard: Any) -> None:
         """Inject a BudgetGuard; AgentRuntime calls this at the start of each run."""

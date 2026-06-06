@@ -30,6 +30,13 @@ class OpenAICodexLLM:
         request_timeout_seconds: float = 120.0,
         http_client: Any | None = None,
         codex_originator: str = "agent-harness",
+        # Reuses OpenAILLM's lookup table; pass an int when running a model
+        # the table doesn't recognise.
+        context_window: int | None = None,
+        # Output cap reserved when computing input_token_budget. Mirrors
+        # OpenAILLM's max_completion_tokens; Codex calls this
+        # max_output_tokens.
+        max_output_tokens: int | None = 4096,
     ) -> None:
         if credential_provider is None:
             if auth_file is None:
@@ -47,8 +54,32 @@ class OpenAICodexLLM:
         self._client = http_client
         self._owns_client = http_client is None
         self._codex_originator = codex_originator
+        self._max_output_tokens = max_output_tokens
+        # Reuse OpenAI's table — Codex models share the gpt-5 / o-series
+        # lineage so the same context windows apply.
+        from harness.llm.openai import (  # noqa: PLC0415
+            _OPENAI_TOKEN_BUDGET_SAFETY,
+            _lookup_openai_context_window,
+        )
+
+        self._context_window = context_window or _lookup_openai_context_window(model)
+        self._token_budget_safety = _OPENAI_TOKEN_BUDGET_SAFETY
         self._budget: Any = None
         self.last_usage: dict | None = None
+
+    @property
+    def context_window(self) -> int:
+        return self._context_window
+
+    @property
+    def input_token_budget(self) -> int:
+        """Tokens available for the prompt after reserving output capacity.
+        OpenAI semantics — context is total (input+output)."""
+        output_reserve = self._max_output_tokens or 0
+        return max(
+            1024,
+            self._context_window - output_reserve - self._token_budget_safety,
+        )
 
     def set_budget(self, guard: Any) -> None:
         """Inject a BudgetGuard so token caps fire on subscription-auth runs.

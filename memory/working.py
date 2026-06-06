@@ -180,12 +180,26 @@ class WorkingMemory:
     def __init__(
         self,
         llm: LLMClient,
-        max_tokens: int = 8000,
+        max_tokens: int | None = None,
         summarize_ratio: float = 0.5,  # summarize oldest 50% of eligible when evicting
         recency_window: int = 4,  # protect last N non-pinned non-summary messages
         token_counter: Callable[[str], int] | None = None,
+        compact_at_fraction: float = 0.8,
     ) -> None:
         self._llm = llm
+        # Auto-derive from the LLM's input budget when the caller didn't
+        # set an explicit cap — 80% of available headroom leaves room for
+        # system prompt + tool schemas + tokeniser variance, and adapts
+        # automatically when the user swaps models. Falls back to 32K for
+        # LLMs that don't expose ``input_token_budget`` (custom adapters,
+        # test stubs).
+        if max_tokens is None:
+            budget = getattr(llm, "input_token_budget", None)
+            max_tokens = (
+                int(budget * compact_at_fraction)
+                if isinstance(budget, int) and budget > 0
+                else 32_000
+            )
         self.max_tokens = max_tokens
         self.summarize_ratio = summarize_ratio
         self.recency_window = max(0, recency_window)

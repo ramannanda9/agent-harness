@@ -74,7 +74,12 @@ class AgentConfig:
     memory_context_enabled: bool = True
     confidence_from_llm: bool = True  # if False, confidence=1.0 on success
     stream_tokens: bool = False  # if True, TOKEN events are emitted as the LLM streams
-    working_memory_max_tokens: int = 8000  # WorkingMemory eviction threshold; tune per agent
+    # ``None`` → derive from ``llm.input_token_budget * 0.8`` at runtime
+    # (each adapter reports a per-model context window; OpenAILLM /
+    # AnthropicLLM / etc. expose ``input_token_budget``). Pass an explicit
+    # int to hard-cap the WorkingMemory eviction threshold — useful for
+    # cost-sensitive workloads or when feeding very small models.
+    working_memory_max_tokens: int | None = None
     hitl_tools: list[str] = None  # tools requiring human approval; None = no HITL
     checkpoint_every: int = 0  # write a resumable checkpoint every N steps; 0 = disabled
     # Cache tool results within a single run, keyed by (tool_name, args).

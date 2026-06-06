@@ -103,7 +103,11 @@ def _build(monkeypatch, **kwargs):
             self.chat = types.SimpleNamespace(completions=completions)
 
     monkeypatch.setattr("openai.AsyncOpenAI", _FakeClient)
-    return OpenAILLM(model="gpt-test", **kwargs), completions.with_raw_response
+    # ``model`` defaults to ``gpt-test`` for the cost / request-shape
+    # tests that don't care about model identity; context-window tests
+    # pass their own model explicitly.
+    kwargs.setdefault("model", "gpt-test")
+    return OpenAILLM(**kwargs), completions.with_raw_response
 
 
 # ── Pure helpers ─────────────────────────────────────────────────────────────
@@ -334,3 +338,48 @@ async def test_stream_complete_omits_response_format_when_not_requested(monkeypa
     raw.next_stream_chunks = [_fake_chunk(usage=_FakeUsage(1, 1))]
     [t async for t in llm.stream_complete(system=None, messages=[])]
     assert "response_format" not in raw.calls[0]
+
+
+# ── context_window / input_token_budget ──────────────────────────────────────
+
+
+def test_context_window_resolves_via_lookup_table(monkeypatch):
+    llm, _ = _build(monkeypatch, model="gpt-4o-mini")
+    assert llm.context_window == 128_000
+
+
+def test_context_window_prefix_match_beats_short_prefix(monkeypatch):
+    """``gpt-4o-mini-2024-…`` should map to gpt-4o-mini's 128K, not
+    gpt-4o's 128K via a shorter prefix or gpt-4's 8K. Longest prefix
+    wins."""
+    llm, _ = _build(monkeypatch, model="gpt-4o-mini-2024-07-18")
+    assert llm.context_window == 128_000
+
+
+def test_context_window_falls_back_with_warning_for_unknown(monkeypatch, caplog):
+    import logging
+
+    caplog.set_level(logging.WARNING, logger="harness.llm.openai")
+    llm, _ = _build(monkeypatch, model="gpt-7-experimental")
+    assert llm.context_window == 8_000
+    assert any("unknown model" in rec.getMessage().lower() for rec in caplog.records)
+
+
+def test_context_window_explicit_override_wins(monkeypatch):
+    llm, _ = _build(monkeypatch, model="gpt-7-experimental", context_window=256_000)
+    assert llm.context_window == 256_000
+
+
+def test_input_token_budget_subtracts_output_reserve_and_safety(monkeypatch):
+    """gpt-5.4-mini (128K) minus 4096 output minus 512 safety = 123_392."""
+    llm, _ = _build(monkeypatch, model="gpt-5.4-mini")
+    assert llm.input_token_budget == 128_000 - 4096 - 512
+
+
+def test_input_token_budget_floor_protects_against_overreserve(monkeypatch):
+    """A misconfigured small model + huge max_completion_tokens shouldn't
+    return a negative or near-zero budget; floor at 1024."""
+    llm, _ = _build(monkeypatch, model="gpt-7-experimental", max_completion_tokens=100_000)
+    # context_window=8000 fallback, output reserve 100K — without the
+    # floor this would be negative.
+    assert llm.input_token_budget == 1024
