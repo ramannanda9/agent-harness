@@ -124,10 +124,10 @@ async def test_stream_complete_yields_deltas_incrementally():
     assert llm.last_usage["total_tokens"] == 7
     assert client.calls[0]["url"] == "https://chatgpt.com/backend-api/codex/responses"
     assert client.calls[0]["headers"]["Authorization"] == "Bearer stale"
-    assert client.calls[0]["json"]["max_output_tokens"] == 4096
+    assert "max_output_tokens" not in client.calls[0]["json"]
 
 
-async def test_stream_complete_forwards_max_output_tokens_override():
+async def test_stream_complete_filters_unsupported_max_output_tokens():
     body = (
         "event: response.output_text.delta\n"
         'data: {"delta":"ok"}\n\n'
@@ -144,7 +144,7 @@ async def test_stream_complete_forwards_max_output_tokens_override():
 
     [delta async for delta in llm.stream_complete(system=None, messages=[], max_output_tokens=123)]
 
-    assert client.calls[0]["json"]["max_output_tokens"] == 123
+    assert "max_output_tokens" not in client.calls[0]["json"]
 
 
 async def test_stream_complete_refreshes_creds_on_401():
@@ -202,10 +202,10 @@ async def test_complete_collects_streamed_deltas():
     assert client.calls[0]["headers"]["Authorization"] == "Bearer stale"
     assert client.calls[1]["headers"]["Authorization"] == "Bearer fresh"
     assert client.calls[1]["headers"]["chatgpt-account-id"] == "acct_123"
-    assert client.calls[1]["json"]["max_output_tokens"] == 4096
+    assert "max_output_tokens" not in client.calls[1]["json"]
 
 
-async def test_complete_forwards_max_output_tokens_override():
+async def test_complete_filters_unsupported_max_output_tokens():
     body = (
         "event: response.output_text.delta\n"
         'data: {"delta":"ok"}\n\n'
@@ -222,7 +222,7 @@ async def test_complete_forwards_max_output_tokens_override():
 
     await llm.complete(system=None, messages=[], max_output_tokens=234)
 
-    assert client.calls[0]["json"]["max_output_tokens"] == 234
+    assert "max_output_tokens" not in client.calls[0]["json"]
 
 
 async def test_complete_falls_back_to_final_payload_text():
