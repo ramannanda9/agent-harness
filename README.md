@@ -647,15 +647,31 @@ Each chat turn gets a fresh `WorkingMemory`. Continuity comes from the
 SQLite session state (rolling summary + recent messages) and normal
 `MemoryManager` recall, not from carrying old ReAct scratchpads forever.
 
-**Prefix-cache aware.** The accumulated session transcript is sent to the
-coordinator as real `user`/`assistant` role messages — not folded into one
-inline-rendered text blob — so the prompt prefix is byte-identical between
-turns until the next compaction. That matters: OpenAI's automatic prefix
-cache and Anthropic's `cache_control` markers both match on longest-
-identical prefix, and grow as the conversation grows. Compaction replaces
-the *oldest* slice with a fresh summary; the recent `recent_messages` slice
-stays verbatim across the compaction boundary so the cache also survives
-that event for those messages.
+**Prefix-cache aware.** The full prompt stays byte-identical across plain
+chat turns within a compaction window. Three things make that work:
+
+1. The accumulated session transcript is sent to the coordinator as real
+   `user`/`assistant` role messages — not folded into one inline-rendered
+   text blob. Each turn extends the message list by exactly the previous
+   turn's user+assistant pair plus the new user task.
+2. Memory context (`MemoryManager.build_context` result) lives in a
+   pinned user-message prior, **not in the system prompt**. The system
+   prompt is now pure agent identity + tool list + ReAct format — purely
+   static. Memory context is fetched once per session, cached on the
+   `PersistentAgent`, and refreshed only at compaction or high-signal
+   reconcile (so it doesn't shift turn-to-turn just because the goal
+   changed).
+3. Long-term memory writes are **deferred to compaction**, not fired
+   periodically. The session transcript is the per-turn journal — facts
+   land in long-term memory only when we're already breaking cache (at
+   compaction or high-signal events like tool runs / "remember" terms).
+   The legacy `reconcile_every_turns` knob is a no-op.
+
+OpenAI's automatic prefix cache and Anthropic's `cache_control` markers
+both match on longest-identical prefix. Together these three changes let
+a typical session pay one cold compaction every ~12 turns plus ~K turns
+of warm-prefix hits in between, instead of paying full price every
+turn.
 
 The demo stores local state under `~/.agent-harness` by default:
 

@@ -337,6 +337,40 @@ async def test_message_prefix_is_stable_across_turns_for_caching():
 
 
 @pytest.mark.asyncio
+async def test_system_prompt_stays_byte_identical_within_compaction_window():
+    """The system prompt must be byte-identical across plain chat turns
+    inside a single compaction window. Memory context used to be embedded
+    in the system prompt via ``MemoryManager.build_context`` on every
+    turn — which made the system block content-dependent on the goal and
+    invalidated prefix caching from position 0. The fix moved memory
+    context to a pinned user-message prior, cached per-session and only
+    refreshed at compaction or high-signal reconcile."""
+    llm = _ChatLLM()
+    memory = _SpyMemory(llm)
+    app = PersistentAgent(
+        coordinator=_agent(llm=llm, memory=memory),
+        session_store=InMemorySessionStore(),
+        memory=memory,
+        llm=llm,
+        config=PersistentAgentConfig(reconcile_every_turns=99, compact_every_turns=99),
+    )
+
+    [event async for event in app.chat("hello there", session_id="sysstable")]
+    [event async for event in app.chat("how's the weather", session_id="sysstable")]
+    [event async for event in app.chat("what about Paris", session_id="sysstable")]
+
+    agent_calls = [c for c in llm.calls if c["kwargs"].get("source") != "reconciler"]
+    system_messages = [
+        next(m["content"] for m in c["messages"] if m["role"] == "system") for c in agent_calls
+    ]
+    assert len(system_messages) >= 3
+    assert system_messages[0] == system_messages[1] == system_messages[2], (
+        "system prompt must not vary between plain chat turns — varying "
+        "system prompt invalidates the prefix cache from position 0"
+    )
+
+
+@pytest.mark.asyncio
 async def test_persistent_agent_reconciles_when_tools_run():
     llm = _ToolLLM()
     memory = _SpyMemory(llm)

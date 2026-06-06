@@ -256,6 +256,7 @@ class BaseAgent:
         *,
         prior_messages: list[tuple[str, str | list]] | None = None,
         pinned_priors: int = 0,
+        precomputed_memory_context: Any = None,
     ) -> AsyncGenerator[BusEvent, None]:
         """Run the ReAct loop on ``task``, optionally seeded with prior
         conversation history.
@@ -286,7 +287,9 @@ class BaseAgent:
             max_tokens=self.config.working_memory_max_tokens,
         )
 
-        system = await self._build_system_prompt(task)
+        system = await self._build_system_prompt(
+            task, precomputed_memory_context=precomputed_memory_context
+        )
         await self._working_memory.append("system", system, pinned=True)
         if prior_messages:
             for idx, (role, content) in enumerate(prior_messages):
@@ -396,10 +399,28 @@ class BaseAgent:
 
     # ── System Prompt ─────────────────────────────────────────────────────────
 
-    async def _build_system_prompt(self, task: str) -> str:
+    async def _build_system_prompt(
+        self,
+        task: str,
+        *,
+        precomputed_memory_context: Any = None,
+    ) -> str:
+        """Build the system prompt.
+
+        When ``precomputed_memory_context`` is the sentinel ``"_skip_"``
+        (passed by ``PersistentAgent``), the live ``build_context`` lookup
+        is skipped entirely — memory context is placed in user-message
+        priors instead so the system prompt stays byte-stable across
+        turns. Otherwise (the default for one-shot dispatch via
+        AgentRuntime / Orchestrator), memory is fetched + rendered inline
+        as before.
+        """
         parts = [self.config.system_prompt]
 
-        if self.config.memory_context_enabled:
+        memory_in_system_prompt = (
+            self.config.memory_context_enabled and precomputed_memory_context != "_skip_"
+        )
+        if memory_in_system_prompt:
             mem_context = await self._memory.build_context(
                 goal=task,
                 agent_id=self.config.agent_id,

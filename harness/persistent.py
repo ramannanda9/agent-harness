@@ -303,6 +303,12 @@ class PersistentAgentConfig:
     # prefix cache (and Anthropic's ``cache_control``) hit on the entire
     # historical prefix.
     recent_messages: int = 8
+    # NO-OP — kept for back-compat with existing user configs. The previous
+    # policy fired a reconciler LLM call every N turns, but mid-window
+    # writes invalidated the next turn's system prompt and broke the
+    # prefix cache. Reconciliation now runs on high-signal events
+    # (tool/sub-agent runs, errors, "remember" terms) and at compaction
+    # — never periodically. Setting this field has no effect.
     reconcile_every_turns: int = 6
     compact_every_turns: int = 12
     compact_message_threshold: int = 24
@@ -336,6 +342,15 @@ class PersistentAgent:
         self._llm = llm or coordinator._llm
         self._guard_factory = guard_factory
         self._config = config or PersistentAgentConfig()
+        # Per-session memory-context cache. Memory retrieval used to fire
+        # on every turn (inside ``_build_system_prompt``), which made the
+        # system prompt content-dependent on whatever ``build_context``
+        # returned for the current goal — defeating prefix caching from
+        # position 0. We now retrieve once per session, hold the rendered
+        # string here, and evict only at compaction (when the cache is
+        # already breaking anyway). Within a compaction window, memory
+        # context is byte-identical across turns.
+        self._session_memory_context: dict[str, str] = {}
 
     async def chat(
         self,
@@ -347,7 +362,10 @@ class PersistentAgent:
         """Run one user turn with fresh working memory and durable session context."""
         state = await self._session_store.load(session_id)
         run_id = run_id or str(uuid.uuid4())
-        prior_messages, pinned_priors = self._build_prior_messages(state)
+        memory_context_text = await self._get_session_memory_context(session_id, message=message)
+        prior_messages, pinned_priors = self._build_prior_messages(
+            state, memory_context_text=memory_context_text
+        )
         if self._guard_factory is not None:
             self._assign_guard(self._guard_factory())
 
@@ -363,6 +381,11 @@ class PersistentAgent:
             run_id=run_id,
             prior_messages=prior_messages,
             pinned_priors=pinned_priors,
+            # Skip the live ``build_context`` inside ``_build_system_prompt``
+            # — memory is in a pinned prior instead, cached per session and
+            # refreshed only at compaction. Keeps the system prompt
+            # byte-identical across turns so the prefix cache holds.
+            precomputed_memory_context="_skip_",
         ):
             trace.append(_event_to_trace(event))
             if event.type == EventType.ACTION:
@@ -496,6 +519,12 @@ class PersistentAgent:
                 trace=trace,
             )
             state = await self._session_store.mark_reconciled(session_id, state.turn_count)
+            # We just wrote new facts → next turn's memory context might
+            # differ. Drop the cache so the refresh on turn N+1 picks them
+            # up. This turn already paid a cache miss (tool / signal
+            # caused the reconcile); the immediate next turn pays at
+            # most one more if the new facts actually changed retrieval.
+            self._evict_session_memory_context(session_id)
 
         if self._should_compact(state):
             # Compact only the OLDER portion — everything before the last
@@ -514,9 +543,72 @@ class PersistentAgent:
                 state = await self._session_store.update_summary(session_id, summary)
                 await self._session_store.trim_messages(session_id, keep)
                 await self._session_store.mark_compacted(session_id, state.turn_count)
+                # Compaction is the natural moment to reconcile the older
+                # transcript window into long-term memory: the reconciler
+                # LLM call colocates with the summary write, both touching
+                # the same cache-miss boundary so we don't pay twice for
+                # cache invalidation. Also evict the cached memory context
+                # so the next turn's first build_context call picks up any
+                # facts the reconciler added/updated.
+                if not self._should_reconcile(
+                    message=message,
+                    state=state,
+                    tools_used=tools_used,
+                    subagents_used=subagents_used,
+                    errors=errors,
+                ):
+                    # High-signal events already triggered reconcile above;
+                    # don't repeat. Only fire here when this turn didn't
+                    # already write.
+                    try:
+                        await self._memory.write_run_end(
+                            goal=message,
+                            agent_results=[
+                                final_result or {"error": errors[-1] if errors else "no result"}
+                            ],
+                            trace=trace,
+                        )
+                    except Exception:  # noqa: BLE001 — best-effort at compaction
+                        pass
+                self._evict_session_memory_context(session_id)
+
+    async def _get_session_memory_context(self, session_id: str, *, message: str) -> str:
+        """Return the per-session memory-context blob (cached).
+
+        First call for the session fetches via ``MemoryManager.build_context``,
+        rendering whatever semantic + episodic context is relevant to the
+        first goal. The result is cached on the PersistentAgent instance
+        keyed by ``session_id`` and reused for every subsequent turn in
+        the same compaction window — see ``_evict_session_memory_context``
+        for the eviction path (compaction).
+        """
+        cached = self._session_memory_context.get(session_id)
+        if cached is not None:
+            return cached
+        try:
+            mem_context = await self._memory.build_context(
+                goal=message,
+                agent_id=self._coordinator.config.agent_id,
+            )
+        except Exception:  # noqa: BLE001 — memory backend hiccup shouldn't crash chat
+            mem_context = None
+        rendered = ""
+        if mem_context is not None and not mem_context.is_empty():
+            rendered = mem_context.render()
+        self._session_memory_context[session_id] = rendered
+        return rendered
+
+    def _evict_session_memory_context(self, session_id: str) -> None:
+        """Drop the cached memory context for ``session_id`` so the next
+        turn re-fetches. Called at compaction, where the cache is already
+        breaking from the summary refresh anyway."""
+        self._session_memory_context.pop(session_id, None)
 
     def _build_prior_messages(
-        self, state: SessionState
+        self,
+        state: SessionState,
+        *,
+        memory_context_text: str = "",
     ) -> tuple[list[tuple[str, str | list]], int]:
         """Return ``(prior_messages, pinned_priors)`` to seed into the
         coordinator's WorkingMemory.
@@ -540,10 +632,22 @@ class PersistentAgent:
         """
         prior_messages: list[tuple[str, str | list]] = []
         pinned_priors = 0
+        # Memory context goes FIRST so it's the most-cached prefix block.
+        # It was previously embedded in the system prompt, but
+        # ``MemoryManager.build_context`` is goal-dependent and shifts
+        # between turns — putting it in the system prompt broke the cache
+        # at position 0. Moved here and cached per-session in
+        # ``self._session_memory_context``.
+        if memory_context_text:
+            prior_messages.append(
+                ("user", f"[Relevant memory for this session]\n{memory_context_text}")
+            )
+            prior_messages.append(("assistant", "Noted."))
+            pinned_priors += 2
         if state.summary:
             prior_messages.append(("user", f"[Earlier conversation, summarised]\n{state.summary}"))
             prior_messages.append(("assistant", "Acknowledged."))
-            pinned_priors = 2
+            pinned_priors += 2
         for msg in state.messages:
             prior_messages.append((msg.role, msg.content))
         return prior_messages, pinned_priors
@@ -557,12 +661,25 @@ class PersistentAgent:
         subagents_used: set[str],
         errors: list[str],
     ) -> bool:
+        """High-signal-only reconciliation policy.
+
+        The previous policy also fired periodically (every
+        ``reconcile_every_turns`` turns), which wrote to long-term memory
+        mid-compaction-window and invalidated the next turn's system
+        prompt — breaking the prefix cache between every reconcile and the
+        following turn. The session transcript already journals every
+        turn to SQLite, so periodic mid-window writes added cost without
+        information.
+
+        We now reconcile only on high-signal events (tool/sub-agent runs,
+        errors, user "remember" terms). Everything else defers to
+        compaction, where reconciliation runs alongside the summary LLM
+        call — both write boundaries collapse into one cache-miss event.
+        """
         if tools_used or subagents_used or errors:
             return True
         lower = message.lower()
-        if any(term in lower for term in self._config.durable_signal_terms):
-            return True
-        return state.turn_count - state.last_reconcile_turn >= self._config.reconcile_every_turns
+        return any(term in lower for term in self._config.durable_signal_terms)
 
     def _should_compact(self, state: SessionState) -> bool:
         if len(state.messages) > self._config.compact_message_threshold:
