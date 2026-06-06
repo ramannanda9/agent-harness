@@ -646,6 +646,17 @@ sub-agents, and MCP tools. The demo exposes this with
 Each chat turn gets a fresh `WorkingMemory`. Continuity comes from the
 SQLite session state (rolling summary + recent messages) and normal
 `MemoryManager` recall, not from carrying old ReAct scratchpads forever.
+
+**Prefix-cache aware.** The accumulated session transcript is sent to the
+coordinator as real `user`/`assistant` role messages — not folded into one
+inline-rendered text blob — so the prompt prefix is byte-identical between
+turns until the next compaction. That matters: OpenAI's automatic prefix
+cache and Anthropic's `cache_control` markers both match on longest-
+identical prefix, and grow as the conversation grows. Compaction replaces
+the *oldest* slice with a fresh summary; the recent `recent_messages` slice
+stays verbatim across the compaction boundary so the cache also survives
+that event for those messages.
+
 The demo stores local state under `~/.agent-harness` by default:
 
 - `sessions.sqlite` for chat/session state

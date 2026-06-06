@@ -295,6 +295,13 @@ class SQLiteSessionStore:
 
 @dataclass
 class PersistentAgentConfig:
+    # Number of most-recent transcript messages to keep VERBATIM through a
+    # compaction event. The transcript itself accumulates across turns and
+    # is sent to the coordinator as real user/assistant role messages —
+    # not folded into one inline-rendered user-message blob — which keeps
+    # the prefix byte-identical between turns and lets OpenAI's automatic
+    # prefix cache (and Anthropic's ``cache_control``) hit on the entire
+    # historical prefix.
     recent_messages: int = 8
     reconcile_every_turns: int = 6
     compact_every_turns: int = 12
@@ -340,7 +347,7 @@ class PersistentAgent:
         """Run one user turn with fresh working memory and durable session context."""
         state = await self._session_store.load(session_id)
         run_id = run_id or str(uuid.uuid4())
-        task = self._build_turn_task(message, state)
+        prior_messages, pinned_priors = self._build_prior_messages(state)
         if self._guard_factory is not None:
             self._assign_guard(self._guard_factory())
 
@@ -351,7 +358,12 @@ class PersistentAgent:
         errors: list[str] = []
         finalized = False
 
-        async for event in self._coordinator.run_stream(task, run_id=run_id):
+        async for event in self._coordinator.run_stream(
+            message,
+            run_id=run_id,
+            prior_messages=prior_messages,
+            pinned_priors=pinned_priors,
+        ):
             trace.append(_event_to_trace(event))
             if event.type == EventType.ACTION:
                 tool = event.payload.get("tool")
@@ -486,23 +498,55 @@ class PersistentAgent:
             state = await self._session_store.mark_reconciled(session_id, state.turn_count)
 
         if self._should_compact(state):
-            summary = await self._summarize_session(state)
-            state = await self._session_store.update_summary(session_id, summary)
-            await self._session_store.trim_messages(session_id, self._config.recent_messages)
-            await self._session_store.mark_compacted(session_id, state.turn_count)
+            # Compact only the OLDER portion — everything before the last
+            # ``recent_messages`` stays verbatim — so the still-recent
+            # turns remain byte-identical across the compaction boundary.
+            # This keeps OpenAI's prefix cache warm through compaction
+            # events (only the leading summary block changes; the verbatim
+            # tail does not).
+            keep = self._config.recent_messages
+            if keep <= 0:
+                to_compact = list(state.messages)
+            else:
+                to_compact = state.messages[:-keep] if len(state.messages) > keep else []
+            if to_compact:
+                summary = await self._summarize_session(state, messages_to_compact=to_compact)
+                state = await self._session_store.update_summary(session_id, summary)
+                await self._session_store.trim_messages(session_id, keep)
+                await self._session_store.mark_compacted(session_id, state.turn_count)
 
-    def _build_turn_task(self, message: str, state: SessionState) -> str:
-        parts: list[str] = []
+    def _build_prior_messages(
+        self, state: SessionState
+    ) -> tuple[list[tuple[str, str | list]], int]:
+        """Return ``(prior_messages, pinned_priors)`` to seed into the
+        coordinator's WorkingMemory.
+
+        Cache-friendly shape:
+          - The rolling summary (if any) lives as a stable user/assistant
+            priming pair at the START of priors. Pinned, so WM eviction
+            within a turn can't drop it. Stays byte-identical between
+            turns until the next compaction → caches cleanly.
+          - All accumulated session messages follow as their own
+            user/assistant entries (NOT collapsed into one rendered text
+            blob). Between turns N and N+1, this prefix grows by exactly
+            two messages (the previous turn's user+assistant pair).
+            Everything older stays byte-identical → OpenAI's automatic
+            prefix cache and Anthropic's ``cache_control`` both hit.
+
+        Without this shape — i.e. the older "render summary+recent+
+        current into one user message" approach — the sliding-window
+        slice rotates every turn and the cache breaks immediately after
+        the system prompt.
+        """
+        prior_messages: list[tuple[str, str | list]] = []
+        pinned_priors = 0
         if state.summary:
-            parts.append(f"Session summary:\n{state.summary}")
-        recent = (
-            state.messages[-self._config.recent_messages :] if self._config.recent_messages else []
-        )
-        if recent:
-            rendered = "\n".join(f"{m.role.title()}: {m.content}" for m in recent)
-            parts.append(f"Recent conversation:\n{rendered}")
-        parts.append(f"Current user turn:\n{message}")
-        return "\n\n".join(parts)
+            prior_messages.append(("user", f"[Earlier conversation, summarised]\n{state.summary}"))
+            prior_messages.append(("assistant", "Acknowledged."))
+            pinned_priors = 2
+        for msg in state.messages:
+            prior_messages.append((msg.role, msg.content))
+        return prior_messages, pinned_priors
 
     def _should_reconcile(
         self,
@@ -525,8 +569,19 @@ class PersistentAgent:
             return True
         return state.turn_count - state.last_compact_turn >= self._config.compact_every_turns
 
-    async def _summarize_session(self, state: SessionState) -> str:
-        rendered = "\n".join(f"{m.role}: {m.content}" for m in state.messages)
+    async def _summarize_session(
+        self,
+        state: SessionState,
+        *,
+        messages_to_compact: list[SessionMessage] | None = None,
+    ) -> str:
+        """Summarise the older portion of the session, folding any prior
+        summary in. ``messages_to_compact`` defaults to the full state
+        transcript (legacy path); the new compaction flow passes only the
+        messages being trimmed so the still-verbatim recent tail stays out
+        of the summary."""
+        targets = messages_to_compact if messages_to_compact is not None else list(state.messages)
+        rendered = "\n".join(f"{m.role}: {m.content}" for m in targets)
         response = await self._llm.complete(
             system="Summarize a persistent agent chat session. Return plain text only.",
             messages=[
@@ -535,10 +590,12 @@ class PersistentAgent:
                     "content": (
                         "Existing summary:\n"
                         f"{state.summary or '(none)'}\n\n"
-                        "Messages:\n"
+                        "Messages to fold in:\n"
                         f"{rendered}\n\n"
                         "Write a compact summary preserving user preferences, decisions, "
-                        "open threads, and concrete references needed for future turns."
+                        "open threads, and concrete references needed for future turns. "
+                        "Treat any 'Existing summary' as the canonical past — merge new "
+                        "evidence into it rather than starting over."
                     ),
                 }
             ],

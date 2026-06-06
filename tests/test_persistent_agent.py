@@ -259,6 +259,10 @@ async def test_persistent_agent_refreshes_guard_per_turn_for_coordinator_and_sub
 
 @pytest.mark.asyncio
 async def test_persistent_agent_injects_recent_session_into_fresh_turn():
+    """Turn N+1's LLM call must include turn N's user/assistant pair as
+    real role messages (not inline-rendered text). Cache-friendly shape:
+    the prefix between turns is byte-identical except for the new pair
+    and the new current task."""
     llm = _ChatLLM()
     memory = _SpyMemory(llm)
     store = InMemorySessionStore()
@@ -274,12 +278,62 @@ async def test_persistent_agent_injects_recent_session_into_fresh_turn():
     [event async for event in app.chat("Can you do x?", session_id="s")]
 
     agent_calls = [c for c in llm.calls if c["kwargs"].get("source") != "reconciler"]
-    second_turn_user = next(
-        m["content"] for m in agent_calls[-1]["messages"] if m["role"] == "user"
+    second_call_messages = agent_calls[-1]["messages"]
+    user_contents = [m["content"] for m in second_call_messages if m["role"] == "user"]
+    assistant_contents = [m["content"] for m in second_call_messages if m["role"] == "assistant"]
+    # Turn 1's user message survives verbatim as its OWN user message —
+    # not folded into a "Recent conversation:" blob inside the turn-2 user
+    # message. That's exactly the difference that lets prefix caching
+    # hit.
+    assert "I like the above" in user_contents
+    # Turn 1's assistant response is also a separate role message.
+    assert assistant_contents, "expected turn 1's assistant reply to appear as its own message"
+    # The current turn's message is the LAST user entry, not a wrapped
+    # "Current user turn:" label.
+    assert user_contents[-1] == "Can you do x?", (
+        f"expected last user content to be the current turn; got {user_contents[-1]!r}"
     )
-    assert "Recent conversation:" in second_turn_user
-    assert "I like the above" in second_turn_user
-    assert "Current user turn:\nCan you do x?" in second_turn_user
+
+
+@pytest.mark.asyncio
+async def test_message_prefix_is_stable_across_turns_for_caching():
+    """The message list sent to the LLM at turn N+1 must extend turn N's
+    list by exactly the new pair + new task — no rotation, no inline
+    rewriting. That stability is what unlocks OpenAI's automatic prefix
+    cache (matches longest identical prefix) and Anthropic's
+    ``cache_control`` markers."""
+    llm = _ChatLLM()
+    memory = _SpyMemory(llm)
+    app = PersistentAgent(
+        coordinator=_agent(llm=llm, memory=memory),
+        session_store=InMemorySessionStore(),
+        memory=memory,
+        llm=llm,
+        config=PersistentAgentConfig(reconcile_every_turns=99, compact_every_turns=99),
+    )
+
+    [event async for event in app.chat("first turn", session_id="cache-test")]
+    [event async for event in app.chat("second turn", session_id="cache-test")]
+    [event async for event in app.chat("third turn", session_id="cache-test")]
+
+    agent_calls = [c for c in llm.calls if c["kwargs"].get("source") != "reconciler"]
+    # First call from turn 2 and first call from turn 3.
+    turn2_messages = agent_calls[1]["messages"]
+    turn3_messages = agent_calls[2]["messages"]
+
+    # System + first user (turn 1 message) + first assistant (turn 1 reply)
+    # is the cacheable prefix shared by turns 2 and 3. Compare role/content
+    # of the first 3 messages — they must be byte-identical.
+    assert len(turn3_messages) > len(turn2_messages), (
+        "turn 3 should include MORE history than turn 2, not slide a window"
+    )
+    for idx in range(3):
+        assert turn3_messages[idx]["role"] == turn2_messages[idx]["role"]
+        assert turn3_messages[idx]["content"] == turn2_messages[idx]["content"], (
+            f"message {idx} content differs between turns — prefix cache would break here. "
+            f"turn2: {turn2_messages[idx]['content']!r}, "
+            f"turn3: {turn3_messages[idx]['content']!r}"
+        )
 
 
 @pytest.mark.asyncio

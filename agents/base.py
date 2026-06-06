@@ -253,7 +253,29 @@ class BaseAgent:
         self,
         task: str,
         run_id: str | None = None,
+        *,
+        prior_messages: list[tuple[str, str | list]] | None = None,
+        pinned_priors: int = 0,
     ) -> AsyncGenerator[BusEvent, None]:
+        """Run the ReAct loop on ``task``, optionally seeded with prior
+        conversation history.
+
+        ``prior_messages``
+            List of ``(role, content)`` pairs to append to WorkingMemory
+            after the system prompt and before the current task. Used by
+            ``PersistentAgent`` to feed cross-turn conversation history as
+            real role messages instead of inline-rendered text — which
+            makes the prompt prefix byte-identical between turns until
+            the next compaction, unlocking OpenAI's automatic prefix
+            cache and Anthropic's ``cache_control``.
+
+        ``pinned_priors``
+            How many of the *first* ``prior_messages`` to pin against
+            WorkingMemory eviction. Designed for ``PersistentAgent`` to
+            pin the rolling-summary priming pair so that even if a busy
+            turn's tool observations push WM into summarisation, the
+            session-level summary survives.
+        """
         run_id = run_id or str(uuid.uuid4())
         self._ckp_id = f"{run_id}:{self.config.agent_id}"
         if not self._resume_key:
@@ -266,6 +288,9 @@ class BaseAgent:
 
         system = await self._build_system_prompt(task)
         await self._working_memory.append("system", system, pinned=True)
+        if prior_messages:
+            for idx, (role, content) in enumerate(prior_messages):
+                await self._working_memory.append(role, content, pinned=idx < pinned_priors)
         await self._working_memory.append("user", task)
 
         # Steering source is owned by the agent for the duration of the run.
