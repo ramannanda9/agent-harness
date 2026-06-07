@@ -1,8 +1,19 @@
-"""Reusable slash-command controls for ``PersistentAgent`` demos and CLIs."""
+"""Reusable slash-command controls for ``PersistentAgent`` demos and CLIs.
+
+The command surface is defined once in ``SLASH_COMMAND_SPECS`` and consumed by:
+- ``PersistentCommandHandler`` (this module) for dispatch
+- ``harness.persistent_completion.SlashCommandCompleter`` for tab-completion
+- ``_help_text`` for the ``/help`` body
+
+A spec registry, not three independent lists, keeps those consumers from
+drifting as commands are added. Tests assert the dispatch map matches the
+spec set exactly.
+"""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from typing import Any
 from uuid import uuid4
 
@@ -17,12 +28,121 @@ class PersistentCommandResult:
     should_exit: bool = False
 
 
-class PersistentCommandHandler:
-    """Map simple slash commands to ``PersistentAgent`` operations.
+@dataclass(frozen=True)
+class SlashCommandSpec:
+    """Metadata for one slash command — name, help text, argument shape.
 
-    This is UI glue, not core runtime behavior. Terminal demos can print the
-    returned text; web/API frontends should generally call ``PersistentAgent``
-    methods directly.
+    ``arg_kind`` is the data contract for UIs that complete arguments:
+
+    - ``"none"`` — no arguments
+    - ``"session_id"`` — one required session id (e.g. ``/switch``)
+    - ``"optional_session_id"`` — one optional session id (e.g. ``/new``)
+    - ``"session_id_then_confirm"`` — optional session id + required ``confirm`` (e.g. ``/delete``)
+    - ``"query"`` — one optional free-text token (e.g. ``/sessions [query]``)
+    """
+
+    name: str
+    description: str
+    category: str = "Other"
+    arg_hint: str = ""
+    arg_kind: str = "none"
+    aliases: tuple[str, ...] = field(default_factory=tuple)
+
+
+SLASH_COMMAND_SPECS: tuple[SlashCommandSpec, ...] = (
+    SlashCommandSpec("/help", "Show command help", category="Help", aliases=("/?",)),
+    SlashCommandSpec(
+        "/capabilities",
+        "Inspect wired coordinator, sub-agents, MCP tools",
+        category="Inspect",
+    ),
+    SlashCommandSpec("/agents", "List coordinator and sub-agents", category="Inspect"),
+    SlashCommandSpec("/mcp", "List wired MCP tools", category="Inspect"),
+    SlashCommandSpec(
+        "/session",
+        "Show current session state + reconcile cadence",
+        category="Inspect",
+    ),
+    SlashCommandSpec(
+        "/memory",
+        "Show cached memory context for this session",
+        category="Inspect",
+    ),
+    SlashCommandSpec(
+        "/usage",
+        "Show token usage totals + last-run breakdown",
+        category="Inspect",
+    ),
+    SlashCommandSpec(
+        "/sessions",
+        "List known sessions",
+        category="Inspect",
+        arg_hint="[query]",
+        arg_kind="query",
+    ),
+    SlashCommandSpec(
+        "/save",
+        "Reconcile pending turns into long-term memory",
+        category="Memory",
+    ),
+    SlashCommandSpec(
+        "/compact",
+        "Structural reorg: summary + trim + reconcile",
+        category="Memory",
+    ),
+    SlashCommandSpec(
+        "/forget",
+        "Drop cached memory context for this session",
+        category="Memory",
+    ),
+    SlashCommandSpec(
+        "/switch",
+        "Switch to an existing or new logical session",
+        category="Session",
+        arg_hint="<id>",
+        arg_kind="session_id",
+    ),
+    SlashCommandSpec(
+        "/new",
+        "Create a new session; refuses if id exists",
+        category="Session",
+        arg_hint="[id]",
+        arg_kind="optional_session_id",
+    ),
+    SlashCommandSpec(
+        "/clear",
+        "Clear current transcript; long-term memory retained",
+        category="Session",
+    ),
+    SlashCommandSpec(
+        "/delete",
+        "Delete a transcript row; long-term memory retained",
+        category="Session",
+        arg_hint="[id] confirm",
+        arg_kind="session_id_then_confirm",
+    ),
+    SlashCommandSpec(
+        "/end",
+        "Exit the demo; transcript stays in SQLite",
+        category="Session",
+    ),
+)
+
+
+def slash_command_specs() -> tuple[SlashCommandSpec, ...]:
+    """Return the slash-command registry. Stable across imports."""
+    return SLASH_COMMAND_SPECS
+
+
+_CommandHandler = Callable[..., Awaitable[PersistentCommandResult]]
+
+
+class PersistentCommandHandler:
+    """Map slash commands to ``PersistentAgent`` operations.
+
+    UI glue, not core runtime behavior. Terminal demos can print the
+    returned ``text``; web/API frontends should generally call
+    ``PersistentAgent`` methods directly.
     """
 
     def __init__(
@@ -35,74 +155,203 @@ class PersistentCommandHandler:
         self._app = app
         self._config = config or app.config
         self._llm = llm or app.llm
+        self._dispatch: dict[str, _CommandHandler] = self._build_dispatch()
+
+    def _build_dispatch(self) -> dict[str, _CommandHandler]:
+        # Map every spec.name (and alias) to the method that handles it.
+        # The spec → method link lives only here; tests pin that every
+        # spec has a handler and every handler corresponds to a spec.
+        method_for_name: dict[str, _CommandHandler] = {
+            "/help": self._cmd_help,
+            "/capabilities": self._cmd_capabilities,
+            "/agents": self._cmd_agents,
+            "/mcp": self._cmd_mcp,
+            "/session": self._cmd_session,
+            "/memory": self._cmd_memory,
+            "/usage": self._cmd_usage,
+            "/sessions": self._cmd_sessions,
+            "/save": self._cmd_save,
+            "/compact": self._cmd_compact,
+            "/forget": self._cmd_forget,
+            "/switch": self._cmd_switch,
+            "/new": self._cmd_new,
+            "/clear": self._cmd_clear,
+            "/delete": self._cmd_delete,
+            "/end": self._cmd_end,
+        }
+        dispatch: dict[str, _CommandHandler] = {}
+        for spec in SLASH_COMMAND_SPECS:
+            handler = method_for_name[spec.name]
+            dispatch[spec.name] = handler
+            for alias in spec.aliases:
+                dispatch[alias] = handler
+        return dispatch
 
     async def handle(self, message: str, *, session_id: str) -> PersistentCommandResult:
         if not message.startswith("/"):
             return PersistentCommandResult(handled=False, session_id=session_id)
         command = message.split(maxsplit=1)[0].lower()
-
-        if command in {"/help", "/?"}:
-            return self._result(session_id, _help_text())
-        if command == "/capabilities":
-            return self._result(session_id, _format_capabilities(self._app))
-        if command == "/agents":
-            return self._result(session_id, _format_agents(self._app))
-        if command == "/mcp":
-            return self._result(session_id, _format_mcp(self._app))
-        if command == "/session":
-            return self._result(session_id, await self._format_session(session_id))
-        if command == "/memory":
-            return self._result(session_id, _format_memory(self._app, session_id=session_id))
-        if command == "/usage":
-            return self._result(session_id, await self._format_usage(session_id))
-        if command == "/sessions":
-            query = message[len(command) :].strip() or None
-            return self._result(
-                session_id,
-                await _format_sessions(self._app, current_session_id=session_id, query=query),
-            )
-        if command == "/save":
-            count = await self._app.save_to_memory(session_id)
-            if count:
-                return self._result(
-                    session_id,
-                    f"saved {count} pending message(s) from {session_id} to long-term memory",
-                )
-            return self._result(session_id, f"session {session_id} has no pending messages to save")
-        if command == "/compact":
-            state = await self._app.force_compact(session_id)
-            return self._result(
-                session_id,
-                f"compacted session {session_id}; last_compact_turn={state.last_compact_turn}",
-            )
-        if command == "/forget":
-            self._app.forget_memory_cache(session_id)
-            return self._result(
-                session_id, f"forgot cached memory context for session {session_id}"
-            )
-        if command == "/switch":
-            return await self._switch(message, command=command, session_id=session_id)
-        if command == "/new":
-            return await self._new(message, command=command, session_id=session_id)
-        if command == "/clear":
-            await self._app.clear_session(session_id)
-            return self._result(
-                session_id,
-                f"cleared session {session_id} transcript; long-term memory retained",
-            )
-        if command == "/delete":
-            return await self._delete(message, command=command, session_id=session_id)
-        if command == "/end":
-            return PersistentCommandResult(
-                handled=True,
-                text=f"exiting; session {session_id} transcript preserved for next run",
-                session_id=session_id,
-                should_exit=True,
-            )
-        return self._result(session_id, f"Unknown command: {command}. Try /help.")
+        handler = self._dispatch.get(command)
+        if handler is None:
+            return self._result(session_id, f"Unknown command: {command}. Try /help.")
+        return await handler(message=message, command=command, session_id=session_id)
 
     def _result(self, session_id: str, text: str) -> PersistentCommandResult:
         return PersistentCommandResult(handled=True, text=text, session_id=session_id)
+
+    # ── Per-command handlers ──────────────────────────────────────────────
+
+    async def _cmd_help(
+        self, *, message: str, command: str, session_id: str
+    ) -> PersistentCommandResult:
+        return self._result(session_id, _help_text())
+
+    async def _cmd_capabilities(
+        self, *, message: str, command: str, session_id: str
+    ) -> PersistentCommandResult:
+        return self._result(session_id, _format_capabilities(self._app))
+
+    async def _cmd_agents(
+        self, *, message: str, command: str, session_id: str
+    ) -> PersistentCommandResult:
+        return self._result(session_id, _format_agents(self._app))
+
+    async def _cmd_mcp(
+        self, *, message: str, command: str, session_id: str
+    ) -> PersistentCommandResult:
+        return self._result(session_id, _format_mcp(self._app))
+
+    async def _cmd_session(
+        self, *, message: str, command: str, session_id: str
+    ) -> PersistentCommandResult:
+        return self._result(session_id, await self._format_session(session_id))
+
+    async def _cmd_memory(
+        self, *, message: str, command: str, session_id: str
+    ) -> PersistentCommandResult:
+        return self._result(session_id, _format_memory(self._app, session_id=session_id))
+
+    async def _cmd_usage(
+        self, *, message: str, command: str, session_id: str
+    ) -> PersistentCommandResult:
+        return self._result(session_id, await self._format_usage(session_id))
+
+    async def _cmd_sessions(
+        self, *, message: str, command: str, session_id: str
+    ) -> PersistentCommandResult:
+        query = message[len(command) :].strip() or None
+        return self._result(
+            session_id,
+            await _format_sessions(self._app, current_session_id=session_id, query=query),
+        )
+
+    async def _cmd_save(
+        self, *, message: str, command: str, session_id: str
+    ) -> PersistentCommandResult:
+        count = await self._app.save_to_memory(session_id)
+        if count:
+            return self._result(
+                session_id,
+                f"saved {count} pending message(s) from {session_id} to long-term memory",
+            )
+        return self._result(session_id, f"session {session_id} has no pending messages to save")
+
+    async def _cmd_compact(
+        self, *, message: str, command: str, session_id: str
+    ) -> PersistentCommandResult:
+        state = await self._app.force_compact(session_id)
+        return self._result(
+            session_id,
+            f"compacted session {session_id}; last_compact_turn={state.last_compact_turn}",
+        )
+
+    async def _cmd_forget(
+        self, *, message: str, command: str, session_id: str
+    ) -> PersistentCommandResult:
+        self._app.forget_memory_cache(session_id)
+        return self._result(session_id, f"forgot cached memory context for session {session_id}")
+
+    async def _cmd_switch(
+        self, *, message: str, command: str, session_id: str
+    ) -> PersistentCommandResult:
+        try:
+            next_session_id = _session_arg(command, message)
+        except ValueError as exc:
+            return self._result(session_id, f"cannot switch session: {exc}")
+        if not next_session_id:
+            return self._result(session_id, "usage: /switch <session_id>")
+        existed = await self._app.session_exists(next_session_id)
+        await self._app.session_state(next_session_id)
+        return self._result(
+            next_session_id,
+            f"{'resumed' if existed else 'created'} session: {next_session_id}",
+        )
+
+    async def _cmd_new(
+        self, *, message: str, command: str, session_id: str
+    ) -> PersistentCommandResult:
+        try:
+            requested_session_id = _session_arg(command, message)
+        except ValueError as exc:
+            return self._result(session_id, f"cannot create session: {exc}")
+        next_session_id = requested_session_id or f"sess_{uuid4().hex[:12]}"
+        if await self._app.session_exists(next_session_id):
+            return self._result(
+                session_id,
+                f"session already exists: {next_session_id}\n"
+                f"use /switch {next_session_id} to resume it",
+            )
+        await self._app.session_state(next_session_id)
+        return self._result(
+            next_session_id,
+            f"new session: {next_session_id} (previous transcript preserved in SQLite)",
+        )
+
+    async def _cmd_clear(
+        self, *, message: str, command: str, session_id: str
+    ) -> PersistentCommandResult:
+        await self._app.clear_session(session_id)
+        return self._result(
+            session_id,
+            f"cleared session {session_id} transcript; long-term memory retained",
+        )
+
+    async def _cmd_delete(
+        self, *, message: str, command: str, session_id: str
+    ) -> PersistentCommandResult:
+        raw = message[len(command) :].strip()
+        parts = raw.split()
+        if parts == ["confirm"]:
+            delete_session_id = session_id
+        elif len(parts) == 2 and parts[1] == "confirm" and not parts[0].startswith("/"):
+            delete_session_id = parts[0]
+        else:
+            return self._result(
+                session_id,
+                "usage: /delete confirm OR /delete <session_id> confirm\n"
+                "deletes transcript only; long-term memory is retained",
+            )
+        deleted = await self._app.delete_session(delete_session_id)
+        if not deleted:
+            return self._result(session_id, f"session not found: {delete_session_id}")
+        text = f"deleted session {delete_session_id}; long-term memory retained"
+        if delete_session_id == session_id:
+            next_session_id = "default"
+            await self._app.session_state(next_session_id)
+            return self._result(next_session_id, f"{text}\nswitched to session: {next_session_id}")
+        return self._result(session_id, text)
+
+    async def _cmd_end(
+        self, *, message: str, command: str, session_id: str
+    ) -> PersistentCommandResult:
+        return PersistentCommandResult(
+            handled=True,
+            text=f"exiting; session {session_id} transcript preserved for next run",
+            session_id=session_id,
+            should_exit=True,
+        )
+
+    # ── Formatters (per-instance because they reference llm/config) ───────
 
     async def _format_session(self, session_id: str) -> str:
         state = await self._app.session_state(session_id)
@@ -155,95 +404,28 @@ class PersistentCommandHandler:
                 )
         return "\n".join(lines)
 
-    async def _switch(
-        self,
-        message: str,
-        *,
-        command: str,
-        session_id: str,
-    ) -> PersistentCommandResult:
-        try:
-            next_session_id = _session_arg(command, message)
-        except ValueError as exc:
-            return self._result(session_id, f"cannot switch session: {exc}")
-        if not next_session_id:
-            return self._result(session_id, "usage: /switch <session_id>")
-        existed = await self._app.session_exists(next_session_id)
-        await self._app.session_state(next_session_id)
-        return self._result(
-            next_session_id,
-            f"{'resumed' if existed else 'created'} session: {next_session_id}",
-        )
-
-    async def _new(
-        self,
-        message: str,
-        *,
-        command: str,
-        session_id: str,
-    ) -> PersistentCommandResult:
-        try:
-            requested_session_id = _session_arg(command, message)
-        except ValueError as exc:
-            return self._result(session_id, f"cannot create session: {exc}")
-        next_session_id = requested_session_id or f"sess_{uuid4().hex[:12]}"
-        if await self._app.session_exists(next_session_id):
-            return self._result(
-                session_id,
-                f"session already exists: {next_session_id}\n"
-                f"use /switch {next_session_id} to resume it",
-            )
-        await self._app.session_state(next_session_id)
-        return self._result(
-            next_session_id,
-            f"new session: {next_session_id} (previous transcript preserved in SQLite)",
-        )
-
-    async def _delete(
-        self,
-        message: str,
-        *,
-        command: str,
-        session_id: str,
-    ) -> PersistentCommandResult:
-        raw = message[len(command) :].strip()
-        parts = raw.split()
-        if parts == ["confirm"]:
-            delete_session_id = session_id
-        elif len(parts) == 2 and parts[1] == "confirm" and not parts[0].startswith("/"):
-            delete_session_id = parts[0]
-        else:
-            return self._result(
-                session_id,
-                "usage: /delete confirm OR /delete <session_id> confirm\n"
-                "deletes transcript only; long-term memory is retained",
-            )
-        deleted = await self._app.delete_session(delete_session_id)
-        if not deleted:
-            return self._result(session_id, f"session not found: {delete_session_id}")
-        text = f"deleted session {delete_session_id}; long-term memory retained"
-        if delete_session_id == session_id:
-            next_session_id = "default"
-            await self._app.session_state(next_session_id)
-            return self._result(next_session_id, f"{text}\nswitched to session: {next_session_id}")
-        return self._result(session_id, text)
-
 
 def _help_text() -> str:
-    return "\n".join(
-        [
-            "Inspect:  /capabilities, /agents, /mcp, /session, /memory, /usage",
-            "Memory:   /save     reconcile recent turns into long-term memory",
-            "          /compact  structural reorg: summary + trim + reconcile",
-            "          /forget   drop this session's cached memory prior",
-            "Session:  /sessions [query] list known sessions",
-            "          /switch <id> switch to an existing or new logical session",
-            "          /new [id] create a new session; refuses if id exists",
-            "          /clear    clear current transcript; memory retained",
-            "          /delete [id] confirm delete transcript; memory retained",
-            "          /end      exit the demo; transcript stays in SQLite",
-        ]
+    # Categorised grid derived from the spec registry so a new spec auto-
+    # appears in /help. Order within category follows declaration order.
+    by_category: dict[str, list[SlashCommandSpec]] = {}
+    for spec in SLASH_COMMAND_SPECS:
+        by_category.setdefault(spec.category, []).append(spec)
+    order = ("Inspect", "Memory", "Session", "Help", "Other")
+    label_width = max(
+        len(spec.name + (f" {spec.arg_hint}" if spec.arg_hint else ""))
+        for spec in SLASH_COMMAND_SPECS
     )
+    lines: list[str] = []
+    for category in order:
+        specs = by_category.get(category)
+        if not specs:
+            continue
+        for spec in specs:
+            label = spec.name + (f" {spec.arg_hint}" if spec.arg_hint else "")
+            lines.append(f"  {label:<{label_width}}  {spec.description}")
+        lines.append("")
+    return "\n".join(lines).rstrip()
 
 
 def _estimate_session_tokens(state: SessionState) -> int:

@@ -39,12 +39,15 @@ from pathlib import Path
 from uuid import uuid4
 
 from mcp import StdioServerParameters
+from prompt_toolkit import PromptSession
+from prompt_toolkit.history import FileHistory
 
 from agents.base import AgentConfig, BaseAgent
 from harness.console import ConsoleRenderer
 from harness.events import EventType
 from harness.executor_bridge import ExecutorBridge, ExecutorConfig, ExecutorTool, find_executor
 from harness.persistent import PersistentAgent, PersistentAgentConfig, SQLiteSessionStore
+from harness.persistent_completion import SlashCommandCompleter
 from harness.persistent_controls import PersistentCommandHandler
 from harness.runtime import BudgetGuard, GuardrailConfig, Tracer
 from memory.manager import MemoryManager
@@ -370,6 +373,18 @@ async def main() -> None:
         )
         renderer = ConsoleRenderer()
         controls = PersistentCommandHandler(app)
+        # prompt_toolkit input: Tab-complete slash commands via
+        # ``SlashCommandCompleter`` (commands + session-id arguments) and
+        # persist command history across runs in ``state_dir``. Falls back
+        # to the framework default of complete-on-tab so we don't query
+        # the session store on every keystroke.
+        history_path = Path(args.state_dir).expanduser() / "demo_history"
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+        prompt_session: PromptSession[str] = PromptSession(
+            history=FileHistory(str(history_path)),
+            completer=SlashCommandCompleter(app),
+            complete_while_typing=False,
+        )
 
         print("Persistent agent ready.")
         print(f"Session: {session_id}")
@@ -389,8 +404,8 @@ async def main() -> None:
 
         while True:
             try:
-                message = input("> ").strip()
-            except EOFError:
+                message = (await prompt_session.prompt_async("> ")).strip()
+            except (EOFError, KeyboardInterrupt):
                 print()
                 return
             if not message:

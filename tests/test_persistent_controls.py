@@ -9,7 +9,10 @@ from harness.persistent import (
     PersistentAgentConfig,
     SessionMessage,
 )
-from harness.persistent_controls import PersistentCommandHandler
+from harness.persistent_controls import (
+    PersistentCommandHandler,
+    slash_command_specs,
+)
 from harness.runtime import BudgetGuard, GuardrailConfig, Tracer
 from memory.manager import MemoryManager
 from memory.stores import InMemoryEpisodicStore, InMemorySemanticStore
@@ -154,3 +157,37 @@ async def test_command_handler_usage_displays_session_totals():
 
     assert "total tokens: in=123 out=45" in result.text
     assert "agent:coordinator" in result.text
+
+
+def test_slash_command_specs_match_dispatch_keys():
+    """Every spec.name (and alias) has a handler; no handler is unspecced."""
+    app, _, _ = _app()
+    handler = PersistentCommandHandler(app)
+    spec_keys: set[str] = set()
+    for spec in slash_command_specs():
+        spec_keys.add(spec.name)
+        spec_keys.update(spec.aliases)
+    assert spec_keys == set(handler._dispatch)
+
+
+@pytest.mark.asyncio
+async def test_help_text_mentions_every_spec_name():
+    """Help body is derived from specs, so each command must appear."""
+    app, _, _ = _app()
+    handler = PersistentCommandHandler(app)
+
+    result = await handler.handle("/help", session_id="x")
+    for spec in slash_command_specs():
+        assert spec.name in result.text, f"missing {spec.name} in /help body"
+
+
+@pytest.mark.asyncio
+async def test_help_alias_question_mark_works():
+    app, _, _ = _app()
+    handler = PersistentCommandHandler(app)
+
+    canonical = await handler.handle("/help", session_id="x")
+    alias = await handler.handle("/?", session_id="x")
+
+    assert canonical.text == alias.text
+    assert canonical.handled is True

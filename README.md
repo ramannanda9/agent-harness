@@ -677,6 +677,29 @@ if result.text:
     print(result.text)
 ```
 
+The command surface is defined once in `SLASH_COMMAND_SPECS` and exposed via
+`slash_command_specs()`. Tab-completion in the demo binds those specs to
+`prompt_toolkit` via `SlashCommandCompleter`:
+
+```python
+from prompt_toolkit import PromptSession
+from prompt_toolkit.history import FileHistory
+from harness.persistent_completion import SlashCommandCompleter
+
+session = PromptSession(
+    history=FileHistory("~/.agent-harness/demo_history"),
+    completer=SlashCommandCompleter(app),
+    complete_while_typing=False,  # Tab-triggered; doesn't query the store every keystroke
+)
+message = (await session.prompt_async("> ")).strip()
+```
+
+Name completion comes from the spec registry; session-id arguments call
+`app.list_sessions(query=...)` (SQLite pushes the filter down to
+`lower(session_id) LIKE ?` so per-keystroke cost stays bounded). Other UIs
+(web autocomplete, fzf, IDE plugins) should consume `slash_command_specs()`
+directly without importing the prompt_toolkit binding.
+
 The demo uses that utility for:
 
 - `/capabilities`, `/agents`, `/mcp` inspect wired agents and tools
