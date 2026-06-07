@@ -643,12 +643,85 @@ Use `app.capabilities()` to inspect the already-wired coordinator,
 sub-agents, and MCP tools. The demo exposes this with
 `--show-capabilities`.
 
+Persistent sessions also expose a small control surface for user interfaces:
+
+```python
+state = await app.session_state("thread-1")
+print(state.tokens_in_total, state.tokens_out_total)
+sessions = await app.list_sessions()
+matches = await app.list_sessions(query="research")
+cached = app.cached_memory_context("thread-1")
+await app.save_to_memory("thread-1")   # reconcile pending turns, keep cache warm
+await app.force_compact("thread-1")    # structural reorg (summary + trim + reconcile + evict)
+app.forget_memory_cache("thread-1")
+await app.clear_session("thread-1")    # clear transcript only; memory retained
+await app.delete_session("thread-1")   # delete transcript only; memory retained
+```
+
+There is deliberately no `close()` method — the SQLite transcript is the
+durable record, and any of `chat`/`save_to_memory`/`force_compact` on the
+same `session_id` later will resume from it. To exit, just stop calling
+`chat` (and let the process end).
+
+For simple REPLs, `PersistentCommandHandler` maps slash commands to those
+primitives and returns structured results:
+
+```python
+from harness.persistent_controls import PersistentCommandHandler
+
+controls = PersistentCommandHandler(app)
+result = await controls.handle("/sessions research", session_id=session_id)
+if result.session_id:
+    session_id = result.session_id
+if result.text:
+    print(result.text)
+```
+
+The command surface is defined once in `SLASH_COMMAND_SPECS` and exposed via
+`slash_command_specs()`. Tab-completion in the demo binds those specs to
+`prompt_toolkit` via `SlashCommandCompleter`:
+
+```python
+from prompt_toolkit import PromptSession
+from prompt_toolkit.history import FileHistory
+from harness.persistent_completion import SlashCommandCompleter
+
+session = PromptSession(
+    history=FileHistory("~/.agent-harness/demo_history"),
+    completer=SlashCommandCompleter(app),
+    complete_while_typing=False,  # Tab-triggered; doesn't query the store every keystroke
+)
+message = (await session.prompt_async("> ")).strip()
+```
+
+Name completion comes from the spec registry; session-id arguments call
+`app.list_sessions(query=...)` (SQLite pushes the filter down to
+`lower(session_id) LIKE ?` so per-keystroke cost stays bounded). Other UIs
+(web autocomplete, fzf, IDE plugins) should consume `slash_command_specs()`
+directly without importing the prompt_toolkit binding.
+
+The demo uses that utility for:
+
+- `/capabilities`, `/agents`, `/mcp` inspect wired agents and tools
+- `/session` shows turns, context-pressure estimate, reconcile cadence, and summary
+- `/usage` shows persisted total and last-run provider-reported token usage
+- `/sessions [query]` lists known session ids, optionally filtered by id text
+- `/memory` shows the cached per-session memory context
+- `/save` flushes turns after the last reconcile checkpoint into long-term memory **without** evicting the cached prior (foreground prefix stays warm)
+- `/compact` forces a structural reorg — summary + trim + reconcile + cache evict — used when the transcript is bloating, not for routine "save"
+- `/forget` evicts cached memory context so the next turn refetches it
+- `/switch <id>` resumes or creates a logical session id
+- `/new [id]` starts a fresh session id and refuses to collide with an existing id
+- `/clear` clears the current transcript/summary/counters; long-term memory is retained
+- `/delete [id] confirm` deletes a transcript row; long-term memory is retained
+- `/end` exits the demo — no auto-flush; call `/save` first if you want pending facts persisted
+
 Each chat turn gets a fresh `WorkingMemory`. Continuity comes from the
 SQLite session state (rolling summary + recent messages) and normal
 `MemoryManager` recall, not from carrying old ReAct scratchpads forever.
 
 **Prefix-cache aware.** The full prompt stays byte-identical across plain
-chat turns within a compaction window. Three things make that work:
+chat turns within a compaction window. Four things make that work:
 
 1. The accumulated session transcript is sent to the coordinator as real
    `user`/`assistant` role messages — not folded into one inline-rendered
@@ -658,20 +731,40 @@ chat turns within a compaction window. Three things make that work:
    pinned user-message prior, **not in the system prompt**. The system
    prompt is now pure agent identity + tool list + ReAct format — purely
    static. Memory context is fetched once per session, cached on the
-   `PersistentAgent`, and refreshed only at compaction or high-signal
-   reconcile (so it doesn't shift turn-to-turn just because the goal
-   changed).
-3. Long-term memory writes are **deferred to compaction**, not fired
-   periodically. The session transcript is the per-turn journal — facts
-   land in long-term memory only when we're already breaking cache (at
-   compaction or high-signal events like tool runs / "remember" terms).
-   The legacy `reconcile_every_turns` knob is a no-op.
+   `PersistentAgent`, and refreshed only at compaction or explicit
+   "remember" signals.
+3. **Compaction triggers on context-size pressure, not turn counts.**
+   `compact_at_context_fraction=0.5` (default) reads the coordinator
+   LLM's `input_token_budget` and fires when the transcript crosses
+   ~50% of it. After compaction, `retain_context_fraction=0.15`
+   keeps the newest messages that fit in ~15% of the input budget
+   verbatim and folds older messages into the rolling summary.
+   Chat-only sessions go thousands of turns between
+   compactions; browser-heavy sessions compact when budget pressure
+   actually warrants it.
+4. **Background memory accumulation, foreground cache stability.**
+   Every `async_reconcile_every_turns` turns (default 10), a
+   non-blocking `write_run_end` samples the last N turn-pairs from the
+   durable transcript and updates long-term memory — but does **not**
+   evict the per-session memory cache. New facts are immediately
+   visible to OTHER sessions; THIS session sees them at the next
+   compaction (where the cache is already breaking for the summary
+   refresh).
 
 OpenAI's automatic prefix cache and Anthropic's `cache_control` markers
-both match on longest-identical prefix. Together these three changes let
-a typical session pay one cold compaction every ~12 turns plus ~K turns
-of warm-prefix hits in between, instead of paying full price every
-turn.
+both match on longest-identical prefix. Together these four changes let
+a typical session pay one cold compaction when the transcript actually
+fills the context window, with warm cache hits on every turn in
+between, while still accumulating memory in the background.
+
+The legacy `reconcile_every_turns`, `compact_every_turns`, and
+`compact_message_threshold` knobs have been **removed** — passing them
+to `PersistentAgentConfig` is a clear `TypeError` rather than a silent
+no-op so existing user code can be updated explicitly. Reconciliation
+fires on (a) user-explicit `remember` / `prefer` / `always` / etc.
+signals (immediate, evicts cache), (b) periodic background async path
+(non-blocking, no eviction), or (c) compaction (with the summary LLM
+call, evicts cache).
 
 The demo stores local state under `~/.agent-harness` by default:
 
@@ -697,11 +790,13 @@ python examples/persistent_agent_demo.py --provider claude-code
 The wrapper owns cadence:
 
 - session transcript is written every turn without an LLM;
-- `MemoryManager.write_run_end(...)` is called only when the turn has a
-  durable signal, tool/sub-agent work, errors, or the configured interval
-  has elapsed;
-- session compaction runs at message/turn thresholds and updates the
-  stored summary.
+- `MemoryManager.write_run_end(...)` runs synchronously only for explicit
+  durable user signals such as "remember" / "prefer" / "always";
+- background async reconciliation samples the durable transcript every
+  `async_reconcile_every_turns` turns without evicting the current
+  session's memory-context cache;
+- session compaction runs under context pressure and updates the stored
+  summary while trimming older transcript messages.
 
 For MCP, put MCP tools on the coordinator or sub-agents before wrapping.
 `PersistentAgent` does not special-case MCP auth; it preserves the existing

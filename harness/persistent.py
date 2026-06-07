@@ -19,6 +19,7 @@ from typing import Any, Protocol
 
 from agents.base import BaseAgent
 from harness.events import BusEvent, EventType
+from harness.utils import fire
 from memory.manager import MemoryManager
 
 
@@ -41,11 +42,20 @@ class SessionState:
     turn_count: int = 0
     last_reconcile_turn: int = 0
     last_compact_turn: int = 0
+    tokens_in_total: int = 0
+    tokens_out_total: int = 0
+    last_run_tokens_in: int = 0
+    last_run_tokens_out: int = 0
+    last_usage: dict[str, Any] = field(default_factory=dict)
     updated_at: str = field(default_factory=_now)
 
 
 class SessionStore(Protocol):
     async def load(self, session_id: str) -> SessionState: ...
+
+    async def exists(self, session_id: str) -> bool: ...
+
+    async def list_sessions(self, *, query: str | None = None) -> list[SessionState]: ...
 
     async def append_messages(
         self, session_id: str, messages: Sequence[SessionMessage]
@@ -58,6 +68,19 @@ class SessionStore(Protocol):
     async def mark_reconciled(self, session_id: str, turn_count: int) -> SessionState: ...
 
     async def mark_compacted(self, session_id: str, turn_count: int) -> SessionState: ...
+
+    async def record_usage(
+        self,
+        session_id: str,
+        *,
+        tokens_in: int,
+        tokens_out: int,
+        usage: dict[str, Any],
+    ) -> SessionState: ...
+
+    async def clear(self, session_id: str) -> SessionState: ...
+
+    async def delete(self, session_id: str) -> bool: ...
 
 
 class InMemorySessionStore:
@@ -72,6 +95,20 @@ class InMemorySessionStore:
             state = SessionState(session_id=session_id)
             self._sessions[session_id] = state
         return _copy_state(state)
+
+    async def exists(self, session_id: str) -> bool:
+        return session_id in self._sessions
+
+    async def list_sessions(self, *, query: str | None = None) -> list[SessionState]:
+        needle = query.lower() if query else None
+        states = self._sessions.values()
+        if needle:
+            states = [state for state in states if needle in state.session_id.lower()]
+        return sorted(
+            (_copy_state(state) for state in states),
+            key=lambda state: state.updated_at,
+            reverse=True,
+        )
 
     async def append_messages(
         self, session_id: str, messages: Sequence[SessionMessage]
@@ -107,6 +144,41 @@ class InMemorySessionStore:
         state.updated_at = _now()
         return _copy_state(state)
 
+    async def record_usage(
+        self,
+        session_id: str,
+        *,
+        tokens_in: int,
+        tokens_out: int,
+        usage: dict[str, Any],
+    ) -> SessionState:
+        state = self._sessions.setdefault(session_id, SessionState(session_id=session_id))
+        state.tokens_in_total += int(tokens_in)
+        state.tokens_out_total += int(tokens_out)
+        state.last_run_tokens_in = int(tokens_in)
+        state.last_run_tokens_out = int(tokens_out)
+        state.last_usage = dict(usage)
+        state.updated_at = _now()
+        return _copy_state(state)
+
+    async def clear(self, session_id: str) -> SessionState:
+        state = self._sessions.setdefault(session_id, SessionState(session_id=session_id))
+        state.summary = ""
+        state.messages = []
+        state.turn_count = 0
+        state.last_reconcile_turn = 0
+        state.last_compact_turn = 0
+        state.tokens_in_total = 0
+        state.tokens_out_total = 0
+        state.last_run_tokens_in = 0
+        state.last_run_tokens_out = 0
+        state.last_usage = {}
+        state.updated_at = _now()
+        return _copy_state(state)
+
+    async def delete(self, session_id: str) -> bool:
+        return self._sessions.pop(session_id, None) is not None
+
 
 class SQLiteSessionStore:
     """Durable local session store using stdlib SQLite."""
@@ -120,6 +192,38 @@ class SQLiteSessionStore:
         with self._connect() as conn:
             self._ensure_session(conn, session_id)
             return self._load_locked(conn, session_id)
+
+    async def exists(self, session_id: str) -> bool:
+        self._ensure_schema()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            return row is not None
+
+    async def list_sessions(self, *, query: str | None = None) -> list[SessionState]:
+        self._ensure_schema()
+        with self._connect() as conn:
+            if query:
+                rows = conn.execute(
+                    """
+                    SELECT session_id
+                    FROM sessions
+                    WHERE lower(session_id) LIKE ?
+                    ORDER BY updated_at DESC, session_id ASC
+                    """,
+                    (f"%{query.lower()}%",),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT session_id
+                    FROM sessions
+                    ORDER BY updated_at DESC, session_id ASC
+                    """
+                ).fetchall()
+            return [self._load_locked(conn, row["session_id"]) for row in rows]
 
     async def append_messages(
         self, session_id: str, messages: Sequence[SessionMessage]
@@ -193,6 +297,77 @@ class SQLiteSessionStore:
     async def mark_compacted(self, session_id: str, turn_count: int) -> SessionState:
         return await self._mark(session_id, "last_compact_turn", turn_count)
 
+    async def record_usage(
+        self,
+        session_id: str,
+        *,
+        tokens_in: int,
+        tokens_out: int,
+        usage: dict[str, Any],
+    ) -> SessionState:
+        self._ensure_schema()
+        with self._connect() as conn:
+            self._ensure_session(conn, session_id)
+            conn.execute(
+                """
+                UPDATE sessions
+                SET tokens_in_total = tokens_in_total + ?,
+                    tokens_out_total = tokens_out_total + ?,
+                    last_run_tokens_in = ?,
+                    last_run_tokens_out = ?,
+                    last_usage_json = ?,
+                    updated_at = ?
+                WHERE session_id = ?
+                """,
+                (
+                    int(tokens_in),
+                    int(tokens_out),
+                    int(tokens_in),
+                    int(tokens_out),
+                    json.dumps(usage, default=str),
+                    _now(),
+                    session_id,
+                ),
+            )
+            return self._load_locked(conn, session_id)
+
+    async def clear(self, session_id: str) -> SessionState:
+        self._ensure_schema()
+        with self._connect() as conn:
+            self._ensure_session(conn, session_id)
+            conn.execute("DELETE FROM session_messages WHERE session_id = ?", (session_id,))
+            conn.execute(
+                """
+                UPDATE sessions
+                SET summary = '',
+                    turn_count = 0,
+                    last_reconcile_turn = 0,
+                    last_compact_turn = 0,
+                    tokens_in_total = 0,
+                    tokens_out_total = 0,
+                    last_run_tokens_in = 0,
+                    last_run_tokens_out = 0,
+                    last_usage_json = '{}',
+                    updated_at = ?
+                WHERE session_id = ?
+                """,
+                (_now(), session_id),
+            )
+            return self._load_locked(conn, session_id)
+
+    async def delete(self, session_id: str) -> bool:
+        self._ensure_schema()
+        with self._connect() as conn:
+            existing = conn.execute(
+                "SELECT 1 FROM sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if existing is None:
+                return False
+            conn.execute("DELETE FROM session_messages WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+            return True
+
     async def _mark(self, session_id: str, column: str, turn_count: int) -> SessionState:
         self._ensure_schema()
         if column not in {"last_reconcile_turn", "last_compact_turn"}:
@@ -223,10 +398,16 @@ class SQLiteSessionStore:
                     turn_count INTEGER NOT NULL DEFAULT 0,
                     last_reconcile_turn INTEGER NOT NULL DEFAULT 0,
                     last_compact_turn INTEGER NOT NULL DEFAULT 0,
+                    tokens_in_total INTEGER NOT NULL DEFAULT 0,
+                    tokens_out_total INTEGER NOT NULL DEFAULT 0,
+                    last_run_tokens_in INTEGER NOT NULL DEFAULT 0,
+                    last_run_tokens_out INTEGER NOT NULL DEFAULT 0,
+                    last_usage_json TEXT NOT NULL DEFAULT '{}',
                     updated_at TEXT NOT NULL
                 )
                 """
             )
+            self._ensure_usage_columns(conn)
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS session_messages (
@@ -247,6 +428,19 @@ class SQLiteSessionStore:
             )
         self._ready = True
 
+    def _ensure_usage_columns(self, conn: sqlite3.Connection) -> None:
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()}
+        additions = {
+            "tokens_in_total": "INTEGER NOT NULL DEFAULT 0",
+            "tokens_out_total": "INTEGER NOT NULL DEFAULT 0",
+            "last_run_tokens_in": "INTEGER NOT NULL DEFAULT 0",
+            "last_run_tokens_out": "INTEGER NOT NULL DEFAULT 0",
+            "last_usage_json": "TEXT NOT NULL DEFAULT '{}'",
+        }
+        for column, ddl in additions.items():
+            if column not in existing:
+                conn.execute(f"ALTER TABLE sessions ADD COLUMN {column} {ddl}")
+
     def _ensure_session(self, conn: sqlite3.Connection, session_id: str) -> None:
         conn.execute(
             """
@@ -260,7 +454,9 @@ class SQLiteSessionStore:
         row = conn.execute(
             """
             SELECT session_id, summary, turn_count, last_reconcile_turn,
-                   last_compact_turn, updated_at
+                   last_compact_turn, tokens_in_total, tokens_out_total,
+                   last_run_tokens_in, last_run_tokens_out, last_usage_json,
+                   updated_at
             FROM sessions
             WHERE session_id = ?
             """,
@@ -289,29 +485,41 @@ class SQLiteSessionStore:
             turn_count=row["turn_count"],
             last_reconcile_turn=row["last_reconcile_turn"],
             last_compact_turn=row["last_compact_turn"],
+            tokens_in_total=row["tokens_in_total"],
+            tokens_out_total=row["tokens_out_total"],
+            last_run_tokens_in=row["last_run_tokens_in"],
+            last_run_tokens_out=row["last_run_tokens_out"],
+            last_usage=json.loads(row["last_usage_json"] or "{}"),
             updated_at=row["updated_at"],
         )
 
 
 @dataclass
 class PersistentAgentConfig:
-    # Number of most-recent transcript messages to keep VERBATIM through a
-    # compaction event. The transcript itself accumulates across turns and
-    # is sent to the coordinator as real user/assistant role messages —
-    # not folded into one inline-rendered user-message blob — which keeps
-    # the prefix byte-identical between turns and lets OpenAI's automatic
-    # prefix cache (and Anthropic's ``cache_control``) hit on the entire
-    # historical prefix.
-    recent_messages: int = 8
-    # NO-OP — kept for back-compat with existing user configs. The previous
-    # policy fired a reconciler LLM call every N turns, but mid-window
-    # writes invalidated the next turn's system prompt and broke the
-    # prefix cache. Reconciliation now runs on high-signal events
-    # (tool/sub-agent runs, errors, "remember" terms) and at compaction
-    # — never periodically. Setting this field has no effect.
-    reconcile_every_turns: int = 6
-    compact_every_turns: int = 12
-    compact_message_threshold: int = 24
+    # Compact when the transcript token count crosses this fraction of
+    # the coordinator's ``llm.input_token_budget``. Replaces the previous
+    # turn-count / message-count triggers, which fired arbitrarily often
+    # on chat-light sessions (wasting context budget) and too late on
+    # tool-heavy sessions (risking input-window overrun). 0.5 leaves room
+    # for the current turn's task, any tool observations it will produce,
+    # and tokeniser variance.
+    compact_at_context_fraction: float = 0.5
+    # After compaction, retain the newest transcript messages whose
+    # estimated token total fits within this fraction of the coordinator
+    # input budget. The rest is folded into ``SessionState.summary``.
+    # Token-based retention scales across models and avoids preserving a
+    # huge browser/tool observation merely because it is one of the last
+    # few messages.
+    retain_context_fraction: float = 0.15
+    # Background memory accumulation: every N turns, schedule a
+    # non-blocking ``write_run_end`` over the last N turns of the durable
+    # session transcript. The current session's per-session memory
+    # context cache is **not** evicted, so the prompt prefix stays
+    # byte-identical and OpenAI / Anthropic prefix caches keep hitting.
+    # The reconciler's new facts are visible to OTHER sessions
+    # immediately and to THIS session at the next compaction (where the
+    # cache breaks anyway). Set to 0 to disable.
+    async_reconcile_every_turns: int = 10
     durable_signal_terms: tuple[str, ...] = (
         "remember",
         "always",
@@ -352,6 +560,16 @@ class PersistentAgent:
         # context is byte-identical across turns.
         self._session_memory_context: dict[str, str] = {}
 
+    @property
+    def config(self) -> PersistentAgentConfig:
+        """Persistent session policy used by this wrapper."""
+        return self._config
+
+    @property
+    def llm(self) -> Any:
+        """LLM used for session summarization/control introspection."""
+        return self._llm
+
     async def chat(
         self,
         message: str,
@@ -366,8 +584,13 @@ class PersistentAgent:
         prior_messages, pinned_priors = self._build_prior_messages(
             state, memory_context_text=memory_context_text
         )
+        turn_guard = None
         if self._guard_factory is not None:
-            self._assign_guard(self._guard_factory())
+            turn_guard = self._guard_factory()
+            self._assign_guard(turn_guard)
+        else:
+            turn_guard = getattr(self._coordinator, "_guard", None)
+        usage_before = _guard_token_totals(turn_guard)
 
         final_result: dict | None = None
         trace: list[dict[str, Any]] = []
@@ -407,6 +630,8 @@ class PersistentAgent:
                     tools_used=tools_used,
                     subagents_used=subagents_used,
                     errors=errors,
+                    usage_guard=turn_guard,
+                    usage_before=usage_before,
                 )
                 finalized = True
             yield event
@@ -420,6 +645,8 @@ class PersistentAgent:
                 tools_used=tools_used,
                 subagents_used=subagents_used,
                 errors=errors,
+                usage_guard=turn_guard,
+                usage_before=usage_before,
             )
 
     def capabilities(self) -> dict[str, Any]:
@@ -466,6 +693,99 @@ class PersistentAgent:
             "mcp_tools": mcp_tools,
         }
 
+    async def session_state(self, session_id: str) -> SessionState:
+        """Return a copy of the durable session state."""
+        return await self._session_store.load(session_id)
+
+    async def list_sessions(self, *, query: str | None = None) -> list[SessionState]:
+        """Return known durable sessions, newest first when supported by the store."""
+        return await self._session_store.list_sessions(query=query)
+
+    async def session_exists(self, session_id: str) -> bool:
+        """Return whether a session exists without creating it."""
+        return await self._session_store.exists(session_id)
+
+    def cached_memory_context(self, session_id: str) -> str | None:
+        """Return the currently cached memory-context blob for a session, if any."""
+        return self._session_memory_context.get(session_id)
+
+    def forget_memory_cache(self, session_id: str) -> None:
+        """Drop cached memory context so the next turn fetches fresh memory."""
+        self._evict_session_memory_context(session_id)
+
+    async def force_compact(self, session_id: str) -> SessionState:
+        """Summarize, trim, and reconcile the older transcript portion.
+
+        This uses the same compaction shape as automatic context-pressure
+        compaction: keep the newest messages that fit inside
+        ``retain_context_fraction`` of the input budget, fold older messages
+        into the rolling summary, reconcile the folded window into long-term
+        memory, then evict cached memory context so the next turn can pick
+        up freshly reconciled facts.
+        """
+        state = await self._session_store.load(session_id)
+        to_compact = self._messages_to_compact(state)
+        state = await self._compact_session(session_id, state)
+        if to_compact and state.last_compact_turn:
+            await self._write_session_window_to_memory(
+                session_id=session_id,
+                messages=to_compact,
+                goal_fallback="(force compact)",
+            )
+            state = await self._session_store.mark_reconciled(session_id, state.turn_count)
+        self._evict_session_memory_context(session_id)
+        return state
+
+    async def save_to_memory(self, session_id: str) -> int:
+        """Reconcile pending transcript messages into long-term memory now.
+
+        Samples only messages after ``last_reconcile_turn``, then awaits the
+        ``write_run_end`` call so the caller can confirm completion. Use when
+        a user explicitly wants "save what we discussed" before leaving the
+        session (e.g. demo ``/save`` command).
+
+        Crucially does NOT evict the per-session memory cache: the active
+        session keeps its warm prefix. New facts are visible to OTHER
+        sessions immediately and to THIS session at the next compaction
+        (where the cache breaks anyway for the summary refresh).
+
+        Returns the number of transcript messages included in the reconcile
+        payload — 0 if there's nothing pending to save.
+        """
+        state = await self._session_store.load(session_id)
+        if not state.messages:
+            return 0
+        window = self._messages_since_reconcile(state)
+        if not window:
+            return 0
+        await self._write_session_window_to_memory(
+            session_id=session_id,
+            messages=window,
+            goal_fallback="(explicit save)",
+        )
+        await self._session_store.mark_reconciled(session_id, state.turn_count)
+        return len(window)
+
+    async def clear_session(self, session_id: str) -> SessionState:
+        """Clear transcript/summary/counters for a session.
+
+        Long-term semantic/episodic memory is intentionally retained; this
+        only resets the durable chat workspace for ``session_id``.
+        """
+        state = await self._session_store.clear(session_id)
+        self._evict_session_memory_context(session_id)
+        return state
+
+    async def delete_session(self, session_id: str) -> bool:
+        """Delete a session transcript/summary row.
+
+        Long-term semantic/episodic memory is intentionally retained.
+        Returns ``True`` when a session existed and was deleted.
+        """
+        deleted = await self._session_store.delete(session_id)
+        self._evict_session_memory_context(session_id)
+        return deleted
+
     def _assign_guard(self, guard: Any) -> None:
         seen_agents: set[int] = set()
 
@@ -474,6 +794,9 @@ class PersistentAgent:
                 return
             seen_agents.add(id(agent))
             agent._guard = guard
+            llm = getattr(agent, "_llm", None)
+            if hasattr(llm, "set_budget"):
+                llm.set_budget(guard)
             for tool in getattr(agent, "_tools", {}).values():
                 sub = _subagent_tool_agent(tool)
                 if sub is not None:
@@ -491,6 +814,8 @@ class PersistentAgent:
         tools_used: set[str],
         subagents_used: set[str],
         errors: list[str],
+        usage_guard: Any | None = None,
+        usage_before: tuple[int, int] = (0, 0),
     ) -> None:
         answer = ""
         if final_result is not None:
@@ -506,13 +831,14 @@ class PersistentAgent:
             ],
         )
 
-        if self._should_reconcile(
+        sync_reconciled = self._should_reconcile(
             message=message,
             state=state,
             tools_used=tools_used,
             subagents_used=subagents_used,
             errors=errors,
-        ):
+        )
+        if sync_reconciled:
             await self._memory.write_run_end(
                 goal=message,
                 agent_results=[final_result or {"error": errors[-1] if errors else "no result"}],
@@ -526,23 +852,21 @@ class PersistentAgent:
             # most one more if the new facts actually changed retrieval.
             self._evict_session_memory_context(session_id)
 
-        if self._should_compact(state):
-            # Compact only the OLDER portion — everything before the last
-            # ``recent_messages`` stays verbatim — so the still-recent
-            # turns remain byte-identical across the compaction boundary.
-            # This keeps OpenAI's prefix cache warm through compaction
-            # events (only the leading summary block changes; the verbatim
-            # tail does not).
-            keep = self._config.recent_messages
-            if keep <= 0:
-                to_compact = list(state.messages)
-            else:
-                to_compact = state.messages[:-keep] if len(state.messages) > keep else []
-            if to_compact:
-                summary = await self._summarize_session(state, messages_to_compact=to_compact)
-                state = await self._session_store.update_summary(session_id, summary)
-                await self._session_store.trim_messages(session_id, keep)
-                await self._session_store.mark_compacted(session_id, state.turn_count)
+        compacted = self._should_compact(state)
+        if not sync_reconciled and not compacted:
+            # Background memory accumulation. The fire-and-forget reconcile
+            # uses the durable transcript window — no buffer to maintain —
+            # and intentionally does NOT evict the per-session memory
+            # context cache. New facts land in the long-term store
+            # immediately for OTHER sessions; THIS session sees them at
+            # the next compaction.
+            self._maybe_fire_async_reconcile(session_id, state)
+
+        if compacted:
+            to_compact = self._messages_to_compact(state)
+            compacted_state = await self._compact_session(session_id, state)
+            if compacted_state.last_compact_turn != state.last_compact_turn:
+                state = compacted_state
                 # Compaction is the natural moment to reconcile the older
                 # transcript window into long-term memory: the reconciler
                 # LLM call colocates with the summary write, both touching
@@ -561,16 +885,140 @@ class PersistentAgent:
                     # don't repeat. Only fire here when this turn didn't
                     # already write.
                     try:
-                        await self._memory.write_run_end(
-                            goal=message,
-                            agent_results=[
-                                final_result or {"error": errors[-1] if errors else "no result"}
-                            ],
-                            trace=trace,
+                        await self._write_session_window_to_memory(
+                            session_id=session_id,
+                            messages=to_compact,
+                            goal_fallback=message,
+                        )
+                        state = await self._session_store.mark_reconciled(
+                            session_id, state.turn_count
                         )
                     except Exception:  # noqa: BLE001 — best-effort at compaction
                         pass
                 self._evict_session_memory_context(session_id)
+
+        await self._record_turn_usage(
+            session_id=session_id,
+            guard=usage_guard,
+            usage_before=usage_before,
+        )
+
+    async def _record_turn_usage(
+        self,
+        *,
+        session_id: str,
+        guard: Any | None,
+        usage_before: tuple[int, int],
+    ) -> None:
+        if guard is None or not hasattr(guard, "snapshot"):
+            return
+        snapshot = guard.snapshot()
+        tokens_in = int(snapshot.get("tokens_in") or 0) - usage_before[0]
+        tokens_out = int(snapshot.get("tokens_out") or 0) - usage_before[1]
+        if tokens_in <= 0 and tokens_out <= 0:
+            return
+        usage = dict(snapshot)
+        usage["tokens_in"] = max(tokens_in, 0)
+        usage["tokens_out"] = max(tokens_out, 0)
+        usage["total_tokens"] = usage["tokens_in"] + usage["tokens_out"]
+        await self._session_store.record_usage(
+            session_id,
+            tokens_in=usage["tokens_in"],
+            tokens_out=usage["tokens_out"],
+            usage=usage,
+        )
+
+    async def _compact_session(self, session_id: str, state: SessionState) -> SessionState:
+        to_compact, keep_last = self._compaction_split(state)
+        if not to_compact:
+            return state
+        summary = await self._summarize_session(state, messages_to_compact=to_compact)
+        state = await self._session_store.update_summary(session_id, summary)
+        state = await self._session_store.trim_messages(session_id, keep_last)
+        state = await self._session_store.mark_compacted(session_id, state.turn_count)
+        return state
+
+    def _messages_to_compact(self, state: SessionState) -> list[SessionMessage]:
+        return self._compaction_split(state)[0]
+
+    def _compaction_split(self, state: SessionState) -> tuple[list[SessionMessage], int]:
+        """Return ``(messages_to_compact, keep_last_count)``.
+
+        Retention is token-budget based: keep newest messages until adding
+        another would exceed ``retain_context_fraction`` of the coordinator's
+        input budget. If no budget is advertised, compact the full verbatim
+        transcript into the summary.
+        """
+        if not state.messages:
+            return [], 0
+        budget = self._coordinator_input_token_budget()
+        if budget is None:
+            return list(state.messages), 0
+        retain_tokens = int(budget * self._config.retain_context_fraction)
+        if retain_tokens <= 0:
+            return list(state.messages), 0
+
+        kept_tokens = 0
+        keep_last = 0
+        for message in reversed(state.messages):
+            tokens = self._message_token_count(message)
+            if keep_last and kept_tokens + tokens > retain_tokens:
+                break
+            if not keep_last and tokens > retain_tokens:
+                # Always keep the newest message, even if it alone exceeds
+                # the retention target. Dropping the latest assistant reply
+                # makes resumption feel broken and loses immediate context.
+                keep_last = 1
+                break
+            kept_tokens += tokens
+            keep_last += 1
+
+        if keep_last >= len(state.messages):
+            return [], len(state.messages)
+        return state.messages[:-keep_last] if keep_last else list(state.messages), keep_last
+
+    def _messages_since_reconcile(self, state: SessionState) -> list[SessionMessage]:
+        if state.last_reconcile_turn <= 0:
+            return list(state.messages)
+        user_messages = sum(1 for message in state.messages if message.role == "user")
+        current_turn = state.turn_count - user_messages
+        pending: list[SessionMessage] = []
+        for message in state.messages:
+            if message.role == "user":
+                current_turn += 1
+            if current_turn > state.last_reconcile_turn:
+                pending.append(message)
+        return pending
+
+    async def _write_session_window_to_memory(
+        self,
+        *,
+        session_id: str,
+        messages: Sequence[SessionMessage],
+        goal_fallback: str,
+    ) -> None:
+        last_user = next((m.content for m in reversed(messages) if m.role == "user"), "")
+        last_assistant = next((m.content for m in reversed(messages) if m.role == "assistant"), "")
+        trace = [
+            {
+                "type": m.role,
+                "content": m.content,
+                "timestamp": m.created_at,
+            }
+            for m in messages
+        ]
+        await self._memory.write_run_end(
+            goal=str(last_user) if last_user else goal_fallback,
+            agent_results=[
+                {
+                    "agent_id": self._coordinator.config.agent_id,
+                    "answer": str(last_assistant),
+                    "confidence": 1.0,
+                    "session_id": session_id,
+                }
+            ],
+            trace=trace,
+        )
 
     async def _get_session_memory_context(self, session_id: str, *, message: str) -> str:
         """Return the per-session memory-context blob (cached).
@@ -661,30 +1109,113 @@ class PersistentAgent:
         subagents_used: set[str],
         errors: list[str],
     ) -> bool:
-        """High-signal-only reconciliation policy.
+        """User-intent-only immediate reconciliation policy.
 
-        The previous policy also fired periodically (every
-        ``reconcile_every_turns`` turns), which wrote to long-term memory
-        mid-compaction-window and invalidated the next turn's system
-        prompt — breaking the prefix cache between every reconcile and the
-        following turn. The session transcript already journals every
-        turn to SQLite, so periodic mid-window writes added cost without
-        information.
+        Compaction handles bulk reconciliation when context pressure
+        forces a summary LLM call (the same boundary already pays a
+        cache miss). Tool runs / sub-agent runs / errors used to also
+        trigger reconciliation here, but their facts are mostly
+        situational (this run's outputs) — the session transcript
+        captures them within the session, and the next compaction
+        boundary folds them into long-term memory. Bypassing
+        compaction for every tool run was just trashing the cache for
+        marginal cross-session benefit.
 
-        We now reconcile only on high-signal events (tool/sub-agent runs,
-        errors, user "remember" terms). Everything else defers to
-        compaction, where reconciliation runs alongside the summary LLM
-        call — both write boundaries collapse into one cache-miss event.
+        What stays: user-explicit signals like "remember X", "always do
+        Y", "I prefer Z" — these are cross-session by nature and should
+        persist immediately even if it costs a cache miss.
         """
-        if tools_used or subagents_used or errors:
-            return True
         lower = message.lower()
         return any(term in lower for term in self._config.durable_signal_terms)
 
     def _should_compact(self, state: SessionState) -> bool:
-        if len(state.messages) > self._config.compact_message_threshold:
-            return True
-        return state.turn_count - state.last_compact_turn >= self._config.compact_every_turns
+        """Context-pressure trigger — fires when the accumulated transcript
+        (rolling summary + verbatim history) crosses
+        ``compact_at_context_fraction`` of the coordinator's
+        ``llm.input_token_budget``.
+
+        Replaces the previous turn-count / message-count triggers, which
+        fired every N turns regardless of actual size. Plain chat
+        sessions (~20 tokens/turn) now go thousands of turns between
+        compactions; browser-heavy research sessions (~3K tokens/turn)
+        compact only when budget pressure forces it.
+        """
+        budget = self._coordinator_input_token_budget()
+        if budget is None:
+            # Adapter doesn't expose ``input_token_budget`` (custom stub
+            # or older client) — never auto-compact; rely on explicit
+            # signals only.
+            return False
+        threshold = int(budget * self._config.compact_at_context_fraction)
+        if threshold <= 0:
+            return False
+        return self._transcript_token_count(state) >= threshold
+
+    def _coordinator_input_token_budget(self) -> int | None:
+        """Read the coordinator LLM's input budget. Falls back to ``None``
+        when the adapter doesn't advertise one."""
+        llm = getattr(self._coordinator, "_llm", None) or self._llm
+        budget = getattr(llm, "input_token_budget", None)
+        return int(budget) if isinstance(budget, int) and budget > 0 else None
+
+    def _transcript_token_count(self, state: SessionState) -> int:
+        """Cheap chars/4 token estimate over the rolling summary +
+        accumulated transcript. Same heuristic ``WorkingMemory`` uses
+        when no exact counter is wired, so the threshold maps coherently
+        to the LLM's eviction behaviour."""
+        total = 0
+        if state.summary:
+            total += max(1, len(state.summary) // 4)
+        for msg in state.messages:
+            total += self._message_token_count(msg)
+        return total
+
+    def _message_token_count(self, message: SessionMessage) -> int:
+        content = message.content if isinstance(message.content, str) else str(message.content)
+        return max(1, len(content) // 4)
+
+    def _maybe_fire_async_reconcile(self, session_id: str, state: SessionState) -> None:
+        """Background reconcile every ``async_reconcile_every_turns`` turns.
+
+        Samples the durable session transcript directly — no separate
+        evidence buffer to maintain. Fires ``write_run_end`` via
+        ``fire()`` so the chat turn never blocks on the reconciler LLM
+        call, and crucially does NOT evict the per-session memory
+        context cache. The session's prompt prefix therefore stays
+        byte-identical → prefix cache keeps hitting.
+
+        New facts land in the long-term store immediately for other
+        sessions; THIS session sees them at the next compaction (where
+        the cache is already breaking for the summary refresh anyway).
+        """
+        interval = self._config.async_reconcile_every_turns
+        if interval <= 0:
+            return
+        if state.turn_count == 0 or state.turn_count % interval != 0:
+            return
+
+        # Sample the last N turn-pairs (= 2N messages) from the durable
+        # transcript. Each turn is one user message + one assistant
+        # reply; the reconciler sees a coherent slice of conversation
+        # and can make MERGE / NOOP / UPDATE decisions across it.
+        window = state.messages[-(2 * interval) :]
+        if not window:
+            return
+        fire(self._async_reconcile_window(session_id, turn_count=state.turn_count, window=window))
+
+    async def _async_reconcile_window(
+        self,
+        session_id: str,
+        *,
+        turn_count: int,
+        window: Sequence[SessionMessage],
+    ) -> None:
+        await self._write_session_window_to_memory(
+            session_id=session_id,
+            messages=window,
+            goal_fallback="(background session reconcile)",
+        )
+        await self._session_store.mark_reconciled(session_id, turn_count)
 
     async def _summarize_session(
         self,
@@ -734,6 +1265,11 @@ def _copy_state(state: SessionState) -> SessionState:
         turn_count=state.turn_count,
         last_reconcile_turn=state.last_reconcile_turn,
         last_compact_turn=state.last_compact_turn,
+        tokens_in_total=state.tokens_in_total,
+        tokens_out_total=state.tokens_out_total,
+        last_run_tokens_in=state.last_run_tokens_in,
+        last_run_tokens_out=state.last_run_tokens_out,
+        last_usage=dict(state.last_usage),
         updated_at=state.updated_at,
     )
 
@@ -748,6 +1284,15 @@ def _event_to_trace(event: BusEvent) -> dict[str, Any]:
         "error": event.error,
         "timestamp": event.timestamp,
     }
+
+
+def _guard_token_totals(guard: Any | None) -> tuple[int, int]:
+    if guard is None:
+        return (0, 0)
+    return (
+        int(getattr(guard, "tokens_in", 0) or 0),
+        int(getattr(guard, "tokens_out", 0) or 0),
+    )
 
 
 def _describe_agent(agent: BaseAgent) -> dict[str, Any]:

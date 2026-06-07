@@ -39,12 +39,16 @@ from pathlib import Path
 from uuid import uuid4
 
 from mcp import StdioServerParameters
+from prompt_toolkit import PromptSession
+from prompt_toolkit.history import FileHistory
 
 from agents.base import AgentConfig, BaseAgent
 from harness.console import ConsoleRenderer
 from harness.events import EventType
 from harness.executor_bridge import ExecutorBridge, ExecutorConfig, ExecutorTool, find_executor
 from harness.persistent import PersistentAgent, PersistentAgentConfig, SQLiteSessionStore
+from harness.persistent_completion import SlashCommandCompleter
+from harness.persistent_controls import PersistentCommandHandler
 from harness.runtime import BudgetGuard, GuardrailConfig, Tracer
 from memory.manager import MemoryManager
 from memory.stores import SQLiteSemanticStore
@@ -158,6 +162,15 @@ def _parse_args() -> argparse.Namespace:
             "what the researcher does; defaults to headless."
         ),
     )
+    parser.add_argument(
+        "--time-budget-seconds",
+        type=int,
+        default=int(os.environ.get("AGENT_TIME_BUDGET_SECONDS", "300")),
+        help=(
+            "Per-turn wall-time budget for coordinator + sub-agents. "
+            "Defaults to AGENT_TIME_BUDGET_SECONDS or 300."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -255,7 +268,11 @@ async def main() -> None:
         memory_scope="persistent-demo",
         memory_subject="persistent-demo",
     )
-    guard = BudgetGuard(GuardrailConfig(max_total_cost_usd=2.0, max_wall_time_seconds=120))
+    guard_config = GuardrailConfig(
+        max_total_cost_usd=2.0,
+        max_wall_time_seconds=args.time_budget_seconds,
+    )
+    guard = BudgetGuard(guard_config)
     shell_tool = ExecutorTool(
         "shell",
         "shell",
@@ -329,22 +346,45 @@ async def main() -> None:
         )
 
         session_id = f"sess_{uuid4().hex[:12]}" if args.new_session else args.session_id
+        persistent_config = PersistentAgentConfig(
+            # Defaults are sensible — explicit here for visibility.
+            # ``compact_at_context_fraction=0.5`` reads
+            # ``coordinator._llm.input_token_budget`` (~123K for
+            # gpt-5.4-mini) so compaction fires only under real
+            # context pressure, not on arbitrary turn counts.
+            # ``retain_context_fraction=0.15`` keeps the newest ~15%
+            # of the model's input budget verbatim after compaction
+            # and folds older messages into the rolling summary.
+            # ``async_reconcile_every_turns=10`` runs a non-blocking
+            # background ``write_run_end`` every 10 turns over the
+            # last 10 turn-pairs from the durable transcript —
+            # memory accumulates without thrashing the prefix cache.
+            compact_at_context_fraction=0.5,
+            retain_context_fraction=0.15,
+            async_reconcile_every_turns=10,
+        )
         app = PersistentAgent(
             coordinator=coordinator,
             session_store=SQLiteSessionStore(session_path),
             memory=memory,
             llm=llm,
-            guard_factory=lambda: BudgetGuard(
-                GuardrailConfig(max_total_cost_usd=2.0, max_wall_time_seconds=120)
-            ),
-            config=PersistentAgentConfig(
-                recent_messages=8,
-                reconcile_every_turns=6,
-                compact_every_turns=12,
-                compact_message_threshold=24,
-            ),
+            guard_factory=lambda: BudgetGuard(guard_config),
+            config=persistent_config,
         )
         renderer = ConsoleRenderer()
+        controls = PersistentCommandHandler(app)
+        # prompt_toolkit input: Tab-complete slash commands via
+        # ``SlashCommandCompleter`` (commands + session-id arguments) and
+        # persist command history across runs in ``state_dir``. Falls back
+        # to the framework default of complete-on-tab so we don't query
+        # the session store on every keystroke.
+        history_path = Path(args.state_dir).expanduser() / "demo_history"
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+        prompt_session: PromptSession[str] = PromptSession(
+            history=FileHistory(str(history_path)),
+            completer=SlashCommandCompleter(app),
+            complete_while_typing=False,
+        )
 
         print("Persistent agent ready.")
         print(f"Session: {session_id}")
@@ -353,22 +393,32 @@ async def main() -> None:
         print(f"Semantic memory: {semantic_path}")
         print(f"Episodic memory: {lance_path} ({embedder_kind})")
         print(f"Shell executor: {executor}")
+        print(f"Turn time budget: {args.time_budget_seconds}s")
         print(f"Browser tools: {len(browser_tools)} ({'headed' if args.headed else 'headless'})")
         print("\nSystem prompt:")
         print(SYSTEM_PROMPT)
         if args.show_capabilities:
             print("\nCapabilities:")
             print(json.dumps(app.capabilities(), indent=2, default=str))
-        print("\nType a message. Use Ctrl-D or an empty line to exit.\n")
+        print("\nType a message. Use /help for controls. Ctrl-D, /end, or an empty line exits.\n")
 
         while True:
             try:
-                message = input("> ").strip()
-            except EOFError:
+                message = (await prompt_session.prompt_async("> ")).strip()
+            except (EOFError, KeyboardInterrupt):
                 print()
                 return
             if not message:
                 return
+            command_result = await controls.handle(message, session_id=session_id)
+            if command_result.session_id is not None:
+                session_id = command_result.session_id
+            if command_result.text:
+                print(command_result.text)
+            if command_result.should_exit:
+                return
+            if command_result.handled:
+                continue
 
             final_answer = ""
             async for event in app.chat(message, session_id=session_id):
