@@ -142,6 +142,33 @@ async def test_sqlite_session_store_persists_messages(tmp_path):
     assert [m.content for m in state.messages] == ["hello", "hi"]
 
 
+@pytest.mark.asyncio
+async def test_sqlite_session_store_lists_clears_and_deletes_sessions(tmp_path):
+    path = tmp_path / "sessions.sqlite"
+    store = SQLiteSessionStore(path)
+    await store.append_messages(
+        "alpha",
+        [
+            SessionMessage(role="user", content="hello"),
+            SessionMessage(role="assistant", content="hi"),
+        ],
+    )
+    await store.append_messages("beta", [SessionMessage(role="user", content="question")])
+
+    listed = await store.list_sessions()
+    assert {state.session_id for state in listed} == {"alpha", "beta"}
+
+    cleared = await store.clear("alpha")
+    assert cleared.messages == []
+    assert cleared.summary == ""
+    assert cleared.turn_count == 0
+    assert cleared.last_reconcile_turn == 0
+    assert cleared.last_compact_turn == 0
+    assert await store.delete("alpha") is True
+    assert await store.delete("missing") is False
+    assert {state.session_id for state in await store.list_sessions()} == {"beta"}
+
+
 def test_persistent_demo_parser_accepts_session_controls(monkeypatch):
     monkeypatch.setattr(
         "sys.argv",
@@ -264,6 +291,36 @@ def test_persistent_agent_forget_memory_cache_evicts_session_context():
     app.forget_memory_cache("s")
 
     assert app.cached_memory_context("s") is None
+
+
+@pytest.mark.asyncio
+async def test_persistent_agent_lists_clears_and_deletes_sessions():
+    llm = _ChatLLM()
+    memory = _SpyMemory(llm)
+    store = InMemorySessionStore()
+    await store.append_messages("s", [SessionMessage(role="user", content="hello")])
+    app = PersistentAgent(
+        coordinator=_agent(llm=llm, memory=memory),
+        session_store=store,
+        memory=memory,
+        llm=llm,
+    )
+    app._session_memory_context["s"] = "cached"
+
+    assert await app.session_exists("s") is True
+    assert await app.session_exists("missing") is False
+    assert [state.session_id for state in await app.list_sessions()] == ["s"]
+
+    cleared = await app.clear_session("s")
+    assert cleared.messages == []
+    assert cleared.turn_count == 0
+    assert app.cached_memory_context("s") is None
+
+    app._session_memory_context["s"] = "cached"
+    assert await app.delete_session("s") is True
+    assert await app.delete_session("s") is False
+    assert app.cached_memory_context("s") is None
+    assert await app.list_sessions() == []
 
 
 @pytest.mark.asyncio

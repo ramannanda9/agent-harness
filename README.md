@@ -647,10 +647,13 @@ Persistent sessions also expose a small control surface for user interfaces:
 
 ```python
 state = await app.session_state("thread-1")
+sessions = await app.list_sessions()
 cached = app.cached_memory_context("thread-1")
 await app.save_to_memory("thread-1")   # reconcile pending turns, keep cache warm
 await app.force_compact("thread-1")    # structural reorg (summary + trim + reconcile + evict)
 app.forget_memory_cache("thread-1")
+await app.clear_session("thread-1")    # clear transcript only; memory retained
+await app.delete_session("thread-1")   # delete transcript only; memory retained
 ```
 
 There is deliberately no `close()` method — the SQLite transcript is the
@@ -662,11 +665,15 @@ The demo maps those primitives to slash commands:
 
 - `/capabilities`, `/agents`, `/mcp` inspect wired agents and tools
 - `/session` shows turns, context-pressure estimate, reconcile cadence, and summary
+- `/sessions` lists known session ids
 - `/memory` shows the cached per-session memory context
 - `/save` flushes turns after the last reconcile checkpoint into long-term memory **without** evicting the cached prior (foreground prefix stays warm)
 - `/compact` forces a structural reorg — summary + trim + reconcile + cache evict — used when the transcript is bloating, not for routine "save"
 - `/forget` evicts cached memory context so the next turn refetches it
-- `/new` starts a fresh session id (the previous transcript stays in SQLite, addressable by its id)
+- `/switch <id>` resumes or creates a logical session id
+- `/new [id]` starts a fresh session id and refuses to collide with an existing id
+- `/clear confirm` clears the current transcript/summary/counters; long-term memory is retained
+- `/delete [id] confirm` deletes a transcript row; long-term memory is retained
 - `/end` exits the demo — no auto-flush; call `/save` first if you want pending facts persisted
 
 Each chat turn gets a fresh `WorkingMemory`. Continuity comes from the

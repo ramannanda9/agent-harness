@@ -48,6 +48,8 @@ class SessionState:
 class SessionStore(Protocol):
     async def load(self, session_id: str) -> SessionState: ...
 
+    async def list_sessions(self) -> list[SessionState]: ...
+
     async def append_messages(
         self, session_id: str, messages: Sequence[SessionMessage]
     ) -> SessionState: ...
@@ -59,6 +61,10 @@ class SessionStore(Protocol):
     async def mark_reconciled(self, session_id: str, turn_count: int) -> SessionState: ...
 
     async def mark_compacted(self, session_id: str, turn_count: int) -> SessionState: ...
+
+    async def clear(self, session_id: str) -> SessionState: ...
+
+    async def delete(self, session_id: str) -> bool: ...
 
 
 class InMemorySessionStore:
@@ -73,6 +79,13 @@ class InMemorySessionStore:
             state = SessionState(session_id=session_id)
             self._sessions[session_id] = state
         return _copy_state(state)
+
+    async def list_sessions(self) -> list[SessionState]:
+        return sorted(
+            (_copy_state(state) for state in self._sessions.values()),
+            key=lambda state: state.updated_at,
+            reverse=True,
+        )
 
     async def append_messages(
         self, session_id: str, messages: Sequence[SessionMessage]
@@ -108,6 +121,19 @@ class InMemorySessionStore:
         state.updated_at = _now()
         return _copy_state(state)
 
+    async def clear(self, session_id: str) -> SessionState:
+        state = self._sessions.setdefault(session_id, SessionState(session_id=session_id))
+        state.summary = ""
+        state.messages = []
+        state.turn_count = 0
+        state.last_reconcile_turn = 0
+        state.last_compact_turn = 0
+        state.updated_at = _now()
+        return _copy_state(state)
+
+    async def delete(self, session_id: str) -> bool:
+        return self._sessions.pop(session_id, None) is not None
+
 
 class SQLiteSessionStore:
     """Durable local session store using stdlib SQLite."""
@@ -121,6 +147,18 @@ class SQLiteSessionStore:
         with self._connect() as conn:
             self._ensure_session(conn, session_id)
             return self._load_locked(conn, session_id)
+
+    async def list_sessions(self) -> list[SessionState]:
+        self._ensure_schema()
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT session_id
+                FROM sessions
+                ORDER BY updated_at DESC, session_id ASC
+                """
+            ).fetchall()
+            return [self._load_locked(conn, row["session_id"]) for row in rows]
 
     async def append_messages(
         self, session_id: str, messages: Sequence[SessionMessage]
@@ -193,6 +231,38 @@ class SQLiteSessionStore:
 
     async def mark_compacted(self, session_id: str, turn_count: int) -> SessionState:
         return await self._mark(session_id, "last_compact_turn", turn_count)
+
+    async def clear(self, session_id: str) -> SessionState:
+        self._ensure_schema()
+        with self._connect() as conn:
+            self._ensure_session(conn, session_id)
+            conn.execute("DELETE FROM session_messages WHERE session_id = ?", (session_id,))
+            conn.execute(
+                """
+                UPDATE sessions
+                SET summary = '',
+                    turn_count = 0,
+                    last_reconcile_turn = 0,
+                    last_compact_turn = 0,
+                    updated_at = ?
+                WHERE session_id = ?
+                """,
+                (_now(), session_id),
+            )
+            return self._load_locked(conn, session_id)
+
+    async def delete(self, session_id: str) -> bool:
+        self._ensure_schema()
+        with self._connect() as conn:
+            existing = conn.execute(
+                "SELECT 1 FROM sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if existing is None:
+                return False
+            conn.execute("DELETE FROM session_messages WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+            return True
 
     async def _mark(self, session_id: str, column: str, turn_count: int) -> SessionState:
         self._ensure_schema()
@@ -478,6 +548,14 @@ class PersistentAgent:
         """Return a copy of the durable session state."""
         return await self._session_store.load(session_id)
 
+    async def list_sessions(self) -> list[SessionState]:
+        """Return known durable sessions, newest first when supported by the store."""
+        return await self._session_store.list_sessions()
+
+    async def session_exists(self, session_id: str) -> bool:
+        """Return whether a session exists without creating it."""
+        return any(state.session_id == session_id for state in await self.list_sessions())
+
     def cached_memory_context(self, session_id: str) -> str | None:
         """Return the currently cached memory-context blob for a session, if any."""
         return self._session_memory_context.get(session_id)
@@ -538,6 +616,26 @@ class PersistentAgent:
         )
         await self._session_store.mark_reconciled(session_id, state.turn_count)
         return len(window)
+
+    async def clear_session(self, session_id: str) -> SessionState:
+        """Clear transcript/summary/counters for a session.
+
+        Long-term semantic/episodic memory is intentionally retained; this
+        only resets the durable chat workspace for ``session_id``.
+        """
+        state = await self._session_store.clear(session_id)
+        self._evict_session_memory_context(session_id)
+        return state
+
+    async def delete_session(self, session_id: str) -> bool:
+        """Delete a session transcript/summary row.
+
+        Long-term semantic/episodic memory is intentionally retained.
+        Returns ``True`` when a session existed and was deleted.
+        """
+        deleted = await self._session_store.delete(session_id)
+        self._evict_session_memory_context(session_id)
+        return deleted
 
     def _assign_guard(self, guard: Any) -> None:
         seen_agents: set[int] = set()

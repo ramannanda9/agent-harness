@@ -303,6 +303,32 @@ def _print_memory(app: PersistentAgent, *, session_id: str) -> None:
         print(context)
 
 
+def _session_arg(command: str, message: str) -> str:
+    arg = message[len(command) :].strip()
+    if not arg:
+        return ""
+    parts = arg.split()
+    if len(parts) != 1:
+        raise ValueError("session ids cannot contain whitespace")
+    if parts[0].startswith("/"):
+        raise ValueError("session ids cannot start with '/'")
+    return parts[0]
+
+
+async def _print_sessions(app: PersistentAgent, *, current_session_id: str) -> None:
+    sessions = await app.list_sessions()
+    if not sessions:
+        print("No sessions found.")
+        return
+    for state in sessions:
+        marker = "*" if state.session_id == current_session_id else " "
+        summary = state.summary or "(no summary)"
+        if len(summary) > 80:
+            summary = summary[:77] + "..."
+        print(f"{marker} {state.session_id}  turns={state.turn_count}  updated={state.updated_at}")
+        print(f"    {summary}")
+
+
 async def _handle_slash_command(
     message: str,
     *,
@@ -320,7 +346,11 @@ async def _handle_slash_command(
         print("Memory:   /save     reconcile recent turns into long-term memory")
         print("          /compact  structural reorg: summary + trim + reconcile")
         print("          /forget   drop this session's cached memory prior")
-        print("Session:  /new      start a fresh session id")
+        print("Session:  /sessions list known sessions")
+        print("          /switch <id> switch to an existing or new logical session")
+        print("          /new [id] create a new session; refuses if id exists")
+        print("          /clear confirm clear current transcript; memory retained")
+        print("          /delete [id] confirm delete transcript; memory retained")
         print("          /end      exit the demo; transcript stays in SQLite")
     elif command == "/capabilities":
         _print_capabilities(app)
@@ -332,6 +362,8 @@ async def _handle_slash_command(
         await _print_session(app, session_id=session_id, config=config, llm=llm)
     elif command == "/memory":
         _print_memory(app, session_id=session_id)
+    elif command == "/sessions":
+        await _print_sessions(app, current_session_id=session_id)
     elif command == "/save":
         count = await app.save_to_memory(session_id)
         if count:
@@ -344,9 +376,63 @@ async def _handle_slash_command(
     elif command == "/forget":
         app.forget_memory_cache(session_id)
         print(f"forgot cached memory context for session {session_id}")
+    elif command == "/switch":
+        try:
+            next_session_id = _session_arg(command, message)
+        except ValueError as exc:
+            print(f"cannot switch session: {exc}")
+            return True, session_id, False
+        if not next_session_id:
+            print("usage: /switch <session_id>")
+            return True, session_id, False
+        existed = await app.session_exists(next_session_id)
+        # ``session_state`` intentionally creates the row if it is missing,
+        # so switching to a new logical workspace makes it visible in
+        # /sessions immediately.
+        await app.session_state(next_session_id)
+        session_id = next_session_id
+        print(f"{'resumed' if existed else 'created'} session: {session_id}")
     elif command == "/new":
-        session_id = f"sess_{uuid4().hex[:12]}"
+        try:
+            requested_session_id = _session_arg(command, message)
+        except ValueError as exc:
+            print(f"cannot create session: {exc}")
+            return True, session_id, False
+        next_session_id = requested_session_id or f"sess_{uuid4().hex[:12]}"
+        if await app.session_exists(next_session_id):
+            print(f"session already exists: {next_session_id}")
+            print(f"use /switch {next_session_id} to resume it")
+            return True, session_id, False
+        await app.session_state(next_session_id)
+        session_id = next_session_id
         print(f"new session: {session_id} (previous transcript preserved in SQLite)")
+    elif command == "/clear":
+        if message.strip() != "/clear confirm":
+            print("usage: /clear confirm")
+            print(f"clears transcript for {session_id}; long-term memory is retained")
+            return True, session_id, False
+        await app.clear_session(session_id)
+        print(f"cleared session {session_id} transcript; long-term memory retained")
+    elif command == "/delete":
+        raw = message[len(command) :].strip()
+        parts = raw.split()
+        if parts == ["confirm"]:
+            delete_session_id = session_id
+        elif len(parts) == 2 and parts[1] == "confirm" and not parts[0].startswith("/"):
+            delete_session_id = parts[0]
+        else:
+            print("usage: /delete confirm OR /delete <session_id> confirm")
+            print("deletes transcript only; long-term memory is retained")
+            return True, session_id, False
+        deleted = await app.delete_session(delete_session_id)
+        if not deleted:
+            print(f"session not found: {delete_session_id}")
+            return True, session_id, False
+        print(f"deleted session {delete_session_id}; long-term memory retained")
+        if delete_session_id == session_id:
+            session_id = "default"
+            await app.session_state(session_id)
+            print(f"switched to session: {session_id}")
     elif command == "/end":
         print(f"exiting; session {session_id} transcript preserved for next run")
         return True, session_id, True
