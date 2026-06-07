@@ -132,3 +132,25 @@ async def test_command_handler_save_clear_delete_and_end():
 
     ended = await handler.handle("/end", session_id="default")
     assert ended.should_exit is True
+
+
+@pytest.mark.asyncio
+async def test_command_handler_usage_displays_session_totals():
+    app, _, _llm = _app()
+    handler = PersistentCommandHandler(app)
+    await app.session_state("usage")
+    await app._session_store.record_usage(
+        "usage",
+        tokens_in=123,
+        tokens_out=45,
+        usage={
+            "tokens_in": 123,
+            "tokens_out": 45,
+            "breakdown": {"agent:coordinator": {"tokens_in": 123, "tokens_out": 45}},
+        },
+    )
+
+    result = await handler.handle("/usage", session_id="usage")
+
+    assert "total tokens: in=123 out=45" in result.text
+    assert "agent:coordinator" in result.text

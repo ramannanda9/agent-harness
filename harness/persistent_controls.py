@@ -53,6 +53,8 @@ class PersistentCommandHandler:
             return self._result(session_id, await self._format_session(session_id))
         if command == "/memory":
             return self._result(session_id, _format_memory(self._app, session_id=session_id))
+        if command == "/usage":
+            return self._result(session_id, await self._format_usage(session_id))
         if command == "/sessions":
             query = message[len(command) :].strip() or None
             return self._result(
@@ -122,12 +124,36 @@ class PersistentCommandHandler:
                 f"session_id: {state.session_id}",
                 f"turns: {state.turn_count}",
                 f"transcript: {token_line}",
+                f"usage total: in={state.tokens_in_total:,} out={state.tokens_out_total:,}",
+                f"last run: in={state.last_run_tokens_in:,} out={state.last_run_tokens_out:,}",
                 f"last reconcile turn: {state.last_reconcile_turn or 'never'}",
                 f"next async reconcile: {reconcile}",
                 f"last compaction turn: {state.last_compact_turn or 'never'}",
                 f"summary: {state.summary or '(none)'}",
             ]
         )
+
+    async def _format_usage(self, session_id: str) -> str:
+        state = await self._app.session_state(session_id)
+        lines = [
+            f"session_id: {state.session_id}",
+            f"total tokens: in={state.tokens_in_total:,} out={state.tokens_out_total:,}",
+            f"last run: in={state.last_run_tokens_in:,} out={state.last_run_tokens_out:,}",
+        ]
+        breakdown = (
+            state.last_usage.get("breakdown") if isinstance(state.last_usage, dict) else None
+        )
+        if isinstance(breakdown, dict) and breakdown:
+            lines.append("last run breakdown:")
+            width = max(len(str(name)) for name in breakdown)
+            for source, stats in breakdown.items():
+                if not isinstance(stats, dict):
+                    continue
+                lines.append(
+                    f"  {source:<{width}} in={int(stats.get('tokens_in') or 0):,} "
+                    f"out={int(stats.get('tokens_out') or 0):,}"
+                )
+        return "\n".join(lines)
 
     async def _switch(
         self,
@@ -206,7 +232,7 @@ class PersistentCommandHandler:
 def _help_text() -> str:
     return "\n".join(
         [
-            "Inspect:  /capabilities, /agents, /mcp, /session, /memory",
+            "Inspect:  /capabilities, /agents, /mcp, /session, /memory, /usage",
             "Memory:   /save     reconcile recent turns into long-term memory",
             "          /compact  structural reorg: summary + trim + reconcile",
             "          /forget   drop this session's cached memory prior",

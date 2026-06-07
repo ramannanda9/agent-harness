@@ -647,6 +647,7 @@ Persistent sessions also expose a small control surface for user interfaces:
 
 ```python
 state = await app.session_state("thread-1")
+print(state.tokens_in_total, state.tokens_out_total)
 sessions = await app.list_sessions()
 matches = await app.list_sessions(query="research")
 cached = app.cached_memory_context("thread-1")
@@ -680,6 +681,7 @@ The demo uses that utility for:
 
 - `/capabilities`, `/agents`, `/mcp` inspect wired agents and tools
 - `/session` shows turns, context-pressure estimate, reconcile cadence, and summary
+- `/usage` shows persisted total and last-run provider-reported token usage
 - `/sessions [query]` lists known session ids, optionally filtered by id text
 - `/memory` shows the cached per-session memory context
 - `/save` flushes turns after the last reconcile checkpoint into long-term memory **without** evicting the cached prior (foreground prefix stays warm)

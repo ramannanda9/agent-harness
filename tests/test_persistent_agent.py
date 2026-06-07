@@ -106,6 +106,21 @@ class _ToolLLM(_ChatLLM):
         return {"thought": "done", "action": "finish", "answer": "used tool", "confidence": 0.9}
 
 
+class _UsageLLM(_ChatLLM):
+    def __init__(self) -> None:
+        super().__init__()
+        self._budget = None
+
+    def set_budget(self, guard: Any) -> None:
+        self._budget = guard
+
+    async def complete(self, system, messages, **kwargs):
+        if self._budget is not None:
+            self._budget.add_tokens(100, 25, source=kwargs.get("source"))
+        self.last_usage = {"tokens_in": 100, "tokens_out": 25}
+        return await super().complete(system, messages, **kwargs)
+
+
 def _agent(*, llm: Any, memory: MemoryManager, tools: dict[str, Any] | None = None) -> BaseAgent:
     return BaseAgent(
         config=AgentConfig(
@@ -160,6 +175,17 @@ async def test_sqlite_session_store_lists_clears_and_deletes_sessions(tmp_path):
     assert await store.exists("alpha") is True
     assert await store.exists("missing") is False
     assert [state.session_id for state in await store.list_sessions(query="alp")] == ["alpha"]
+    usage = await store.record_usage(
+        "alpha",
+        tokens_in=12,
+        tokens_out=5,
+        usage={"tokens_in": 12, "tokens_out": 5, "breakdown": {"agent:a": {"tokens_in": 12}}},
+    )
+    assert usage.tokens_in_total == 12
+    assert usage.tokens_out_total == 5
+    assert usage.last_run_tokens_in == 12
+    assert usage.last_run_tokens_out == 5
+    assert usage.last_usage["breakdown"]["agent:a"]["tokens_in"] == 12
 
     cleared = await store.clear("alpha")
     assert cleared.messages == []
@@ -167,6 +193,9 @@ async def test_sqlite_session_store_lists_clears_and_deletes_sessions(tmp_path):
     assert cleared.turn_count == 0
     assert cleared.last_reconcile_turn == 0
     assert cleared.last_compact_turn == 0
+    assert cleared.tokens_in_total == 0
+    assert cleared.tokens_out_total == 0
+    assert cleared.last_usage == {}
     assert await store.delete("alpha") is True
     assert await store.delete("missing") is False
     assert {state.session_id for state in await store.list_sessions()} == {"beta"}
@@ -521,6 +550,36 @@ async def test_persistent_agent_refreshes_guard_per_turn_for_coordinator_and_sub
     assert sub._guard is created_guards[0]
     assert coordinator._guard is not original_coordinator_guard
     assert sub._guard is not original_sub_guard
+
+
+@pytest.mark.asyncio
+async def test_persistent_agent_records_turn_usage_from_guard():
+    llm = _UsageLLM()
+    memory = _SpyMemory(llm)
+    store = InMemorySessionStore()
+    app = PersistentAgent(
+        coordinator=_agent(llm=llm, memory=memory),
+        session_store=store,
+        memory=memory,
+        llm=llm,
+        guard_factory=lambda: BudgetGuard(
+            GuardrailConfig(max_total_cost_usd=10.0, max_wall_time_seconds=60)
+        ),
+        config=PersistentAgentConfig(
+            compact_at_context_fraction=1.0,
+            async_reconcile_every_turns=0,
+        ),
+    )
+
+    [event async for event in app.chat("hello", session_id="usage")]
+    [event async for event in app.chat("again", session_id="usage")]
+    state = await store.load("usage")
+
+    assert state.tokens_in_total == 200
+    assert state.tokens_out_total == 50
+    assert state.last_run_tokens_in == 100
+    assert state.last_run_tokens_out == 25
+    assert state.last_usage["breakdown"]["agent:coordinator"]["tokens_in"] == 100
 
 
 @pytest.mark.asyncio

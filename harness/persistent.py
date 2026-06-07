@@ -42,6 +42,11 @@ class SessionState:
     turn_count: int = 0
     last_reconcile_turn: int = 0
     last_compact_turn: int = 0
+    tokens_in_total: int = 0
+    tokens_out_total: int = 0
+    last_run_tokens_in: int = 0
+    last_run_tokens_out: int = 0
+    last_usage: dict[str, Any] = field(default_factory=dict)
     updated_at: str = field(default_factory=_now)
 
 
@@ -63,6 +68,15 @@ class SessionStore(Protocol):
     async def mark_reconciled(self, session_id: str, turn_count: int) -> SessionState: ...
 
     async def mark_compacted(self, session_id: str, turn_count: int) -> SessionState: ...
+
+    async def record_usage(
+        self,
+        session_id: str,
+        *,
+        tokens_in: int,
+        tokens_out: int,
+        usage: dict[str, Any],
+    ) -> SessionState: ...
 
     async def clear(self, session_id: str) -> SessionState: ...
 
@@ -130,6 +144,23 @@ class InMemorySessionStore:
         state.updated_at = _now()
         return _copy_state(state)
 
+    async def record_usage(
+        self,
+        session_id: str,
+        *,
+        tokens_in: int,
+        tokens_out: int,
+        usage: dict[str, Any],
+    ) -> SessionState:
+        state = self._sessions.setdefault(session_id, SessionState(session_id=session_id))
+        state.tokens_in_total += int(tokens_in)
+        state.tokens_out_total += int(tokens_out)
+        state.last_run_tokens_in = int(tokens_in)
+        state.last_run_tokens_out = int(tokens_out)
+        state.last_usage = dict(usage)
+        state.updated_at = _now()
+        return _copy_state(state)
+
     async def clear(self, session_id: str) -> SessionState:
         state = self._sessions.setdefault(session_id, SessionState(session_id=session_id))
         state.summary = ""
@@ -137,6 +168,11 @@ class InMemorySessionStore:
         state.turn_count = 0
         state.last_reconcile_turn = 0
         state.last_compact_turn = 0
+        state.tokens_in_total = 0
+        state.tokens_out_total = 0
+        state.last_run_tokens_in = 0
+        state.last_run_tokens_out = 0
+        state.last_usage = {}
         state.updated_at = _now()
         return _copy_state(state)
 
@@ -261,6 +297,40 @@ class SQLiteSessionStore:
     async def mark_compacted(self, session_id: str, turn_count: int) -> SessionState:
         return await self._mark(session_id, "last_compact_turn", turn_count)
 
+    async def record_usage(
+        self,
+        session_id: str,
+        *,
+        tokens_in: int,
+        tokens_out: int,
+        usage: dict[str, Any],
+    ) -> SessionState:
+        self._ensure_schema()
+        with self._connect() as conn:
+            self._ensure_session(conn, session_id)
+            conn.execute(
+                """
+                UPDATE sessions
+                SET tokens_in_total = tokens_in_total + ?,
+                    tokens_out_total = tokens_out_total + ?,
+                    last_run_tokens_in = ?,
+                    last_run_tokens_out = ?,
+                    last_usage_json = ?,
+                    updated_at = ?
+                WHERE session_id = ?
+                """,
+                (
+                    int(tokens_in),
+                    int(tokens_out),
+                    int(tokens_in),
+                    int(tokens_out),
+                    json.dumps(usage, default=str),
+                    _now(),
+                    session_id,
+                ),
+            )
+            return self._load_locked(conn, session_id)
+
     async def clear(self, session_id: str) -> SessionState:
         self._ensure_schema()
         with self._connect() as conn:
@@ -273,6 +343,11 @@ class SQLiteSessionStore:
                     turn_count = 0,
                     last_reconcile_turn = 0,
                     last_compact_turn = 0,
+                    tokens_in_total = 0,
+                    tokens_out_total = 0,
+                    last_run_tokens_in = 0,
+                    last_run_tokens_out = 0,
+                    last_usage_json = '{}',
                     updated_at = ?
                 WHERE session_id = ?
                 """,
@@ -323,10 +398,16 @@ class SQLiteSessionStore:
                     turn_count INTEGER NOT NULL DEFAULT 0,
                     last_reconcile_turn INTEGER NOT NULL DEFAULT 0,
                     last_compact_turn INTEGER NOT NULL DEFAULT 0,
+                    tokens_in_total INTEGER NOT NULL DEFAULT 0,
+                    tokens_out_total INTEGER NOT NULL DEFAULT 0,
+                    last_run_tokens_in INTEGER NOT NULL DEFAULT 0,
+                    last_run_tokens_out INTEGER NOT NULL DEFAULT 0,
+                    last_usage_json TEXT NOT NULL DEFAULT '{}',
                     updated_at TEXT NOT NULL
                 )
                 """
             )
+            self._ensure_usage_columns(conn)
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS session_messages (
@@ -347,6 +428,19 @@ class SQLiteSessionStore:
             )
         self._ready = True
 
+    def _ensure_usage_columns(self, conn: sqlite3.Connection) -> None:
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()}
+        additions = {
+            "tokens_in_total": "INTEGER NOT NULL DEFAULT 0",
+            "tokens_out_total": "INTEGER NOT NULL DEFAULT 0",
+            "last_run_tokens_in": "INTEGER NOT NULL DEFAULT 0",
+            "last_run_tokens_out": "INTEGER NOT NULL DEFAULT 0",
+            "last_usage_json": "TEXT NOT NULL DEFAULT '{}'",
+        }
+        for column, ddl in additions.items():
+            if column not in existing:
+                conn.execute(f"ALTER TABLE sessions ADD COLUMN {column} {ddl}")
+
     def _ensure_session(self, conn: sqlite3.Connection, session_id: str) -> None:
         conn.execute(
             """
@@ -360,7 +454,9 @@ class SQLiteSessionStore:
         row = conn.execute(
             """
             SELECT session_id, summary, turn_count, last_reconcile_turn,
-                   last_compact_turn, updated_at
+                   last_compact_turn, tokens_in_total, tokens_out_total,
+                   last_run_tokens_in, last_run_tokens_out, last_usage_json,
+                   updated_at
             FROM sessions
             WHERE session_id = ?
             """,
@@ -389,6 +485,11 @@ class SQLiteSessionStore:
             turn_count=row["turn_count"],
             last_reconcile_turn=row["last_reconcile_turn"],
             last_compact_turn=row["last_compact_turn"],
+            tokens_in_total=row["tokens_in_total"],
+            tokens_out_total=row["tokens_out_total"],
+            last_run_tokens_in=row["last_run_tokens_in"],
+            last_run_tokens_out=row["last_run_tokens_out"],
+            last_usage=json.loads(row["last_usage_json"] or "{}"),
             updated_at=row["updated_at"],
         )
 
@@ -483,8 +584,13 @@ class PersistentAgent:
         prior_messages, pinned_priors = self._build_prior_messages(
             state, memory_context_text=memory_context_text
         )
+        turn_guard = None
         if self._guard_factory is not None:
-            self._assign_guard(self._guard_factory())
+            turn_guard = self._guard_factory()
+            self._assign_guard(turn_guard)
+        else:
+            turn_guard = getattr(self._coordinator, "_guard", None)
+        usage_before = _guard_token_totals(turn_guard)
 
         final_result: dict | None = None
         trace: list[dict[str, Any]] = []
@@ -524,6 +630,8 @@ class PersistentAgent:
                     tools_used=tools_used,
                     subagents_used=subagents_used,
                     errors=errors,
+                    usage_guard=turn_guard,
+                    usage_before=usage_before,
                 )
                 finalized = True
             yield event
@@ -537,6 +645,8 @@ class PersistentAgent:
                 tools_used=tools_used,
                 subagents_used=subagents_used,
                 errors=errors,
+                usage_guard=turn_guard,
+                usage_before=usage_before,
             )
 
     def capabilities(self) -> dict[str, Any]:
@@ -684,6 +794,9 @@ class PersistentAgent:
                 return
             seen_agents.add(id(agent))
             agent._guard = guard
+            llm = getattr(agent, "_llm", None)
+            if hasattr(llm, "set_budget"):
+                llm.set_budget(guard)
             for tool in getattr(agent, "_tools", {}).values():
                 sub = _subagent_tool_agent(tool)
                 if sub is not None:
@@ -701,6 +814,8 @@ class PersistentAgent:
         tools_used: set[str],
         subagents_used: set[str],
         errors: list[str],
+        usage_guard: Any | None = None,
+        usage_before: tuple[int, int] = (0, 0),
     ) -> None:
         answer = ""
         if final_result is not None:
@@ -781,6 +896,37 @@ class PersistentAgent:
                     except Exception:  # noqa: BLE001 — best-effort at compaction
                         pass
                 self._evict_session_memory_context(session_id)
+
+        await self._record_turn_usage(
+            session_id=session_id,
+            guard=usage_guard,
+            usage_before=usage_before,
+        )
+
+    async def _record_turn_usage(
+        self,
+        *,
+        session_id: str,
+        guard: Any | None,
+        usage_before: tuple[int, int],
+    ) -> None:
+        if guard is None or not hasattr(guard, "snapshot"):
+            return
+        snapshot = guard.snapshot()
+        tokens_in = int(snapshot.get("tokens_in") or 0) - usage_before[0]
+        tokens_out = int(snapshot.get("tokens_out") or 0) - usage_before[1]
+        if tokens_in <= 0 and tokens_out <= 0:
+            return
+        usage = dict(snapshot)
+        usage["tokens_in"] = max(tokens_in, 0)
+        usage["tokens_out"] = max(tokens_out, 0)
+        usage["total_tokens"] = usage["tokens_in"] + usage["tokens_out"]
+        await self._session_store.record_usage(
+            session_id,
+            tokens_in=usage["tokens_in"],
+            tokens_out=usage["tokens_out"],
+            usage=usage,
+        )
 
     async def _compact_session(self, session_id: str, state: SessionState) -> SessionState:
         to_compact, keep_last = self._compaction_split(state)
@@ -1119,6 +1265,11 @@ def _copy_state(state: SessionState) -> SessionState:
         turn_count=state.turn_count,
         last_reconcile_turn=state.last_reconcile_turn,
         last_compact_turn=state.last_compact_turn,
+        tokens_in_total=state.tokens_in_total,
+        tokens_out_total=state.tokens_out_total,
+        last_run_tokens_in=state.last_run_tokens_in,
+        last_run_tokens_out=state.last_run_tokens_out,
+        last_usage=dict(state.last_usage),
         updated_at=state.updated_at,
     )
 
@@ -1133,6 +1284,15 @@ def _event_to_trace(event: BusEvent) -> dict[str, Any]:
         "error": event.error,
         "timestamp": event.timestamp,
     }
+
+
+def _guard_token_totals(guard: Any | None) -> tuple[int, int]:
+    if guard is None:
+        return (0, 0)
+    return (
+        int(getattr(guard, "tokens_in", 0) or 0),
+        int(getattr(guard, "tokens_out", 0) or 0),
+    )
 
 
 def _describe_agent(agent: BaseAgent) -> dict[str, Any]:
