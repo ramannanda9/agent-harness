@@ -662,7 +662,21 @@ durable record, and any of `chat`/`save_to_memory`/`force_compact` on the
 same `session_id` later will resume from it. To exit, just stop calling
 `chat` (and let the process end).
 
-The demo maps those primitives to slash commands:
+For simple REPLs, `PersistentCommandHandler` maps slash commands to those
+primitives and returns structured results:
+
+```python
+from harness.persistent_controls import PersistentCommandHandler
+
+controls = PersistentCommandHandler(app, config=persistent_config, llm=llm)
+result = await controls.handle("/sessions research", session_id=session_id)
+if result.session_id:
+    session_id = result.session_id
+if result.text:
+    print(result.text)
+```
+
+The demo uses that utility for:
 
 - `/capabilities`, `/agents`, `/mcp` inspect wired agents and tools
 - `/session` shows turns, context-pressure estimate, reconcile cadence, and summary

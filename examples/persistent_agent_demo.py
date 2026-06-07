@@ -44,12 +44,8 @@ from agents.base import AgentConfig, BaseAgent
 from harness.console import ConsoleRenderer
 from harness.events import EventType
 from harness.executor_bridge import ExecutorBridge, ExecutorConfig, ExecutorTool, find_executor
-from harness.persistent import (
-    PersistentAgent,
-    PersistentAgentConfig,
-    SessionState,
-    SQLiteSessionStore,
-)
+from harness.persistent import PersistentAgent, PersistentAgentConfig, SQLiteSessionStore
+from harness.persistent_controls import PersistentCommandHandler
 from harness.runtime import BudgetGuard, GuardrailConfig, Tracer
 from memory.manager import MemoryManager
 from memory.stores import SQLiteSemanticStore
@@ -213,233 +209,6 @@ def _build_llm(provider: str):
     raise ValueError(f"unsupported provider: {provider}")
 
 
-def _estimate_session_tokens(state: SessionState) -> int:
-    total = max(0, len(state.summary) // 4) if state.summary else 0
-    for message in state.messages:
-        content = message.content if isinstance(message.content, str) else str(message.content)
-        total += max(1, len(content) // 4)
-    return total
-
-
-def _print_capabilities(app: PersistentAgent) -> None:
-    caps = app.capabilities()
-    coordinator = caps["coordinator"]
-    print(f"Coordinator: {coordinator['agent_id']}")
-    for tool in coordinator.get("tools", []):
-        sub = next((s for s in caps["subagents"] if s["tool_name"] == tool), None)
-        if sub is None:
-            print(f"  - {tool}")
-            continue
-        print(f"  - {tool} -> {sub['agent_id']}")
-        for sub_tool in sub.get("tools", []):
-            print(f"      - {sub_tool}")
-
-
-def _print_agents(app: PersistentAgent) -> None:
-    caps = app.capabilities()
-    coordinator = caps["coordinator"]
-    print(f"{coordinator['agent_id']}: {coordinator['role']}")
-    for sub in caps["subagents"]:
-        print(f"{sub['agent_id']}: {sub['role']} (via {sub['tool_name']})")
-
-
-def _print_mcp(app: PersistentAgent) -> None:
-    tools = app.capabilities()["mcp_tools"]
-    if not tools:
-        print("No MCP tools are wired.")
-        return
-    by_owner: dict[str, list[dict]] = {}
-    for tool in tools:
-        by_owner.setdefault(tool["owner_agent_id"], []).append(tool)
-    for owner, owned_tools in sorted(by_owner.items()):
-        print(f"{owner}: {len(owned_tools)} MCP tools")
-        for tool in sorted(owned_tools, key=lambda t: t["name"]):
-            schema = tool.get("input_schema") or {}
-            props = schema.get("properties") if isinstance(schema, dict) else None
-            args = ", ".join(sorted(props)) if isinstance(props, dict) else ""
-            suffix = f"({args})" if args else "()"
-            description = tool.get("description") or ""
-            print(f"  - {tool['name']}{suffix}" + (f" — {description}" if description else ""))
-
-
-async def _print_session(
-    app: PersistentAgent,
-    *,
-    session_id: str,
-    config: PersistentAgentConfig,
-    llm,
-) -> None:
-    state = await app.session_state(session_id)
-    tokens = _estimate_session_tokens(state)
-    budget = getattr(llm, "input_token_budget", None)
-    if isinstance(budget, int) and budget > 0:
-        pct = (tokens / budget) * 100
-        token_line = f"{tokens:,} / {budget:,} tokens ({pct:.1f}%)"
-    else:
-        token_line = f"{tokens:,} estimated tokens"
-    interval = config.async_reconcile_every_turns
-    if interval > 0:
-        remaining = interval - (state.turn_count % interval)
-        reconcile = f"turn {state.turn_count + remaining} ({remaining} turn(s))"
-    else:
-        reconcile = "disabled"
-    print(f"session_id: {state.session_id}")
-    print(f"turns: {state.turn_count}")
-    print(f"transcript: {token_line}")
-    print(f"last reconcile turn: {state.last_reconcile_turn or 'never'}")
-    print(f"next async reconcile: {reconcile}")
-    print(f"last compaction turn: {state.last_compact_turn or 'never'}")
-    print(f"summary: {state.summary or '(none)'}")
-
-
-def _print_memory(app: PersistentAgent, *, session_id: str) -> None:
-    context = app.cached_memory_context(session_id)
-    if context is None:
-        print("memory cache: not loaded yet")
-    elif not context:
-        print("memory cache: loaded, no relevant facts or episodes")
-    else:
-        print("memory cache:")
-        print(context)
-
-
-def _session_arg(command: str, message: str) -> str:
-    arg = message[len(command) :].strip()
-    if not arg:
-        return ""
-    parts = arg.split()
-    if len(parts) != 1:
-        raise ValueError("session ids cannot contain whitespace")
-    if parts[0].startswith("/"):
-        raise ValueError("session ids cannot start with '/'")
-    return parts[0]
-
-
-async def _print_sessions(
-    app: PersistentAgent, *, current_session_id: str, query: str | None = None
-) -> None:
-    sessions = await app.list_sessions(query=query)
-    if not sessions:
-        print(f"No sessions found{f' matching {query!r}' if query else ''}.")
-        return
-    for state in sessions:
-        marker = "*" if state.session_id == current_session_id else " "
-        summary = state.summary or "(no summary)"
-        if len(summary) > 80:
-            summary = summary[:77] + "..."
-        print(f"{marker} {state.session_id}  turns={state.turn_count}  updated={state.updated_at}")
-        print(f"    {summary}")
-
-
-async def _handle_slash_command(
-    message: str,
-    *,
-    app: PersistentAgent,
-    session_id: str,
-    config: PersistentAgentConfig,
-    llm,
-) -> tuple[bool, str, bool]:
-    if not message.startswith("/"):
-        return False, session_id, False
-    command = message.split(maxsplit=1)[0].lower()
-
-    if command in {"/help", "/?"}:
-        print("Inspect:  /capabilities, /agents, /mcp, /session, /memory")
-        print("Memory:   /save     reconcile recent turns into long-term memory")
-        print("          /compact  structural reorg: summary + trim + reconcile")
-        print("          /forget   drop this session's cached memory prior")
-        print("Session:  /sessions [query] list known sessions")
-        print("          /switch <id> switch to an existing or new logical session")
-        print("          /new [id] create a new session; refuses if id exists")
-        print("          /clear    clear current transcript; memory retained")
-        print("          /delete [id] confirm delete transcript; memory retained")
-        print("          /end      exit the demo; transcript stays in SQLite")
-    elif command == "/capabilities":
-        _print_capabilities(app)
-    elif command == "/agents":
-        _print_agents(app)
-    elif command == "/mcp":
-        _print_mcp(app)
-    elif command == "/session":
-        await _print_session(app, session_id=session_id, config=config, llm=llm)
-    elif command == "/memory":
-        _print_memory(app, session_id=session_id)
-    elif command == "/sessions":
-        query = message[len(command) :].strip() or None
-        await _print_sessions(app, current_session_id=session_id, query=query)
-    elif command == "/save":
-        count = await app.save_to_memory(session_id)
-        if count:
-            print(f"saved {count} pending message(s) from {session_id} to long-term memory")
-        else:
-            print(f"session {session_id} has no pending messages to save")
-    elif command == "/compact":
-        state = await app.force_compact(session_id)
-        print(f"compacted session {session_id}; last_compact_turn={state.last_compact_turn}")
-    elif command == "/forget":
-        app.forget_memory_cache(session_id)
-        print(f"forgot cached memory context for session {session_id}")
-    elif command == "/switch":
-        try:
-            next_session_id = _session_arg(command, message)
-        except ValueError as exc:
-            print(f"cannot switch session: {exc}")
-            return True, session_id, False
-        if not next_session_id:
-            print("usage: /switch <session_id>")
-            return True, session_id, False
-        existed = await app.session_exists(next_session_id)
-        # ``session_state`` intentionally creates the row if it is missing,
-        # so switching to a new logical workspace makes it visible in
-        # /sessions immediately.
-        await app.session_state(next_session_id)
-        session_id = next_session_id
-        print(f"{'resumed' if existed else 'created'} session: {session_id}")
-    elif command == "/new":
-        try:
-            requested_session_id = _session_arg(command, message)
-        except ValueError as exc:
-            print(f"cannot create session: {exc}")
-            return True, session_id, False
-        next_session_id = requested_session_id or f"sess_{uuid4().hex[:12]}"
-        if await app.session_exists(next_session_id):
-            print(f"session already exists: {next_session_id}")
-            print(f"use /switch {next_session_id} to resume it")
-            return True, session_id, False
-        await app.session_state(next_session_id)
-        session_id = next_session_id
-        print(f"new session: {session_id} (previous transcript preserved in SQLite)")
-    elif command == "/clear":
-        await app.clear_session(session_id)
-        print(f"cleared session {session_id} transcript; long-term memory retained")
-    elif command == "/delete":
-        raw = message[len(command) :].strip()
-        parts = raw.split()
-        if parts == ["confirm"]:
-            delete_session_id = session_id
-        elif len(parts) == 2 and parts[1] == "confirm" and not parts[0].startswith("/"):
-            delete_session_id = parts[0]
-        else:
-            print("usage: /delete confirm OR /delete <session_id> confirm")
-            print("deletes transcript only; long-term memory is retained")
-            return True, session_id, False
-        deleted = await app.delete_session(delete_session_id)
-        if not deleted:
-            print(f"session not found: {delete_session_id}")
-            return True, session_id, False
-        print(f"deleted session {delete_session_id}; long-term memory retained")
-        if delete_session_id == session_id:
-            session_id = "default"
-            await app.session_state(session_id)
-            print(f"switched to session: {session_id}")
-    elif command == "/end":
-        print(f"exiting; session {session_id} transcript preserved for next run")
-        return True, session_id, True
-    else:
-        print(f"Unknown command: {command}. Try /help.")
-    return True, session_id, False
-
-
 async def main() -> None:
     args = _parse_args()
     if shutil.which("npx") is None:
@@ -589,6 +358,7 @@ async def main() -> None:
             config=persistent_config,
         )
         renderer = ConsoleRenderer()
+        controls = PersistentCommandHandler(app, config=persistent_config, llm=llm)
 
         print("Persistent agent ready.")
         print(f"Session: {session_id}")
@@ -613,16 +383,14 @@ async def main() -> None:
                 return
             if not message:
                 return
-            handled, session_id, should_exit = await _handle_slash_command(
-                message,
-                app=app,
-                session_id=session_id,
-                config=persistent_config,
-                llm=llm,
-            )
-            if should_exit:
+            command_result = await controls.handle(message, session_id=session_id)
+            if command_result.session_id is not None:
+                session_id = command_result.session_id
+            if command_result.text:
+                print(command_result.text)
+            if command_result.should_exit:
                 return
-            if handled:
+            if command_result.handled:
                 continue
 
             final_answer = ""
