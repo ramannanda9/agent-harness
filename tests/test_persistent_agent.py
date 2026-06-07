@@ -210,6 +210,8 @@ def test_persistent_demo_parser_accepts_session_controls(monkeypatch):
             "pr-review",
             "--db",
             "sessions.sqlite",
+            "--time-budget-seconds",
+            "420",
         ],
     )
 
@@ -219,6 +221,7 @@ def test_persistent_demo_parser_accepts_session_controls(monkeypatch):
     assert args.db == "sessions.sqlite"
     assert args.new_session is False
     assert args.provider == "openai"
+    assert args.time_budget_seconds == 420
 
 
 def test_persistent_demo_parser_accepts_codex_provider(monkeypatch):

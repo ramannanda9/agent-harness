@@ -159,6 +159,15 @@ def _parse_args() -> argparse.Namespace:
             "what the researcher does; defaults to headless."
         ),
     )
+    parser.add_argument(
+        "--time-budget-seconds",
+        type=int,
+        default=int(os.environ.get("AGENT_TIME_BUDGET_SECONDS", "300")),
+        help=(
+            "Per-turn wall-time budget for coordinator + sub-agents. "
+            "Defaults to AGENT_TIME_BUDGET_SECONDS or 300."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -256,7 +265,11 @@ async def main() -> None:
         memory_scope="persistent-demo",
         memory_subject="persistent-demo",
     )
-    guard = BudgetGuard(GuardrailConfig(max_total_cost_usd=2.0, max_wall_time_seconds=120))
+    guard_config = GuardrailConfig(
+        max_total_cost_usd=2.0,
+        max_wall_time_seconds=args.time_budget_seconds,
+    )
+    guard = BudgetGuard(guard_config)
     shell_tool = ExecutorTool(
         "shell",
         "shell",
@@ -352,9 +365,7 @@ async def main() -> None:
             session_store=SQLiteSessionStore(session_path),
             memory=memory,
             llm=llm,
-            guard_factory=lambda: BudgetGuard(
-                GuardrailConfig(max_total_cost_usd=2.0, max_wall_time_seconds=120)
-            ),
+            guard_factory=lambda: BudgetGuard(guard_config),
             config=persistent_config,
         )
         renderer = ConsoleRenderer()
@@ -367,6 +378,7 @@ async def main() -> None:
         print(f"Semantic memory: {semantic_path}")
         print(f"Episodic memory: {lance_path} ({embedder_kind})")
         print(f"Shell executor: {executor}")
+        print(f"Turn time budget: {args.time_budget_seconds}s")
         print(f"Browser tools: {len(browser_tools)} ({'headed' if args.headed else 'headless'})")
         print("\nSystem prompt:")
         print(SYSTEM_PROMPT)
