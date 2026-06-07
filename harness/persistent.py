@@ -303,15 +303,14 @@ class PersistentAgentConfig:
     # prefix cache (and Anthropic's ``cache_control``) hit on the entire
     # historical prefix.
     recent_messages: int = 8
-    # NO-OP — kept for back-compat with existing user configs. The previous
-    # policy fired a reconciler LLM call every N turns, but mid-window
-    # writes invalidated the next turn's system prompt and broke the
-    # prefix cache. Reconciliation now runs on high-signal events
-    # (tool/sub-agent runs, errors, "remember" terms) and at compaction
-    # — never periodically. Setting this field has no effect.
-    reconcile_every_turns: int = 6
-    compact_every_turns: int = 12
-    compact_message_threshold: int = 24
+    # Compact when the transcript token count crosses this fraction of
+    # the coordinator's ``llm.input_token_budget``. Replaces the previous
+    # turn-count / message-count triggers, which fired arbitrarily often
+    # on chat-light sessions (wasting context budget) and too late on
+    # tool-heavy sessions (risking input-window overrun). 0.7 leaves room
+    # for the current turn's task, any tool observations it will produce,
+    # and tokeniser variance.
+    compact_at_context_fraction: float = 0.7
     durable_signal_terms: tuple[str, ...] = (
         "remember",
         "always",
@@ -661,30 +660,67 @@ class PersistentAgent:
         subagents_used: set[str],
         errors: list[str],
     ) -> bool:
-        """High-signal-only reconciliation policy.
+        """User-intent-only immediate reconciliation policy.
 
-        The previous policy also fired periodically (every
-        ``reconcile_every_turns`` turns), which wrote to long-term memory
-        mid-compaction-window and invalidated the next turn's system
-        prompt — breaking the prefix cache between every reconcile and the
-        following turn. The session transcript already journals every
-        turn to SQLite, so periodic mid-window writes added cost without
-        information.
+        Compaction handles bulk reconciliation when context pressure
+        forces a summary LLM call (the same boundary already pays a
+        cache miss). Tool runs / sub-agent runs / errors used to also
+        trigger reconciliation here, but their facts are mostly
+        situational (this run's outputs) — the session transcript
+        captures them within the session, and the next compaction
+        boundary folds them into long-term memory. Bypassing
+        compaction for every tool run was just trashing the cache for
+        marginal cross-session benefit.
 
-        We now reconcile only on high-signal events (tool/sub-agent runs,
-        errors, user "remember" terms). Everything else defers to
-        compaction, where reconciliation runs alongside the summary LLM
-        call — both write boundaries collapse into one cache-miss event.
+        What stays: user-explicit signals like "remember X", "always do
+        Y", "I prefer Z" — these are cross-session by nature and should
+        persist immediately even if it costs a cache miss.
         """
-        if tools_used or subagents_used or errors:
-            return True
         lower = message.lower()
         return any(term in lower for term in self._config.durable_signal_terms)
 
     def _should_compact(self, state: SessionState) -> bool:
-        if len(state.messages) > self._config.compact_message_threshold:
-            return True
-        return state.turn_count - state.last_compact_turn >= self._config.compact_every_turns
+        """Context-pressure trigger — fires when the accumulated transcript
+        (rolling summary + verbatim history) crosses
+        ``compact_at_context_fraction`` of the coordinator's
+        ``llm.input_token_budget``.
+
+        Replaces the previous turn-count / message-count triggers, which
+        fired every N turns regardless of actual size. Plain chat
+        sessions (~20 tokens/turn) now go thousands of turns between
+        compactions; browser-heavy research sessions (~3K tokens/turn)
+        compact only when budget pressure forces it.
+        """
+        budget = self._coordinator_input_token_budget()
+        if budget is None:
+            # Adapter doesn't expose ``input_token_budget`` (custom stub
+            # or older client) — never auto-compact; rely on explicit
+            # signals only.
+            return False
+        threshold = int(budget * self._config.compact_at_context_fraction)
+        if threshold <= 0:
+            return False
+        return self._transcript_token_count(state) >= threshold
+
+    def _coordinator_input_token_budget(self) -> int | None:
+        """Read the coordinator LLM's input budget. Falls back to ``None``
+        when the adapter doesn't advertise one."""
+        llm = getattr(self._coordinator, "_llm", None) or self._llm
+        budget = getattr(llm, "input_token_budget", None)
+        return int(budget) if isinstance(budget, int) and budget > 0 else None
+
+    def _transcript_token_count(self, state: SessionState) -> int:
+        """Cheap chars/4 token estimate over the rolling summary +
+        accumulated transcript. Same heuristic ``WorkingMemory`` uses
+        when no exact counter is wired, so the threshold maps coherently
+        to the LLM's eviction behaviour."""
+        total = 0
+        if state.summary:
+            total += max(1, len(state.summary) // 4)
+        for msg in state.messages:
+            content = msg.content if isinstance(msg.content, str) else str(msg.content)
+            total += max(1, len(content) // 4)
+        return total
 
     async def _summarize_session(
         self,

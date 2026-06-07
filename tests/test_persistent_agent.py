@@ -21,6 +21,12 @@ from tools.builtin.subagent import SubAgentTool
 
 
 class _ChatLLM:
+    # PersistentAgent reads ``input_token_budget`` to drive the
+    # context-fraction compaction trigger. Stubs that omit it would
+    # default to "never auto-compact" — tests that want to exercise the
+    # compaction path adjust this per-fixture.
+    input_token_budget: int = 1_000_000
+
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
         self.last_usage: dict | None = None
@@ -245,7 +251,7 @@ async def test_persistent_agent_refreshes_guard_per_turn_for_coordinator_and_sub
         memory=memory,
         llm=llm,
         guard_factory=guard_factory,
-        config=PersistentAgentConfig(reconcile_every_turns=99, compact_every_turns=99),
+        config=PersistentAgentConfig(compact_at_context_fraction=1.0),
     )
 
     [event async for event in app.chat("hello")]
@@ -271,7 +277,7 @@ async def test_persistent_agent_injects_recent_session_into_fresh_turn():
         session_store=store,
         memory=memory,
         llm=llm,
-        config=PersistentAgentConfig(reconcile_every_turns=99, compact_every_turns=99),
+        config=PersistentAgentConfig(compact_at_context_fraction=1.0),
     )
 
     [event async for event in app.chat("I like the above", session_id="s")]
@@ -309,7 +315,7 @@ async def test_message_prefix_is_stable_across_turns_for_caching():
         session_store=InMemorySessionStore(),
         memory=memory,
         llm=llm,
-        config=PersistentAgentConfig(reconcile_every_turns=99, compact_every_turns=99),
+        config=PersistentAgentConfig(compact_at_context_fraction=1.0),
     )
 
     [event async for event in app.chat("first turn", session_id="cache-test")]
@@ -352,7 +358,7 @@ async def test_system_prompt_stays_byte_identical_within_compaction_window():
         session_store=InMemorySessionStore(),
         memory=memory,
         llm=llm,
-        config=PersistentAgentConfig(reconcile_every_turns=99, compact_every_turns=99),
+        config=PersistentAgentConfig(compact_at_context_fraction=1.0),
     )
 
     [event async for event in app.chat("hello there", session_id="sysstable")]
@@ -371,7 +377,13 @@ async def test_system_prompt_stays_byte_identical_within_compaction_window():
 
 
 @pytest.mark.asyncio
-async def test_persistent_agent_reconciles_when_tools_run():
+async def test_persistent_agent_does_not_reconcile_on_tool_runs_alone():
+    """The previous contract reconciled on every tool run — but tool
+    outputs are usually situational ("3pm Reuters headlines", "this
+    moment's kubectl get pods") and don't generalise across sessions.
+    Eagerly writing them invalidated the next turn's cache for marginal
+    cross-session benefit. Tools now stay in the session transcript;
+    long-term memory picks them up at the next compaction boundary."""
     llm = _ToolLLM()
     memory = _SpyMemory(llm)
     app = PersistentAgent(
@@ -379,15 +391,41 @@ async def test_persistent_agent_reconciles_when_tools_run():
         session_store=InMemorySessionStore(),
         memory=memory,
         llm=llm,
-        config=PersistentAgentConfig(reconcile_every_turns=99, compact_every_turns=99),
+        config=PersistentAgentConfig(compact_at_context_fraction=1.0),
     )
 
     events = [event async for event in app.chat("use a tool")]
 
+    # Tool still ran — observation event reached the consumer.
     assert any(e.type == EventType.OBSERVATION for e in events)
-    assert memory.run_writes
-    assert memory.run_writes[0]["goal"] == "use a tool"
-    assert any(t.get("type") == "action" for t in memory.run_writes[0]["trace"])
+    # But no immediate write_run_end (no compaction crossed; no durable
+    # signal terms in the message). Tool fact lives in the transcript
+    # only until the next compaction event picks it up.
+    assert not memory.run_writes, (
+        f"tool-run-only turn should NOT trigger reconciliation; "
+        f"got {len(memory.run_writes)} write(s)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_persistent_agent_reconciles_on_explicit_remember_term():
+    """User-explicit durable signals ("remember", "always", "prefer", etc.)
+    still fire reconciliation immediately — cross-session by intent."""
+    llm = _ChatLLM()
+    memory = _SpyMemory(llm)
+    app = PersistentAgent(
+        coordinator=_agent(llm=llm, memory=memory),
+        session_store=InMemorySessionStore(),
+        memory=memory,
+        llm=llm,
+        config=PersistentAgentConfig(compact_at_context_fraction=1.0),
+    )
+
+    [event async for event in app.chat("please remember I prefer concise answers")]
+
+    assert memory.run_writes, (
+        "explicit 'remember' / 'prefer' signal should trigger immediate reconcile"
+    )
 
 
 @pytest.mark.asyncio
@@ -400,7 +438,7 @@ async def test_persistent_agent_persists_before_terminal_event_is_yielded():
         session_store=store,
         memory=memory,
         llm=llm,
-        config=PersistentAgentConfig(reconcile_every_turns=99, compact_every_turns=99),
+        config=PersistentAgentConfig(compact_at_context_fraction=1.0),
     )
 
     async for event in app.chat("finish quickly", session_id="s"):
@@ -413,8 +451,16 @@ async def test_persistent_agent_persists_before_terminal_event_is_yielded():
 
 
 @pytest.mark.asyncio
-async def test_persistent_agent_compacts_session_at_threshold():
+async def test_persistent_agent_compacts_session_at_context_pressure():
+    """Compaction now triggers on transcript-token pressure relative to
+    the coordinator LLM's ``input_token_budget`` — not on turn or message
+    count. Fixture sets a very small budget so two short turns of content
+    push past the 0.7 default and force a compaction."""
     llm = _ChatLLM()
+    # ~8-token threshold (12 * 0.7). Each turn here adds ~6 transcript
+    # tokens (8-char user msg + 16-char assistant reply, chars/4 counter),
+    # so turn 1 stays below threshold and turn 2 crosses it.
+    llm.input_token_budget = 12
     memory = _SpyMemory(llm)
     store = InMemorySessionStore()
     app = PersistentAgent(
@@ -422,12 +468,7 @@ async def test_persistent_agent_compacts_session_at_threshold():
         session_store=store,
         memory=memory,
         llm=llm,
-        config=PersistentAgentConfig(
-            reconcile_every_turns=99,
-            compact_every_turns=99,
-            compact_message_threshold=3,
-            recent_messages=2,
-        ),
+        config=PersistentAgentConfig(recent_messages=2),
     )
 
     [event async for event in app.chat("turn one", session_id="s")]
