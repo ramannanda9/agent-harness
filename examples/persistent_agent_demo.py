@@ -339,9 +339,17 @@ async def main() -> None:
             ),
             config=PersistentAgentConfig(
                 recent_messages=8,
-                reconcile_every_turns=6,
-                compact_every_turns=12,
-                compact_message_threshold=24,
+                # Defaults are sensible — explicit here for visibility.
+                # ``compact_at_context_fraction=0.7`` reads
+                # ``coordinator._llm.input_token_budget`` (~123K for
+                # gpt-5.4-mini) so compaction fires only under real
+                # context pressure, not on arbitrary turn counts.
+                # ``async_reconcile_every_turns=10`` runs a non-blocking
+                # background ``write_run_end`` every 10 turns over the
+                # last 10 turn-pairs from the durable transcript —
+                # memory accumulates without thrashing the prefix cache.
+                compact_at_context_fraction=0.7,
+                async_reconcile_every_turns=10,
             ),
         )
         renderer = ConsoleRenderer()
