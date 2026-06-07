@@ -316,8 +316,12 @@ async def _handle_slash_command(
     command = message.split(maxsplit=1)[0].lower()
 
     if command in {"/help", "/?"}:
-        print("Commands: /capabilities, /agents, /mcp, /session, /memory")
-        print("          /compact, /forget, /new, /end")
+        print("Inspect:  /capabilities, /agents, /mcp, /session, /memory")
+        print("Memory:   /save     reconcile recent turns into long-term memory")
+        print("          /compact  structural reorg: summary + trim + reconcile")
+        print("          /forget   drop this session's cached memory prior")
+        print("Session:  /new      start a fresh session id")
+        print("          /end      exit the demo; transcript stays in SQLite")
     elif command == "/capabilities":
         _print_capabilities(app)
     elif command == "/agents":
@@ -328,6 +332,12 @@ async def _handle_slash_command(
         await _print_session(app, session_id=session_id, config=config, llm=llm)
     elif command == "/memory":
         _print_memory(app, session_id=session_id)
+    elif command == "/save":
+        count = await app.save_to_memory(session_id)
+        if count:
+            print(f"saved {count} pending message(s) from {session_id} to long-term memory")
+        else:
+            print(f"session {session_id} has no pending messages to save")
     elif command == "/compact":
         state = await app.force_compact(session_id)
         print(f"compacted session {session_id}; last_compact_turn={state.last_compact_turn}")
@@ -336,10 +346,9 @@ async def _handle_slash_command(
         print(f"forgot cached memory context for session {session_id}")
     elif command == "/new":
         session_id = f"sess_{uuid4().hex[:12]}"
-        print(f"new session: {session_id}")
+        print(f"new session: {session_id} (previous transcript preserved in SQLite)")
     elif command == "/end":
-        state = await app.close(session_id)
-        print(f"closed session {session_id}; last_reconcile_turn={state.last_reconcile_turn}")
+        print(f"exiting; session {session_id} transcript preserved for next run")
         return True, session_id, True
     else:
         print(f"Unknown command: {command}. Try /help.")
@@ -468,17 +477,20 @@ async def main() -> None:
 
         session_id = f"sess_{uuid4().hex[:12]}" if args.new_session else args.session_id
         persistent_config = PersistentAgentConfig(
-            recent_messages=8,
             # Defaults are sensible — explicit here for visibility.
-            # ``compact_at_context_fraction=0.7`` reads
+            # ``compact_at_context_fraction=0.5`` reads
             # ``coordinator._llm.input_token_budget`` (~123K for
             # gpt-5.4-mini) so compaction fires only under real
             # context pressure, not on arbitrary turn counts.
+            # ``retain_context_fraction=0.15`` keeps the newest ~15%
+            # of the model's input budget verbatim after compaction
+            # and folds older messages into the rolling summary.
             # ``async_reconcile_every_turns=10`` runs a non-blocking
             # background ``write_run_end`` every 10 turns over the
             # last 10 turn-pairs from the durable transcript —
             # memory accumulates without thrashing the prefix cache.
-            compact_at_context_fraction=0.7,
+            compact_at_context_fraction=0.5,
+            retain_context_fraction=0.15,
             async_reconcile_every_turns=10,
         )
         app = PersistentAgent(

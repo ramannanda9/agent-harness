@@ -269,6 +269,7 @@ def test_persistent_agent_forget_memory_cache_evicts_session_context():
 @pytest.mark.asyncio
 async def test_persistent_agent_force_compact_summarizes_and_trims():
     llm = _ChatLLM()
+    llm.input_token_budget = 40
     memory = _SpyMemory(llm)
     store = InMemorySessionStore()
     await store.append_messages(
@@ -285,7 +286,7 @@ async def test_persistent_agent_force_compact_summarizes_and_trims():
         session_store=store,
         memory=memory,
         llm=llm,
-        config=PersistentAgentConfig(recent_messages=2),
+        config=PersistentAgentConfig(retain_context_fraction=0.15),
     )
     app._session_memory_context["s"] = "cached"
 
@@ -294,11 +295,17 @@ async def test_persistent_agent_force_compact_summarizes_and_trims():
     assert state.summary == "The user likes the proposed approach."
     assert [m.content for m in state.messages] == ["recent user", "recent assistant"]
     assert state.last_compact_turn == 2
+    assert state.last_reconcile_turn == 2
+    assert memory.run_writes
+    assert [step["content"] for step in memory.run_writes[-1]["trace"]] == [
+        "old user",
+        "old assistant",
+    ]
     assert app.cached_memory_context("s") is None
 
 
 @pytest.mark.asyncio
-async def test_persistent_agent_close_reconciles_and_evicts_cache():
+async def test_persistent_agent_save_to_memory_reconciles_without_evicting_cache():
     llm = _ChatLLM()
     memory = _SpyMemory(llm)
     store = InMemorySessionStore()
@@ -314,15 +321,94 @@ async def test_persistent_agent_close_reconciles_and_evicts_cache():
         session_store=store,
         memory=memory,
         llm=llm,
+        config=PersistentAgentConfig(async_reconcile_every_turns=5),
     )
     app._session_memory_context["s"] = "cached"
 
-    state = await app.close("s")
+    count = await app.save_to_memory("s")
 
-    assert state.last_reconcile_turn == 1
+    assert count == 2
     assert memory.run_writes
-    assert memory.run_writes[-1]["goal"] == "remember final preference"
-    assert app.cached_memory_context("s") is None
+    write = memory.run_writes[-1]
+    assert write["goal"] == "remember final preference"
+    assert write["agent_results"][-1]["answer"] == "noted"
+    assert [step["content"] for step in write["trace"]] == ["remember final preference", "noted"]
+    # Cache is NOT evicted: the active session keeps its warm prefix.
+    assert app.cached_memory_context("s") == "cached"
+    state = await store.load("s")
+    assert state.last_reconcile_turn == 1
+
+
+@pytest.mark.asyncio
+async def test_persistent_agent_save_to_memory_noops_on_empty_session():
+    llm = _ChatLLM()
+    memory = _SpyMemory(llm)
+    store = InMemorySessionStore()
+    app = PersistentAgent(
+        coordinator=_agent(llm=llm, memory=memory),
+        session_store=store,
+        memory=memory,
+        llm=llm,
+    )
+
+    count = await app.save_to_memory("s")
+
+    assert count == 0
+    assert not memory.run_writes
+
+
+@pytest.mark.asyncio
+async def test_persistent_agent_save_to_memory_uses_reconcile_checkpoint():
+    llm = _ChatLLM()
+    memory = _SpyMemory(llm)
+    store = InMemorySessionStore()
+    # 8 messages = 4 turn-pairs. Mark the first 2 turns reconciled, then
+    # explicit save should include only turns 3-4.
+    msgs = []
+    for i in range(4):
+        msgs.append(SessionMessage(role="user", content=f"u{i}"))
+        msgs.append(SessionMessage(role="assistant", content=f"a{i}"))
+    await store.append_messages("s", msgs)
+    app = PersistentAgent(
+        coordinator=_agent(llm=llm, memory=memory),
+        session_store=store,
+        memory=memory,
+        llm=llm,
+        config=PersistentAgentConfig(async_reconcile_every_turns=2),
+    )
+    await store.mark_reconciled("s", 2)
+
+    count = await app.save_to_memory("s")
+
+    assert count == 4
+    write = memory.run_writes[-1]
+    assert [step["content"] for step in write["trace"]] == ["u2", "a2", "u3", "a3"]
+
+
+@pytest.mark.asyncio
+async def test_persistent_agent_save_to_memory_noops_when_checkpoint_is_current():
+    llm = _ChatLLM()
+    memory = _SpyMemory(llm)
+    store = InMemorySessionStore()
+    await store.append_messages(
+        "s",
+        [
+            SessionMessage(role="user", content="already saved"),
+            SessionMessage(role="assistant", content="ok"),
+        ],
+    )
+    await store.mark_reconciled("s", 1)
+    app = PersistentAgent(
+        coordinator=_agent(llm=llm, memory=memory),
+        session_store=store,
+        memory=memory,
+        llm=llm,
+    )
+
+    count = await app.save_to_memory("s")
+
+    assert count == 0
+    assert not memory.run_writes
 
 
 @pytest.mark.asyncio
@@ -565,6 +651,8 @@ async def test_async_reconcile_fires_at_interval_without_evicting_cache():
     await asyncio.sleep(0)
 
     assert memory.run_writes, "turn 3 (interval) should fire async reconcile"
+    state = await store.load("async")
+    assert state.last_reconcile_turn == 3
     # Crucially: the memory context cache was NOT evicted. Identity matters
     # — if it had been refetched, ``cached_before`` would no longer be
     # the value at ``self._session_memory_context["async"]``.
@@ -658,11 +746,11 @@ async def test_persistent_agent_compacts_session_at_context_pressure():
     """Compaction now triggers on transcript-token pressure relative to
     the coordinator LLM's ``input_token_budget`` — not on turn or message
     count. Fixture sets a very small budget so two short turns of content
-    push past the 0.7 default and force a compaction."""
+    push past the 0.5 default and force a compaction."""
     llm = _ChatLLM()
-    # ~8-token threshold (12 * 0.7). Each turn here adds ~6 transcript
+    # 6-token threshold (12 * 0.5). Each turn here adds ~6 transcript
     # tokens (8-char user msg + 16-char assistant reply, chars/4 counter),
-    # so turn 1 stays below threshold and turn 2 crosses it.
+    # so the second turn leaves an older turn to fold into the summary.
     llm.input_token_budget = 12
     memory = _SpyMemory(llm)
     store = InMemorySessionStore()
@@ -671,7 +759,7 @@ async def test_persistent_agent_compacts_session_at_context_pressure():
         session_store=store,
         memory=memory,
         llm=llm,
-        config=PersistentAgentConfig(recent_messages=2),
+        config=PersistentAgentConfig(retain_context_fraction=0.5),
     )
 
     [event async for event in app.chat("turn one", session_id="s")]
@@ -679,5 +767,6 @@ async def test_persistent_agent_compacts_session_at_context_pressure():
     state = await store.load("s")
 
     assert state.summary == "The user likes the proposed approach."
-    assert len(state.messages) == 2
+    assert "turn one" not in [m.content for m in state.messages if m.role == "user"]
+    assert state.messages[-1].role == "assistant"
     assert state.last_compact_turn == 2

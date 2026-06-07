@@ -296,22 +296,21 @@ class SQLiteSessionStore:
 
 @dataclass
 class PersistentAgentConfig:
-    # Number of most-recent transcript messages to keep VERBATIM through a
-    # compaction event. The transcript itself accumulates across turns and
-    # is sent to the coordinator as real user/assistant role messages —
-    # not folded into one inline-rendered user-message blob — which keeps
-    # the prefix byte-identical between turns and lets OpenAI's automatic
-    # prefix cache (and Anthropic's ``cache_control``) hit on the entire
-    # historical prefix.
-    recent_messages: int = 8
     # Compact when the transcript token count crosses this fraction of
     # the coordinator's ``llm.input_token_budget``. Replaces the previous
     # turn-count / message-count triggers, which fired arbitrarily often
     # on chat-light sessions (wasting context budget) and too late on
-    # tool-heavy sessions (risking input-window overrun). 0.7 leaves room
+    # tool-heavy sessions (risking input-window overrun). 0.5 leaves room
     # for the current turn's task, any tool observations it will produce,
     # and tokeniser variance.
-    compact_at_context_fraction: float = 0.7
+    compact_at_context_fraction: float = 0.5
+    # After compaction, retain the newest transcript messages whose
+    # estimated token total fits within this fraction of the coordinator
+    # input budget. The rest is folded into ``SessionState.summary``.
+    # Token-based retention scales across models and avoids preserving a
+    # huge browser/tool observation merely because it is one of the last
+    # few messages.
+    retain_context_fraction: float = 0.15
     # Background memory accumulation: every N turns, schedule a
     # non-blocking ``write_run_end`` over the last N turns of the durable
     # session transcript. The current session's per-session memory
@@ -488,53 +487,57 @@ class PersistentAgent:
         self._evict_session_memory_context(session_id)
 
     async def force_compact(self, session_id: str) -> SessionState:
-        """Summarize and trim the older transcript portion immediately.
+        """Summarize, trim, and reconcile the older transcript portion.
 
         This uses the same compaction shape as automatic context-pressure
-        compaction: keep the most recent ``recent_messages`` verbatim, fold
-        older messages into the rolling summary, then evict cached memory
-        context so the next turn can pick up freshly reconciled facts.
+        compaction: keep the newest messages that fit inside
+        ``retain_context_fraction`` of the input budget, fold older messages
+        into the rolling summary, reconcile the folded window into long-term
+        memory, then evict cached memory context so the next turn can pick
+        up freshly reconciled facts.
         """
         state = await self._session_store.load(session_id)
+        to_compact = self._messages_to_compact(state)
         state = await self._compact_session(session_id, state)
-        self._evict_session_memory_context(session_id)
-        return state
-
-    async def close(self, session_id: str) -> SessionState:
-        """Flush the current durable transcript window to long-term memory.
-
-        Closing does not delete the session transcript. It is a "session is
-        ending" hook: reconcile the stored messages, mark the session
-        reconciled, and clear cached memory context.
-        """
-        state = await self._session_store.load(session_id)
-        if state.messages:
-            last_user = next((m.content for m in reversed(state.messages) if m.role == "user"), "")
-            last_assistant = next(
-                (m.content for m in reversed(state.messages) if m.role == "assistant"), ""
-            )
-            trace = [
-                {
-                    "type": m.role,
-                    "content": m.content,
-                    "timestamp": m.created_at,
-                }
-                for m in state.messages
-            ]
-            await self._memory.write_run_end(
-                goal=str(last_user) if last_user else "(session close)",
-                agent_results=[
-                    {
-                        "agent_id": self._coordinator.config.agent_id,
-                        "answer": str(last_assistant),
-                        "confidence": 1.0,
-                    }
-                ],
-                trace=trace,
+        if to_compact and state.last_compact_turn:
+            await self._write_session_window_to_memory(
+                session_id=session_id,
+                messages=to_compact,
+                goal_fallback="(force compact)",
             )
             state = await self._session_store.mark_reconciled(session_id, state.turn_count)
         self._evict_session_memory_context(session_id)
         return state
+
+    async def save_to_memory(self, session_id: str) -> int:
+        """Reconcile pending transcript messages into long-term memory now.
+
+        Samples only messages after ``last_reconcile_turn``, then awaits the
+        ``write_run_end`` call so the caller can confirm completion. Use when
+        a user explicitly wants "save what we discussed" before leaving the
+        session (e.g. demo ``/save`` command).
+
+        Crucially does NOT evict the per-session memory cache: the active
+        session keeps its warm prefix. New facts are visible to OTHER
+        sessions immediately and to THIS session at the next compaction
+        (where the cache breaks anyway for the summary refresh).
+
+        Returns the number of transcript messages included in the reconcile
+        payload — 0 if there's nothing pending to save.
+        """
+        state = await self._session_store.load(session_id)
+        if not state.messages:
+            return 0
+        window = self._messages_since_reconcile(state)
+        if not window:
+            return 0
+        await self._write_session_window_to_memory(
+            session_id=session_id,
+            messages=window,
+            goal_fallback="(explicit save)",
+        )
+        await self._session_store.mark_reconciled(session_id, state.turn_count)
+        return len(window)
 
     def _assign_guard(self, guard: Any) -> None:
         seen_agents: set[int] = set()
@@ -608,6 +611,7 @@ class PersistentAgent:
             self._maybe_fire_async_reconcile(session_id, state)
 
         if compacted:
+            to_compact = self._messages_to_compact(state)
             compacted_state = await self._compact_session(session_id, state)
             if compacted_state.last_compact_turn != state.last_compact_turn:
                 state = compacted_state
@@ -629,33 +633,109 @@ class PersistentAgent:
                     # don't repeat. Only fire here when this turn didn't
                     # already write.
                     try:
-                        await self._memory.write_run_end(
-                            goal=message,
-                            agent_results=[
-                                final_result or {"error": errors[-1] if errors else "no result"}
-                            ],
-                            trace=trace,
+                        await self._write_session_window_to_memory(
+                            session_id=session_id,
+                            messages=to_compact,
+                            goal_fallback=message,
+                        )
+                        state = await self._session_store.mark_reconciled(
+                            session_id, state.turn_count
                         )
                     except Exception:  # noqa: BLE001 — best-effort at compaction
                         pass
                 self._evict_session_memory_context(session_id)
 
     async def _compact_session(self, session_id: str, state: SessionState) -> SessionState:
-        # Compact only the OLDER portion — everything before the last
-        # ``recent_messages`` stays verbatim — so the still-recent turns
-        # remain byte-identical across the compaction boundary.
-        keep = self._config.recent_messages
-        if keep <= 0:
-            to_compact = list(state.messages)
-        else:
-            to_compact = state.messages[:-keep] if len(state.messages) > keep else []
+        to_compact, keep_last = self._compaction_split(state)
         if not to_compact:
             return state
         summary = await self._summarize_session(state, messages_to_compact=to_compact)
         state = await self._session_store.update_summary(session_id, summary)
-        state = await self._session_store.trim_messages(session_id, keep)
+        state = await self._session_store.trim_messages(session_id, keep_last)
         state = await self._session_store.mark_compacted(session_id, state.turn_count)
         return state
+
+    def _messages_to_compact(self, state: SessionState) -> list[SessionMessage]:
+        return self._compaction_split(state)[0]
+
+    def _compaction_split(self, state: SessionState) -> tuple[list[SessionMessage], int]:
+        """Return ``(messages_to_compact, keep_last_count)``.
+
+        Retention is token-budget based: keep newest messages until adding
+        another would exceed ``retain_context_fraction`` of the coordinator's
+        input budget. If no budget is advertised, compact the full verbatim
+        transcript into the summary.
+        """
+        if not state.messages:
+            return [], 0
+        budget = self._coordinator_input_token_budget()
+        if budget is None:
+            return list(state.messages), 0
+        retain_tokens = int(budget * self._config.retain_context_fraction)
+        if retain_tokens <= 0:
+            return list(state.messages), 0
+
+        kept_tokens = 0
+        keep_last = 0
+        for message in reversed(state.messages):
+            tokens = self._message_token_count(message)
+            if keep_last and kept_tokens + tokens > retain_tokens:
+                break
+            if not keep_last and tokens > retain_tokens:
+                # Always keep the newest message, even if it alone exceeds
+                # the retention target. Dropping the latest assistant reply
+                # makes resumption feel broken and loses immediate context.
+                keep_last = 1
+                break
+            kept_tokens += tokens
+            keep_last += 1
+
+        if keep_last >= len(state.messages):
+            return [], len(state.messages)
+        return state.messages[:-keep_last] if keep_last else list(state.messages), keep_last
+
+    def _messages_since_reconcile(self, state: SessionState) -> list[SessionMessage]:
+        if state.last_reconcile_turn <= 0:
+            return list(state.messages)
+        user_messages = sum(1 for message in state.messages if message.role == "user")
+        current_turn = state.turn_count - user_messages
+        pending: list[SessionMessage] = []
+        for message in state.messages:
+            if message.role == "user":
+                current_turn += 1
+            if current_turn > state.last_reconcile_turn:
+                pending.append(message)
+        return pending
+
+    async def _write_session_window_to_memory(
+        self,
+        *,
+        session_id: str,
+        messages: Sequence[SessionMessage],
+        goal_fallback: str,
+    ) -> None:
+        last_user = next((m.content for m in reversed(messages) if m.role == "user"), "")
+        last_assistant = next((m.content for m in reversed(messages) if m.role == "assistant"), "")
+        trace = [
+            {
+                "type": m.role,
+                "content": m.content,
+                "timestamp": m.created_at,
+            }
+            for m in messages
+        ]
+        await self._memory.write_run_end(
+            goal=str(last_user) if last_user else goal_fallback,
+            agent_results=[
+                {
+                    "agent_id": self._coordinator.config.agent_id,
+                    "answer": str(last_assistant),
+                    "confidence": 1.0,
+                    "session_id": session_id,
+                }
+            ],
+            trace=trace,
+        )
 
     async def _get_session_memory_context(self, session_id: str, *, message: str) -> str:
         """Return the per-session memory-context blob (cached).
@@ -804,9 +884,12 @@ class PersistentAgent:
         if state.summary:
             total += max(1, len(state.summary) // 4)
         for msg in state.messages:
-            content = msg.content if isinstance(msg.content, str) else str(msg.content)
-            total += max(1, len(content) // 4)
+            total += self._message_token_count(msg)
         return total
+
+    def _message_token_count(self, message: SessionMessage) -> int:
+        content = message.content if isinstance(message.content, str) else str(message.content)
+        return max(1, len(content) // 4)
 
     def _maybe_fire_async_reconcile(self, session_id: str, state: SessionState) -> None:
         """Background reconcile every ``async_reconcile_every_turns`` turns.
@@ -835,29 +918,21 @@ class PersistentAgent:
         window = state.messages[-(2 * interval) :]
         if not window:
             return
-        last_user = next((m.content for m in reversed(window) if m.role == "user"), "")
-        last_assistant = next((m.content for m in reversed(window) if m.role == "assistant"), "")
-        trace = [
-            {
-                "type": m.role,
-                "content": m.content,
-                "timestamp": m.created_at,
-            }
-            for m in window
-        ]
-        fire(
-            self._memory.write_run_end(
-                goal=str(last_user) if last_user else "(background session reconcile)",
-                agent_results=[
-                    {
-                        "agent_id": self._coordinator.config.agent_id,
-                        "answer": str(last_assistant),
-                        "confidence": 1.0,
-                    }
-                ],
-                trace=trace,
-            )
+        fire(self._async_reconcile_window(session_id, turn_count=state.turn_count, window=window))
+
+    async def _async_reconcile_window(
+        self,
+        session_id: str,
+        *,
+        turn_count: int,
+        window: Sequence[SessionMessage],
+    ) -> None:
+        await self._write_session_window_to_memory(
+            session_id=session_id,
+            messages=window,
+            goal_fallback="(background session reconcile)",
         )
+        await self._session_store.mark_reconciled(session_id, turn_count)
 
     async def _summarize_session(
         self,

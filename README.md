@@ -648,20 +648,26 @@ Persistent sessions also expose a small control surface for user interfaces:
 ```python
 state = await app.session_state("thread-1")
 cached = app.cached_memory_context("thread-1")
-await app.force_compact("thread-1")
+await app.save_to_memory("thread-1")   # reconcile pending turns, keep cache warm
+await app.force_compact("thread-1")    # structural reorg (summary + trim + reconcile + evict)
 app.forget_memory_cache("thread-1")
-await app.close("thread-1")
 ```
+
+There is deliberately no `close()` method — the SQLite transcript is the
+durable record, and any of `chat`/`save_to_memory`/`force_compact` on the
+same `session_id` later will resume from it. To exit, just stop calling
+`chat` (and let the process end).
 
 The demo maps those primitives to slash commands:
 
 - `/capabilities`, `/agents`, `/mcp` inspect wired agents and tools
 - `/session` shows turns, context-pressure estimate, reconcile cadence, and summary
 - `/memory` shows the cached per-session memory context
-- `/compact` forces a summary/trim cycle
+- `/save` flushes turns after the last reconcile checkpoint into long-term memory **without** evicting the cached prior (foreground prefix stays warm)
+- `/compact` forces a structural reorg — summary + trim + reconcile + cache evict — used when the transcript is bloating, not for routine "save"
 - `/forget` evicts cached memory context so the next turn refetches it
-- `/new` starts a fresh session id
-- `/end` performs a final reconcile and exits
+- `/new` starts a fresh session id (the previous transcript stays in SQLite, addressable by its id)
+- `/end` exits the demo — no auto-flush; call `/save` first if you want pending facts persisted
 
 Each chat turn gets a fresh `WorkingMemory`. Continuity comes from the
 SQLite session state (rolling summary + recent messages) and normal
@@ -681,9 +687,12 @@ chat turns within a compaction window. Four things make that work:
    `PersistentAgent`, and refreshed only at compaction or explicit
    "remember" signals.
 3. **Compaction triggers on context-size pressure, not turn counts.**
-   `compact_at_context_fraction=0.7` (default) reads the coordinator
+   `compact_at_context_fraction=0.5` (default) reads the coordinator
    LLM's `input_token_budget` and fires when the transcript crosses
-   ~70% of it. Chat-only sessions go thousands of turns between
+   ~50% of it. After compaction, `retain_context_fraction=0.15`
+   keeps the newest messages that fit in ~15% of the input budget
+   verbatim and folds older messages into the rolling summary.
+   Chat-only sessions go thousands of turns between
    compactions; browser-heavy sessions compact when budget pressure
    actually warrants it.
 4. **Background memory accumulation, foreground cache stability.**
