@@ -44,7 +44,12 @@ from agents.base import AgentConfig, BaseAgent
 from harness.console import ConsoleRenderer
 from harness.events import EventType
 from harness.executor_bridge import ExecutorBridge, ExecutorConfig, ExecutorTool, find_executor
-from harness.persistent import PersistentAgent, PersistentAgentConfig, SQLiteSessionStore
+from harness.persistent import (
+    PersistentAgent,
+    PersistentAgentConfig,
+    SessionState,
+    SQLiteSessionStore,
+)
 from harness.runtime import BudgetGuard, GuardrailConfig, Tracer
 from memory.manager import MemoryManager
 from memory.stores import SQLiteSemanticStore
@@ -208,6 +213,139 @@ def _build_llm(provider: str):
     raise ValueError(f"unsupported provider: {provider}")
 
 
+def _estimate_session_tokens(state: SessionState) -> int:
+    total = max(0, len(state.summary) // 4) if state.summary else 0
+    for message in state.messages:
+        content = message.content if isinstance(message.content, str) else str(message.content)
+        total += max(1, len(content) // 4)
+    return total
+
+
+def _print_capabilities(app: PersistentAgent) -> None:
+    caps = app.capabilities()
+    coordinator = caps["coordinator"]
+    print(f"Coordinator: {coordinator['agent_id']}")
+    for tool in coordinator.get("tools", []):
+        sub = next((s for s in caps["subagents"] if s["tool_name"] == tool), None)
+        if sub is None:
+            print(f"  - {tool}")
+            continue
+        print(f"  - {tool} -> {sub['agent_id']}")
+        for sub_tool in sub.get("tools", []):
+            print(f"      - {sub_tool}")
+
+
+def _print_agents(app: PersistentAgent) -> None:
+    caps = app.capabilities()
+    coordinator = caps["coordinator"]
+    print(f"{coordinator['agent_id']}: {coordinator['role']}")
+    for sub in caps["subagents"]:
+        print(f"{sub['agent_id']}: {sub['role']} (via {sub['tool_name']})")
+
+
+def _print_mcp(app: PersistentAgent) -> None:
+    tools = app.capabilities()["mcp_tools"]
+    if not tools:
+        print("No MCP tools are wired.")
+        return
+    by_owner: dict[str, list[dict]] = {}
+    for tool in tools:
+        by_owner.setdefault(tool["owner_agent_id"], []).append(tool)
+    for owner, owned_tools in sorted(by_owner.items()):
+        print(f"{owner}: {len(owned_tools)} MCP tools")
+        for tool in sorted(owned_tools, key=lambda t: t["name"]):
+            schema = tool.get("input_schema") or {}
+            props = schema.get("properties") if isinstance(schema, dict) else None
+            args = ", ".join(sorted(props)) if isinstance(props, dict) else ""
+            suffix = f"({args})" if args else "()"
+            description = tool.get("description") or ""
+            print(f"  - {tool['name']}{suffix}" + (f" — {description}" if description else ""))
+
+
+async def _print_session(
+    app: PersistentAgent,
+    *,
+    session_id: str,
+    config: PersistentAgentConfig,
+    llm,
+) -> None:
+    state = await app.session_state(session_id)
+    tokens = _estimate_session_tokens(state)
+    budget = getattr(llm, "input_token_budget", None)
+    if isinstance(budget, int) and budget > 0:
+        pct = (tokens / budget) * 100
+        token_line = f"{tokens:,} / {budget:,} tokens ({pct:.1f}%)"
+    else:
+        token_line = f"{tokens:,} estimated tokens"
+    interval = config.async_reconcile_every_turns
+    if interval > 0:
+        remaining = interval - (state.turn_count % interval)
+        reconcile = f"turn {state.turn_count + remaining} ({remaining} turn(s))"
+    else:
+        reconcile = "disabled"
+    print(f"session_id: {state.session_id}")
+    print(f"turns: {state.turn_count}")
+    print(f"transcript: {token_line}")
+    print(f"last reconcile turn: {state.last_reconcile_turn or 'never'}")
+    print(f"next async reconcile: {reconcile}")
+    print(f"last compaction turn: {state.last_compact_turn or 'never'}")
+    print(f"summary: {state.summary or '(none)'}")
+
+
+def _print_memory(app: PersistentAgent, *, session_id: str) -> None:
+    context = app.cached_memory_context(session_id)
+    if context is None:
+        print("memory cache: not loaded yet")
+    elif not context:
+        print("memory cache: loaded, no relevant facts or episodes")
+    else:
+        print("memory cache:")
+        print(context)
+
+
+async def _handle_slash_command(
+    message: str,
+    *,
+    app: PersistentAgent,
+    session_id: str,
+    config: PersistentAgentConfig,
+    llm,
+) -> tuple[bool, str, bool]:
+    if not message.startswith("/"):
+        return False, session_id, False
+    command = message.split(maxsplit=1)[0].lower()
+
+    if command in {"/help", "/?"}:
+        print("Commands: /capabilities, /agents, /mcp, /session, /memory")
+        print("          /compact, /forget, /new, /end")
+    elif command == "/capabilities":
+        _print_capabilities(app)
+    elif command == "/agents":
+        _print_agents(app)
+    elif command == "/mcp":
+        _print_mcp(app)
+    elif command == "/session":
+        await _print_session(app, session_id=session_id, config=config, llm=llm)
+    elif command == "/memory":
+        _print_memory(app, session_id=session_id)
+    elif command == "/compact":
+        state = await app.force_compact(session_id)
+        print(f"compacted session {session_id}; last_compact_turn={state.last_compact_turn}")
+    elif command == "/forget":
+        app.forget_memory_cache(session_id)
+        print(f"forgot cached memory context for session {session_id}")
+    elif command == "/new":
+        session_id = f"sess_{uuid4().hex[:12]}"
+        print(f"new session: {session_id}")
+    elif command == "/end":
+        state = await app.close(session_id)
+        print(f"closed session {session_id}; last_reconcile_turn={state.last_reconcile_turn}")
+        return True, session_id, True
+    else:
+        print(f"Unknown command: {command}. Try /help.")
+    return True, session_id, False
+
+
 async def main() -> None:
     args = _parse_args()
     if shutil.which("npx") is None:
@@ -329,6 +467,20 @@ async def main() -> None:
         )
 
         session_id = f"sess_{uuid4().hex[:12]}" if args.new_session else args.session_id
+        persistent_config = PersistentAgentConfig(
+            recent_messages=8,
+            # Defaults are sensible — explicit here for visibility.
+            # ``compact_at_context_fraction=0.7`` reads
+            # ``coordinator._llm.input_token_budget`` (~123K for
+            # gpt-5.4-mini) so compaction fires only under real
+            # context pressure, not on arbitrary turn counts.
+            # ``async_reconcile_every_turns=10`` runs a non-blocking
+            # background ``write_run_end`` every 10 turns over the
+            # last 10 turn-pairs from the durable transcript —
+            # memory accumulates without thrashing the prefix cache.
+            compact_at_context_fraction=0.7,
+            async_reconcile_every_turns=10,
+        )
         app = PersistentAgent(
             coordinator=coordinator,
             session_store=SQLiteSessionStore(session_path),
@@ -337,20 +489,7 @@ async def main() -> None:
             guard_factory=lambda: BudgetGuard(
                 GuardrailConfig(max_total_cost_usd=2.0, max_wall_time_seconds=120)
             ),
-            config=PersistentAgentConfig(
-                recent_messages=8,
-                # Defaults are sensible — explicit here for visibility.
-                # ``compact_at_context_fraction=0.7`` reads
-                # ``coordinator._llm.input_token_budget`` (~123K for
-                # gpt-5.4-mini) so compaction fires only under real
-                # context pressure, not on arbitrary turn counts.
-                # ``async_reconcile_every_turns=10`` runs a non-blocking
-                # background ``write_run_end`` every 10 turns over the
-                # last 10 turn-pairs from the durable transcript —
-                # memory accumulates without thrashing the prefix cache.
-                compact_at_context_fraction=0.7,
-                async_reconcile_every_turns=10,
-            ),
+            config=persistent_config,
         )
         renderer = ConsoleRenderer()
 
@@ -367,7 +506,7 @@ async def main() -> None:
         if args.show_capabilities:
             print("\nCapabilities:")
             print(json.dumps(app.capabilities(), indent=2, default=str))
-        print("\nType a message. Use Ctrl-D or an empty line to exit.\n")
+        print("\nType a message. Use /help for controls. Ctrl-D, /end, or an empty line exits.\n")
 
         while True:
             try:
@@ -377,6 +516,17 @@ async def main() -> None:
                 return
             if not message:
                 return
+            handled, session_id, should_exit = await _handle_slash_command(
+                message,
+                app=app,
+                session_id=session_id,
+                config=persistent_config,
+                llm=llm,
+            )
+            if should_exit:
+                return
+            if handled:
+                continue
 
             final_answer = ""
             async for event in app.chat(message, session_id=session_id):

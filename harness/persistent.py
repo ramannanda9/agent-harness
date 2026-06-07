@@ -475,6 +475,67 @@ class PersistentAgent:
             "mcp_tools": mcp_tools,
         }
 
+    async def session_state(self, session_id: str) -> SessionState:
+        """Return a copy of the durable session state."""
+        return await self._session_store.load(session_id)
+
+    def cached_memory_context(self, session_id: str) -> str | None:
+        """Return the currently cached memory-context blob for a session, if any."""
+        return self._session_memory_context.get(session_id)
+
+    def forget_memory_cache(self, session_id: str) -> None:
+        """Drop cached memory context so the next turn fetches fresh memory."""
+        self._evict_session_memory_context(session_id)
+
+    async def force_compact(self, session_id: str) -> SessionState:
+        """Summarize and trim the older transcript portion immediately.
+
+        This uses the same compaction shape as automatic context-pressure
+        compaction: keep the most recent ``recent_messages`` verbatim, fold
+        older messages into the rolling summary, then evict cached memory
+        context so the next turn can pick up freshly reconciled facts.
+        """
+        state = await self._session_store.load(session_id)
+        state = await self._compact_session(session_id, state)
+        self._evict_session_memory_context(session_id)
+        return state
+
+    async def close(self, session_id: str) -> SessionState:
+        """Flush the current durable transcript window to long-term memory.
+
+        Closing does not delete the session transcript. It is a "session is
+        ending" hook: reconcile the stored messages, mark the session
+        reconciled, and clear cached memory context.
+        """
+        state = await self._session_store.load(session_id)
+        if state.messages:
+            last_user = next((m.content for m in reversed(state.messages) if m.role == "user"), "")
+            last_assistant = next(
+                (m.content for m in reversed(state.messages) if m.role == "assistant"), ""
+            )
+            trace = [
+                {
+                    "type": m.role,
+                    "content": m.content,
+                    "timestamp": m.created_at,
+                }
+                for m in state.messages
+            ]
+            await self._memory.write_run_end(
+                goal=str(last_user) if last_user else "(session close)",
+                agent_results=[
+                    {
+                        "agent_id": self._coordinator.config.agent_id,
+                        "answer": str(last_assistant),
+                        "confidence": 1.0,
+                    }
+                ],
+                trace=trace,
+            )
+            state = await self._session_store.mark_reconciled(session_id, state.turn_count)
+        self._evict_session_memory_context(session_id)
+        return state
+
     def _assign_guard(self, guard: Any) -> None:
         seen_agents: set[int] = set()
 
@@ -547,22 +608,9 @@ class PersistentAgent:
             self._maybe_fire_async_reconcile(session_id, state)
 
         if compacted:
-            # Compact only the OLDER portion — everything before the last
-            # ``recent_messages`` stays verbatim — so the still-recent
-            # turns remain byte-identical across the compaction boundary.
-            # This keeps OpenAI's prefix cache warm through compaction
-            # events (only the leading summary block changes; the verbatim
-            # tail does not).
-            keep = self._config.recent_messages
-            if keep <= 0:
-                to_compact = list(state.messages)
-            else:
-                to_compact = state.messages[:-keep] if len(state.messages) > keep else []
-            if to_compact:
-                summary = await self._summarize_session(state, messages_to_compact=to_compact)
-                state = await self._session_store.update_summary(session_id, summary)
-                await self._session_store.trim_messages(session_id, keep)
-                await self._session_store.mark_compacted(session_id, state.turn_count)
+            compacted_state = await self._compact_session(session_id, state)
+            if compacted_state.last_compact_turn != state.last_compact_turn:
+                state = compacted_state
                 # Compaction is the natural moment to reconcile the older
                 # transcript window into long-term memory: the reconciler
                 # LLM call colocates with the summary write, both touching
@@ -591,6 +639,23 @@ class PersistentAgent:
                     except Exception:  # noqa: BLE001 — best-effort at compaction
                         pass
                 self._evict_session_memory_context(session_id)
+
+    async def _compact_session(self, session_id: str, state: SessionState) -> SessionState:
+        # Compact only the OLDER portion — everything before the last
+        # ``recent_messages`` stays verbatim — so the still-recent turns
+        # remain byte-identical across the compaction boundary.
+        keep = self._config.recent_messages
+        if keep <= 0:
+            to_compact = list(state.messages)
+        else:
+            to_compact = state.messages[:-keep] if len(state.messages) > keep else []
+        if not to_compact:
+            return state
+        summary = await self._summarize_session(state, messages_to_compact=to_compact)
+        state = await self._session_store.update_summary(session_id, summary)
+        state = await self._session_store.trim_messages(session_id, keep)
+        state = await self._session_store.mark_compacted(session_id, state.turn_count)
+        return state
 
     async def _get_session_memory_context(self, session_id: str, *, message: str) -> str:
         """Return the per-session memory-context blob (cached).

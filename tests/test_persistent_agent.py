@@ -230,6 +230,102 @@ def test_persistent_agent_capabilities_lists_subagents_and_mcp_tools():
 
 
 @pytest.mark.asyncio
+async def test_persistent_agent_session_state_returns_store_state():
+    llm = _ChatLLM()
+    memory = _SpyMemory(llm)
+    store = InMemorySessionStore()
+    await store.append_messages("s", [SessionMessage(role="user", content="hello")])
+    app = PersistentAgent(
+        coordinator=_agent(llm=llm, memory=memory),
+        session_store=store,
+        memory=memory,
+        llm=llm,
+    )
+
+    state = await app.session_state("s")
+
+    assert state.session_id == "s"
+    assert state.turn_count == 1
+    assert state.messages[0].content == "hello"
+
+
+def test_persistent_agent_forget_memory_cache_evicts_session_context():
+    llm = _ChatLLM()
+    memory = _SpyMemory(llm)
+    app = PersistentAgent(
+        coordinator=_agent(llm=llm, memory=memory),
+        session_store=InMemorySessionStore(),
+        memory=memory,
+        llm=llm,
+    )
+    app._session_memory_context["s"] = "cached"
+
+    assert app.cached_memory_context("s") == "cached"
+    app.forget_memory_cache("s")
+
+    assert app.cached_memory_context("s") is None
+
+
+@pytest.mark.asyncio
+async def test_persistent_agent_force_compact_summarizes_and_trims():
+    llm = _ChatLLM()
+    memory = _SpyMemory(llm)
+    store = InMemorySessionStore()
+    await store.append_messages(
+        "s",
+        [
+            SessionMessage(role="user", content="old user"),
+            SessionMessage(role="assistant", content="old assistant"),
+            SessionMessage(role="user", content="recent user"),
+            SessionMessage(role="assistant", content="recent assistant"),
+        ],
+    )
+    app = PersistentAgent(
+        coordinator=_agent(llm=llm, memory=memory),
+        session_store=store,
+        memory=memory,
+        llm=llm,
+        config=PersistentAgentConfig(recent_messages=2),
+    )
+    app._session_memory_context["s"] = "cached"
+
+    state = await app.force_compact("s")
+
+    assert state.summary == "The user likes the proposed approach."
+    assert [m.content for m in state.messages] == ["recent user", "recent assistant"]
+    assert state.last_compact_turn == 2
+    assert app.cached_memory_context("s") is None
+
+
+@pytest.mark.asyncio
+async def test_persistent_agent_close_reconciles_and_evicts_cache():
+    llm = _ChatLLM()
+    memory = _SpyMemory(llm)
+    store = InMemorySessionStore()
+    await store.append_messages(
+        "s",
+        [
+            SessionMessage(role="user", content="remember final preference"),
+            SessionMessage(role="assistant", content="noted"),
+        ],
+    )
+    app = PersistentAgent(
+        coordinator=_agent(llm=llm, memory=memory),
+        session_store=store,
+        memory=memory,
+        llm=llm,
+    )
+    app._session_memory_context["s"] = "cached"
+
+    state = await app.close("s")
+
+    assert state.last_reconcile_turn == 1
+    assert memory.run_writes
+    assert memory.run_writes[-1]["goal"] == "remember final preference"
+    assert app.cached_memory_context("s") is None
+
+
+@pytest.mark.asyncio
 async def test_persistent_agent_refreshes_guard_per_turn_for_coordinator_and_subagents():
     llm = _ChatLLM()
     memory = _SpyMemory(llm)

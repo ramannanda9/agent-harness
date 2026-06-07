@@ -643,6 +643,26 @@ Use `app.capabilities()` to inspect the already-wired coordinator,
 sub-agents, and MCP tools. The demo exposes this with
 `--show-capabilities`.
 
+Persistent sessions also expose a small control surface for user interfaces:
+
+```python
+state = await app.session_state("thread-1")
+cached = app.cached_memory_context("thread-1")
+await app.force_compact("thread-1")
+app.forget_memory_cache("thread-1")
+await app.close("thread-1")
+```
+
+The demo maps those primitives to slash commands:
+
+- `/capabilities`, `/agents`, `/mcp` inspect wired agents and tools
+- `/session` shows turns, context-pressure estimate, reconcile cadence, and summary
+- `/memory` shows the cached per-session memory context
+- `/compact` forces a summary/trim cycle
+- `/forget` evicts cached memory context so the next turn refetches it
+- `/new` starts a fresh session id
+- `/end` performs a final reconcile and exits
+
 Each chat turn gets a fresh `WorkingMemory`. Continuity comes from the
 SQLite session state (rolling summary + recent messages) and normal
 `MemoryManager` recall, not from carrying old ReAct scratchpads forever.
@@ -714,11 +734,13 @@ python examples/persistent_agent_demo.py --provider claude-code
 The wrapper owns cadence:
 
 - session transcript is written every turn without an LLM;
-- `MemoryManager.write_run_end(...)` is called only when the turn has a
-  durable signal, tool/sub-agent work, errors, or the configured interval
-  has elapsed;
-- session compaction runs at message/turn thresholds and updates the
-  stored summary.
+- `MemoryManager.write_run_end(...)` runs synchronously only for explicit
+  durable user signals such as "remember" / "prefer" / "always";
+- background async reconciliation samples the durable transcript every
+  `async_reconcile_every_turns` turns without evicting the current
+  session's memory-context cache;
+- session compaction runs under context pressure and updates the stored
+  summary while trimming older transcript messages.
 
 For MCP, put MCP tools on the coordinator or sub-agents before wrapping.
 `PersistentAgent` does not special-case MCP auth; it preserves the existing
