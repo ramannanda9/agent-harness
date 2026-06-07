@@ -19,6 +19,7 @@ from typing import Any, Protocol
 
 from agents.base import BaseAgent
 from harness.events import BusEvent, EventType
+from harness.utils import fire
 from memory.manager import MemoryManager
 
 
@@ -311,6 +312,15 @@ class PersistentAgentConfig:
     # for the current turn's task, any tool observations it will produce,
     # and tokeniser variance.
     compact_at_context_fraction: float = 0.7
+    # Background memory accumulation: every N turns, schedule a
+    # non-blocking ``write_run_end`` over the last N turns of the durable
+    # session transcript. The current session's per-session memory
+    # context cache is **not** evicted, so the prompt prefix stays
+    # byte-identical and OpenAI / Anthropic prefix caches keep hitting.
+    # The reconciler's new facts are visible to OTHER sessions
+    # immediately and to THIS session at the next compaction (where the
+    # cache breaks anyway). Set to 0 to disable.
+    async_reconcile_every_turns: int = 10
     durable_signal_terms: tuple[str, ...] = (
         "remember",
         "always",
@@ -505,13 +515,14 @@ class PersistentAgent:
             ],
         )
 
-        if self._should_reconcile(
+        sync_reconciled = self._should_reconcile(
             message=message,
             state=state,
             tools_used=tools_used,
             subagents_used=subagents_used,
             errors=errors,
-        ):
+        )
+        if sync_reconciled:
             await self._memory.write_run_end(
                 goal=message,
                 agent_results=[final_result or {"error": errors[-1] if errors else "no result"}],
@@ -525,7 +536,17 @@ class PersistentAgent:
             # most one more if the new facts actually changed retrieval.
             self._evict_session_memory_context(session_id)
 
-        if self._should_compact(state):
+        compacted = self._should_compact(state)
+        if not sync_reconciled and not compacted:
+            # Background memory accumulation. The fire-and-forget reconcile
+            # uses the durable transcript window — no buffer to maintain —
+            # and intentionally does NOT evict the per-session memory
+            # context cache. New facts land in the long-term store
+            # immediately for OTHER sessions; THIS session sees them at
+            # the next compaction.
+            self._maybe_fire_async_reconcile(session_id, state)
+
+        if compacted:
             # Compact only the OLDER portion — everything before the last
             # ``recent_messages`` stays verbatim — so the still-recent
             # turns remain byte-identical across the compaction boundary.
@@ -721,6 +742,57 @@ class PersistentAgent:
             content = msg.content if isinstance(msg.content, str) else str(msg.content)
             total += max(1, len(content) // 4)
         return total
+
+    def _maybe_fire_async_reconcile(self, session_id: str, state: SessionState) -> None:
+        """Background reconcile every ``async_reconcile_every_turns`` turns.
+
+        Samples the durable session transcript directly — no separate
+        evidence buffer to maintain. Fires ``write_run_end`` via
+        ``fire()`` so the chat turn never blocks on the reconciler LLM
+        call, and crucially does NOT evict the per-session memory
+        context cache. The session's prompt prefix therefore stays
+        byte-identical → prefix cache keeps hitting.
+
+        New facts land in the long-term store immediately for other
+        sessions; THIS session sees them at the next compaction (where
+        the cache is already breaking for the summary refresh anyway).
+        """
+        interval = self._config.async_reconcile_every_turns
+        if interval <= 0:
+            return
+        if state.turn_count == 0 or state.turn_count % interval != 0:
+            return
+
+        # Sample the last N turn-pairs (= 2N messages) from the durable
+        # transcript. Each turn is one user message + one assistant
+        # reply; the reconciler sees a coherent slice of conversation
+        # and can make MERGE / NOOP / UPDATE decisions across it.
+        window = state.messages[-(2 * interval) :]
+        if not window:
+            return
+        last_user = next((m.content for m in reversed(window) if m.role == "user"), "")
+        last_assistant = next((m.content for m in reversed(window) if m.role == "assistant"), "")
+        trace = [
+            {
+                "type": m.role,
+                "content": m.content,
+                "timestamp": m.created_at,
+            }
+            for m in window
+        ]
+        fire(
+            self._memory.write_run_end(
+                goal=str(last_user) if last_user else "(background session reconcile)",
+                agent_results=[
+                    {
+                        "agent_id": self._coordinator.config.agent_id,
+                        "answer": str(last_assistant),
+                        "confidence": 1.0,
+                    }
+                ],
+                trace=trace,
+            )
+        )
 
     async def _summarize_session(
         self,

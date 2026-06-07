@@ -648,7 +648,7 @@ SQLite session state (rolling summary + recent messages) and normal
 `MemoryManager` recall, not from carrying old ReAct scratchpads forever.
 
 **Prefix-cache aware.** The full prompt stays byte-identical across plain
-chat turns within a compaction window. Three things make that work:
+chat turns within a compaction window. Four things make that work:
 
 1. The accumulated session transcript is sent to the coordinator as real
    `user`/`assistant` role messages — not folded into one inline-rendered
@@ -658,20 +658,37 @@ chat turns within a compaction window. Three things make that work:
    pinned user-message prior, **not in the system prompt**. The system
    prompt is now pure agent identity + tool list + ReAct format — purely
    static. Memory context is fetched once per session, cached on the
-   `PersistentAgent`, and refreshed only at compaction or high-signal
-   reconcile (so it doesn't shift turn-to-turn just because the goal
-   changed).
-3. Long-term memory writes are **deferred to compaction**, not fired
-   periodically. The session transcript is the per-turn journal — facts
-   land in long-term memory only when we're already breaking cache (at
-   compaction or high-signal events like tool runs / "remember" terms).
-   The legacy `reconcile_every_turns` knob is a no-op.
+   `PersistentAgent`, and refreshed only at compaction or explicit
+   "remember" signals.
+3. **Compaction triggers on context-size pressure, not turn counts.**
+   `compact_at_context_fraction=0.7` (default) reads the coordinator
+   LLM's `input_token_budget` and fires when the transcript crosses
+   ~70% of it. Chat-only sessions go thousands of turns between
+   compactions; browser-heavy sessions compact when budget pressure
+   actually warrants it.
+4. **Background memory accumulation, foreground cache stability.**
+   Every `async_reconcile_every_turns` turns (default 10), a
+   non-blocking `write_run_end` samples the last N turn-pairs from the
+   durable transcript and updates long-term memory — but does **not**
+   evict the per-session memory cache. New facts are immediately
+   visible to OTHER sessions; THIS session sees them at the next
+   compaction (where the cache is already breaking for the summary
+   refresh).
 
 OpenAI's automatic prefix cache and Anthropic's `cache_control` markers
-both match on longest-identical prefix. Together these three changes let
-a typical session pay one cold compaction every ~12 turns plus ~K turns
-of warm-prefix hits in between, instead of paying full price every
-turn.
+both match on longest-identical prefix. Together these four changes let
+a typical session pay one cold compaction when the transcript actually
+fills the context window, with warm cache hits on every turn in
+between, while still accumulating memory in the background.
+
+The legacy `reconcile_every_turns`, `compact_every_turns`, and
+`compact_message_threshold` knobs have been **removed** — passing them
+to `PersistentAgentConfig` is a clear `TypeError` rather than a silent
+no-op so existing user code can be updated explicitly. Reconciliation
+fires on (a) user-explicit `remember` / `prefer` / `always` / etc.
+signals (immediate, evicts cache), (b) periodic background async path
+(non-blocking, no eviction), or (c) compaction (with the summary LLM
+call, evicts cache).
 
 The demo stores local state under `~/.agent-harness` by default:
 

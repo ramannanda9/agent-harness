@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
@@ -418,13 +419,119 @@ async def test_persistent_agent_reconciles_on_explicit_remember_term():
         session_store=InMemorySessionStore(),
         memory=memory,
         llm=llm,
-        config=PersistentAgentConfig(compact_at_context_fraction=1.0),
+        config=PersistentAgentConfig(
+            compact_at_context_fraction=1.0,
+            async_reconcile_every_turns=0,  # disable for focused assertion
+        ),
     )
 
     [event async for event in app.chat("please remember I prefer concise answers")]
 
     assert memory.run_writes, (
         "explicit 'remember' / 'prefer' signal should trigger immediate reconcile"
+    )
+
+
+# ── Async background reconcile ───────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_async_reconcile_fires_at_interval_without_evicting_cache():
+    """Every ``async_reconcile_every_turns`` turns, a background reconcile
+    runs against the durable session transcript window. The session's
+    memory-context cache must NOT be evicted — that's the whole point of
+    the async path. Memory accumulates without thrashing prefix cache."""
+    llm = _ChatLLM()
+    memory = _SpyMemory(llm)
+    store = InMemorySessionStore()
+    app = PersistentAgent(
+        coordinator=_agent(llm=llm, memory=memory),
+        session_store=store,
+        memory=memory,
+        llm=llm,
+        config=PersistentAgentConfig(
+            compact_at_context_fraction=1.0,  # disable compaction trigger
+            async_reconcile_every_turns=3,
+        ),
+    )
+
+    # Prime the per-session memory context cache by running one turn.
+    [event async for event in app.chat("first turn", session_id="async")]
+    cached_before = app._session_memory_context.get("async")
+
+    # Turn 2: not an interval boundary → no async fire.
+    [event async for event in app.chat("second turn", session_id="async")]
+    assert not memory.run_writes, "turn 2 should not trigger async reconcile"
+
+    # Turn 3: hits the interval → async reconcile fires. Give the
+    # fire-and-forget task a tick to land.
+    [event async for event in app.chat("third turn", session_id="async")]
+    await asyncio.sleep(0)
+
+    assert memory.run_writes, "turn 3 (interval) should fire async reconcile"
+    # Crucially: the memory context cache was NOT evicted. Identity matters
+    # — if it had been refetched, ``cached_before`` would no longer be
+    # the value at ``self._session_memory_context["async"]``.
+    cached_after = app._session_memory_context.get("async")
+    assert cached_after == cached_before, (
+        "async reconcile must NOT evict the per-session memory context cache"
+    )
+
+
+@pytest.mark.asyncio
+async def test_async_reconcile_samples_transcript_window():
+    """The async reconcile pulls evidence from the durable transcript —
+    not just the trigger turn. The reconciler sees the last N turn-pairs
+    so it can make MERGE / NOOP decisions across the window instead of
+    treating every fact as a fresh ADD."""
+    llm = _ChatLLM()
+    memory = _SpyMemory(llm)
+    app = PersistentAgent(
+        coordinator=_agent(llm=llm, memory=memory),
+        session_store=InMemorySessionStore(),
+        memory=memory,
+        llm=llm,
+        config=PersistentAgentConfig(
+            compact_at_context_fraction=1.0,
+            async_reconcile_every_turns=2,  # smaller for the test
+        ),
+    )
+
+    [event async for event in app.chat("turn-A msg", session_id="winfocus")]
+    [event async for event in app.chat("turn-B msg", session_id="winfocus")]
+    await asyncio.sleep(0)
+
+    assert memory.run_writes, "turn 2 (interval=2) should fire async reconcile"
+    trace = memory.run_writes[-1]["trace"]
+    trace_contents = [t.get("content") for t in trace]
+    # Both turn-A and turn-B's user messages should appear in the trace
+    # — confirming the reconciler sees the WINDOW, not just the trigger
+    # turn's evidence.
+    assert "turn-A msg" in trace_contents
+    assert "turn-B msg" in trace_contents
+
+
+@pytest.mark.asyncio
+async def test_async_reconcile_disabled_with_zero_interval():
+    llm = _ChatLLM()
+    memory = _SpyMemory(llm)
+    app = PersistentAgent(
+        coordinator=_agent(llm=llm, memory=memory),
+        session_store=InMemorySessionStore(),
+        memory=memory,
+        llm=llm,
+        config=PersistentAgentConfig(
+            compact_at_context_fraction=1.0,
+            async_reconcile_every_turns=0,
+        ),
+    )
+
+    for i in range(15):
+        [event async for event in app.chat(f"turn {i}", session_id="off")]
+    await asyncio.sleep(0)
+
+    assert not memory.run_writes, (
+        "async_reconcile_every_turns=0 must fully disable the background path"
     )
 
 
