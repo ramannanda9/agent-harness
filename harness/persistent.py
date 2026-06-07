@@ -459,6 +459,16 @@ class PersistentAgent:
         # context is byte-identical across turns.
         self._session_memory_context: dict[str, str] = {}
 
+    @property
+    def config(self) -> PersistentAgentConfig:
+        """Persistent session policy used by this wrapper."""
+        return self._config
+
+    @property
+    def llm(self) -> Any:
+        """LLM used for session summarization/control introspection."""
+        return self._llm
+
     async def chat(
         self,
         message: str,

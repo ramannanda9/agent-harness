@@ -259,6 +259,22 @@ def test_persistent_agent_capabilities_lists_subagents_and_mcp_tools():
     }
 
 
+def test_persistent_agent_exposes_config_and_llm():
+    llm = _ChatLLM()
+    memory = _SpyMemory(llm)
+    config = PersistentAgentConfig(retain_context_fraction=0.2)
+    app = PersistentAgent(
+        coordinator=_agent(llm=llm, memory=memory),
+        session_store=InMemorySessionStore(),
+        memory=memory,
+        llm=llm,
+        config=config,
+    )
+
+    assert app.config is config
+    assert app.llm is llm
+
+
 @pytest.mark.asyncio
 async def test_persistent_agent_session_state_returns_store_state():
     llm = _ChatLLM()

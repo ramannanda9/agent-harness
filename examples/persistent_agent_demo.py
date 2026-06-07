@@ -358,7 +358,7 @@ async def main() -> None:
             config=persistent_config,
         )
         renderer = ConsoleRenderer()
-        controls = PersistentCommandHandler(app, config=persistent_config, llm=llm)
+        controls = PersistentCommandHandler(app)
 
         print("Persistent agent ready.")
         print(f"Session: {session_id}")

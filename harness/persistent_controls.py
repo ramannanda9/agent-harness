@@ -29,12 +29,12 @@ class PersistentCommandHandler:
         self,
         app: PersistentAgent,
         *,
-        config: PersistentAgentConfig,
-        llm: Any,
+        config: PersistentAgentConfig | None = None,
+        llm: Any | None = None,
     ) -> None:
         self._app = app
-        self._config = config
-        self._llm = llm
+        self._config = config or app.config
+        self._llm = llm or app.llm
 
     async def handle(self, message: str, *, session_id: str) -> PersistentCommandResult:
         if not message.startswith("/"):

@@ -668,7 +668,7 @@ primitives and returns structured results:
 ```python
 from harness.persistent_controls import PersistentCommandHandler
 
-controls = PersistentCommandHandler(app, config=persistent_config, llm=llm)
+controls = PersistentCommandHandler(app)
 result = await controls.handle("/sessions research", session_id=session_id)
 if result.session_id:
     session_id = result.session_id

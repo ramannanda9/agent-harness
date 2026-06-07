@@ -72,7 +72,7 @@ def _app():
 @pytest.mark.asyncio
 async def test_command_handler_ignores_non_commands():
     app, _, llm = _app()
-    handler = PersistentCommandHandler(app, config=PersistentAgentConfig(), llm=llm)
+    handler = PersistentCommandHandler(app)
 
     result = await handler.handle("hello", session_id="default")
 
@@ -83,7 +83,7 @@ async def test_command_handler_ignores_non_commands():
 @pytest.mark.asyncio
 async def test_command_handler_switch_new_sessions_and_filters():
     app, _, llm = _app()
-    handler = PersistentCommandHandler(app, config=PersistentAgentConfig(), llm=llm)
+    handler = PersistentCommandHandler(app)
 
     created = await handler.handle("/new research", session_id="default")
     assert created.handled is True
@@ -105,7 +105,7 @@ async def test_command_handler_switch_new_sessions_and_filters():
 @pytest.mark.asyncio
 async def test_command_handler_save_clear_delete_and_end():
     app, memory, llm = _app()
-    handler = PersistentCommandHandler(app, config=PersistentAgentConfig(), llm=llm)
+    handler = PersistentCommandHandler(app)
     await app.session_state("work")
     await app._session_store.append_messages(
         "work",
