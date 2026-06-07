@@ -672,7 +672,7 @@ The demo maps those primitives to slash commands:
 - `/forget` evicts cached memory context so the next turn refetches it
 - `/switch <id>` resumes or creates a logical session id
 - `/new [id]` starts a fresh session id and refuses to collide with an existing id
-- `/clear confirm` clears the current transcript/summary/counters; long-term memory is retained
+- `/clear` clears the current transcript/summary/counters; long-term memory is retained
 - `/delete [id] confirm` deletes a transcript row; long-term memory is retained
 - `/end` exits the demo — no auto-flush; call `/save` first if you want pending facts persisted
 

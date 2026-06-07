@@ -349,7 +349,7 @@ async def _handle_slash_command(
         print("Session:  /sessions list known sessions")
         print("          /switch <id> switch to an existing or new logical session")
         print("          /new [id] create a new session; refuses if id exists")
-        print("          /clear confirm clear current transcript; memory retained")
+        print("          /clear    clear current transcript; memory retained")
         print("          /delete [id] confirm delete transcript; memory retained")
         print("          /end      exit the demo; transcript stays in SQLite")
     elif command == "/capabilities":
@@ -407,10 +407,6 @@ async def _handle_slash_command(
         session_id = next_session_id
         print(f"new session: {session_id} (previous transcript preserved in SQLite)")
     elif command == "/clear":
-        if message.strip() != "/clear confirm":
-            print("usage: /clear confirm")
-            print(f"clears transcript for {session_id}; long-term memory is retained")
-            return True, session_id, False
         await app.clear_session(session_id)
         print(f"cleared session {session_id} transcript; long-term memory retained")
     elif command == "/delete":
