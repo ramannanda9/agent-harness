@@ -48,7 +48,9 @@ class SessionState:
 class SessionStore(Protocol):
     async def load(self, session_id: str) -> SessionState: ...
 
-    async def list_sessions(self) -> list[SessionState]: ...
+    async def exists(self, session_id: str) -> bool: ...
+
+    async def list_sessions(self, *, query: str | None = None) -> list[SessionState]: ...
 
     async def append_messages(
         self, session_id: str, messages: Sequence[SessionMessage]
@@ -80,9 +82,16 @@ class InMemorySessionStore:
             self._sessions[session_id] = state
         return _copy_state(state)
 
-    async def list_sessions(self) -> list[SessionState]:
+    async def exists(self, session_id: str) -> bool:
+        return session_id in self._sessions
+
+    async def list_sessions(self, *, query: str | None = None) -> list[SessionState]:
+        needle = query.lower() if query else None
+        states = self._sessions.values()
+        if needle:
+            states = [state for state in states if needle in state.session_id.lower()]
         return sorted(
-            (_copy_state(state) for state in self._sessions.values()),
+            (_copy_state(state) for state in states),
             key=lambda state: state.updated_at,
             reverse=True,
         )
@@ -148,16 +157,36 @@ class SQLiteSessionStore:
             self._ensure_session(conn, session_id)
             return self._load_locked(conn, session_id)
 
-    async def list_sessions(self) -> list[SessionState]:
+    async def exists(self, session_id: str) -> bool:
         self._ensure_schema()
         with self._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT session_id
-                FROM sessions
-                ORDER BY updated_at DESC, session_id ASC
-                """
-            ).fetchall()
+            row = conn.execute(
+                "SELECT 1 FROM sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            return row is not None
+
+    async def list_sessions(self, *, query: str | None = None) -> list[SessionState]:
+        self._ensure_schema()
+        with self._connect() as conn:
+            if query:
+                rows = conn.execute(
+                    """
+                    SELECT session_id
+                    FROM sessions
+                    WHERE lower(session_id) LIKE ?
+                    ORDER BY updated_at DESC, session_id ASC
+                    """,
+                    (f"%{query.lower()}%",),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT session_id
+                    FROM sessions
+                    ORDER BY updated_at DESC, session_id ASC
+                    """
+                ).fetchall()
             return [self._load_locked(conn, row["session_id"]) for row in rows]
 
     async def append_messages(
@@ -548,13 +577,13 @@ class PersistentAgent:
         """Return a copy of the durable session state."""
         return await self._session_store.load(session_id)
 
-    async def list_sessions(self) -> list[SessionState]:
+    async def list_sessions(self, *, query: str | None = None) -> list[SessionState]:
         """Return known durable sessions, newest first when supported by the store."""
-        return await self._session_store.list_sessions()
+        return await self._session_store.list_sessions(query=query)
 
     async def session_exists(self, session_id: str) -> bool:
         """Return whether a session exists without creating it."""
-        return any(state.session_id == session_id for state in await self.list_sessions())
+        return await self._session_store.exists(session_id)
 
     def cached_memory_context(self, session_id: str) -> str | None:
         """Return the currently cached memory-context blob for a session, if any."""

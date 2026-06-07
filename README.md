@@ -648,6 +648,7 @@ Persistent sessions also expose a small control surface for user interfaces:
 ```python
 state = await app.session_state("thread-1")
 sessions = await app.list_sessions()
+matches = await app.list_sessions(query="research")
 cached = app.cached_memory_context("thread-1")
 await app.save_to_memory("thread-1")   # reconcile pending turns, keep cache warm
 await app.force_compact("thread-1")    # structural reorg (summary + trim + reconcile + evict)
@@ -665,7 +666,7 @@ The demo maps those primitives to slash commands:
 
 - `/capabilities`, `/agents`, `/mcp` inspect wired agents and tools
 - `/session` shows turns, context-pressure estimate, reconcile cadence, and summary
-- `/sessions` lists known session ids
+- `/sessions [query]` lists known session ids, optionally filtered by id text
 - `/memory` shows the cached per-session memory context
 - `/save` flushes turns after the last reconcile checkpoint into long-term memory **without** evicting the cached prior (foreground prefix stays warm)
 - `/compact` forces a structural reorg — summary + trim + reconcile + cache evict — used when the transcript is bloating, not for routine "save"

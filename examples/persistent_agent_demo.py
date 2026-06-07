@@ -315,10 +315,12 @@ def _session_arg(command: str, message: str) -> str:
     return parts[0]
 
 
-async def _print_sessions(app: PersistentAgent, *, current_session_id: str) -> None:
-    sessions = await app.list_sessions()
+async def _print_sessions(
+    app: PersistentAgent, *, current_session_id: str, query: str | None = None
+) -> None:
+    sessions = await app.list_sessions(query=query)
     if not sessions:
-        print("No sessions found.")
+        print(f"No sessions found{f' matching {query!r}' if query else ''}.")
         return
     for state in sessions:
         marker = "*" if state.session_id == current_session_id else " "
@@ -346,7 +348,7 @@ async def _handle_slash_command(
         print("Memory:   /save     reconcile recent turns into long-term memory")
         print("          /compact  structural reorg: summary + trim + reconcile")
         print("          /forget   drop this session's cached memory prior")
-        print("Session:  /sessions list known sessions")
+        print("Session:  /sessions [query] list known sessions")
         print("          /switch <id> switch to an existing or new logical session")
         print("          /new [id] create a new session; refuses if id exists")
         print("          /clear    clear current transcript; memory retained")
@@ -363,7 +365,8 @@ async def _handle_slash_command(
     elif command == "/memory":
         _print_memory(app, session_id=session_id)
     elif command == "/sessions":
-        await _print_sessions(app, current_session_id=session_id)
+        query = message[len(command) :].strip() or None
+        await _print_sessions(app, current_session_id=session_id, query=query)
     elif command == "/save":
         count = await app.save_to_memory(session_id)
         if count:

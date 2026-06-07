@@ -157,6 +157,9 @@ async def test_sqlite_session_store_lists_clears_and_deletes_sessions(tmp_path):
 
     listed = await store.list_sessions()
     assert {state.session_id for state in listed} == {"alpha", "beta"}
+    assert await store.exists("alpha") is True
+    assert await store.exists("missing") is False
+    assert [state.session_id for state in await store.list_sessions(query="alp")] == ["alpha"]
 
     cleared = await store.clear("alpha")
     assert cleared.messages == []
@@ -310,6 +313,7 @@ async def test_persistent_agent_lists_clears_and_deletes_sessions():
     assert await app.session_exists("s") is True
     assert await app.session_exists("missing") is False
     assert [state.session_id for state in await app.list_sessions()] == ["s"]
+    assert [state.session_id for state in await app.list_sessions(query="S")] == ["s"]
 
     cleared = await app.clear_session("s")
     assert cleared.messages == []
