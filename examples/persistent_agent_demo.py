@@ -39,16 +39,14 @@ from pathlib import Path
 from uuid import uuid4
 
 from mcp import StdioServerParameters
-from prompt_toolkit import PromptSession
-from prompt_toolkit.history import FileHistory
 
 from agents.base import AgentConfig, BaseAgent
 from harness.console import ConsoleRenderer
 from harness.events import EventType
 from harness.executor_bridge import ExecutorBridge, ExecutorConfig, ExecutorTool, find_executor
 from harness.persistent import PersistentAgent, PersistentAgentConfig, SQLiteSessionStore
-from harness.persistent_completion import SlashCommandCompleter
 from harness.persistent_controls import PersistentCommandHandler
+from harness.persistent_prompt import build_chat_prompt_session
 from harness.runtime import BudgetGuard, GuardrailConfig, Tracer
 from memory.manager import MemoryManager
 from memory.stores import SQLiteSemanticStore
@@ -373,17 +371,13 @@ async def main() -> None:
         )
         renderer = ConsoleRenderer()
         controls = PersistentCommandHandler(app)
-        # prompt_toolkit input: Tab-complete slash commands via
-        # ``SlashCommandCompleter`` (commands + session-id arguments) and
-        # persist command history across runs in ``state_dir``. Falls back
-        # to the framework default of complete-on-tab so we don't query
-        # the session store on every keystroke.
-        history_path = Path(args.state_dir).expanduser() / "demo_history"
-        history_path.parent.mkdir(parents=True, exist_ok=True)
-        prompt_session: PromptSession[str] = PromptSession(
-            history=FileHistory(str(history_path)),
-            completer=SlashCommandCompleter(app),
-            complete_while_typing=False,
+        # Chat-style input: multi-line buffer with Enter to submit,
+        # Ctrl+J / Esc-Enter for newline, slash-command + session-id
+        # Tab-completion, command history persisted in ``state_dir``.
+        # All configured in one place — see ``build_chat_prompt_session``.
+        prompt_session = build_chat_prompt_session(
+            app,
+            history_path=Path(args.state_dir).expanduser() / "demo_history",
         )
 
         print("Persistent agent ready.")
@@ -401,9 +395,9 @@ async def main() -> None:
             print("\nCapabilities:")
             print(json.dumps(app.capabilities(), indent=2, default=str))
         print(
-            "\nType a message. Use /help for controls. "
-            "Press Esc while the agent is running to cancel the current turn. "
-            "Ctrl-D, /end, or an empty line exits.\n"
+            "\nType a message. Enter submits; Ctrl+J or Esc-Enter inserts a newline. "
+            "Use /help for controls. Press Esc while the agent is running to cancel "
+            "the current turn. Ctrl-D, /end, or an empty line exits.\n"
         )
 
         while True:
