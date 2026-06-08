@@ -59,8 +59,9 @@ import sys
 from pathlib import Path
 
 from agents.base import AgentConfig
+from harness.cancellation import consume_with_cancel
 from harness.console import ConsoleRenderer
-from harness.events import EventType
+from harness.events import BusEvent, EventType
 from harness.llm.claude_code import ClaudeCodeLLM
 from harness.llm.openai_codex import OpenAICodexLLM
 from harness.runtime import AgentRegistry, AgentRuntime, GuardrailConfig, ToolRegistry
@@ -316,8 +317,13 @@ async def run(provider: str, *, trace_path: str | None = None) -> dict:
 
         stream = record_trace(stream, trace_path)
 
+    # Press Esc during the run to cancel cleanly. ERROR events get
+    # rendered AND recorded as the final payload so the caller can
+    # surface "ran but failed" distinctly from "completed".
     final: dict = {}
-    async for event in stream:
+
+    def _on_event(event: BusEvent) -> None:
+        nonlocal final
         if event.type == EventType.TASK_DONE:
             final = event.payload
         elif event.type == EventType.ERROR:
@@ -325,6 +331,13 @@ async def run(provider: str, *, trace_path: str | None = None) -> dict:
             final = {"error": event.error}
         else:
             _renderer.render(event)
+
+    cancelled = await consume_with_cancel(stream, on_event=_on_event)
+    if cancelled:
+        _renderer.sep("═")
+        print("[cancelled by user]")
+        _renderer.sep("═")
+        final = {"cancelled": True}
 
     if trace_path:
         print(f"\n[trace] Wrote {trace_path} — view with: agent-harness trace view {trace_path}")
@@ -390,8 +403,13 @@ async def run_cache_demo(provider: str, *, trace_path: str | None = None) -> dic
 
         stream = record_trace(stream, trace_path)
 
+    # Press Esc during the run to cancel cleanly. ERROR events get
+    # rendered AND recorded as the final payload so the caller can
+    # surface "ran but failed" distinctly from "completed".
     final: dict = {}
-    async for event in stream:
+
+    def _on_event(event: BusEvent) -> None:
+        nonlocal final
         if event.type == EventType.TASK_DONE:
             final = event.payload
         elif event.type == EventType.ERROR:
@@ -399,6 +417,13 @@ async def run_cache_demo(provider: str, *, trace_path: str | None = None) -> dic
             final = {"error": event.error}
         else:
             _renderer.render(event)
+
+    cancelled = await consume_with_cancel(stream, on_event=_on_event)
+    if cancelled:
+        _renderer.sep("═")
+        print("[cancelled by user]")
+        _renderer.sep("═")
+        final = {"cancelled": True}
 
     if record_tool.entries:
         print("\n[cache-demo] Recorded observations:")

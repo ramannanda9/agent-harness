@@ -118,13 +118,14 @@ async def main() -> None:
     print(f"\nGoal: {GOAL}\n")
     _renderer.sep()
 
-    final: dict = {}
-    async for event in runtime.dispatch_stream(GOAL):
-        if event.type == EventType.TASK_DONE:
-            final = event.payload
-        else:
-            _renderer.render(event)
-
+    # Press Esc during the run to cancel cleanly.
+    cancelled, terminal = await _renderer.render_stream(
+        runtime.dispatch_stream(GOAL),
+        terminal_event_type=EventType.TASK_DONE,
+    )
+    if cancelled:
+        return
+    final: dict = terminal.payload if terminal else {}
     _renderer.sep("═")
     print("VISION REPORT")
     _renderer.sep("═")

@@ -400,7 +400,11 @@ async def main() -> None:
         if args.show_capabilities:
             print("\nCapabilities:")
             print(json.dumps(app.capabilities(), indent=2, default=str))
-        print("\nType a message. Use /help for controls. Ctrl-D, /end, or an empty line exits.\n")
+        print(
+            "\nType a message. Use /help for controls. "
+            "Press Esc while the agent is running to cancel the current turn. "
+            "Ctrl-D, /end, or an empty line exits.\n"
+        )
 
         while True:
             try:
@@ -420,11 +424,19 @@ async def main() -> None:
             if command_result.handled:
                 continue
 
-            final_answer = ""
-            async for event in app.chat(message, session_id=session_id):
-                renderer.render(event)
-                if event.type == EventType.TASK_DONE and not event.parent_agent_id:
-                    final_answer = str(event.payload.get("answer") or "")
+            # Esc during a long turn cancels it cleanly.
+            # ``PersistentAgent.chat`` only writes to the session store
+            # inside ``_finalize_turn`` (TASK_DONE / ERROR / clean stream
+            # end), so a mid-stream cancel writes nothing — the
+            # transcript looks like the turn never started.
+            cancelled, terminal = await renderer.render_stream(
+                app.chat(message, session_id=session_id),
+                terminal_event_type=EventType.TASK_DONE,
+                cancel_message="[cancelled by user — type your next message or /end to exit]",
+            )
+            if cancelled:
+                continue
+            final_answer = str(terminal.payload.get("answer") or "") if terminal else ""
             if final_answer:
                 renderer.sep("═")
                 print(final_answer)

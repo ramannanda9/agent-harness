@@ -4,9 +4,27 @@ from __future__ import annotations
 
 import json
 import sys
-from typing import TextIO
+from collections.abc import AsyncIterator
+from typing import NamedTuple, TextIO
 
 from harness.events import BusEvent, EventType
+
+
+class StreamResult(NamedTuple):
+    """Return shape of ``ConsoleRenderer.render_stream``.
+
+    ``cancelled`` is True when the user pressed Esc mid-stream (only
+    possible on TTY stdin; non-TTY hosts never set it). ``terminal`` is
+    the last event matching the requested ``terminal_event_type`` (and,
+    when ``top_level_only`` is True, having no ``parent_agent_id``), or
+    None when no such event arrived before cancellation / end-of-stream.
+
+    Tuple shape so callers can write ``cancelled, terminal = await
+    renderer.render_stream(...)`` without importing the class.
+    """
+
+    cancelled: bool
+    terminal: BusEvent | None
 
 
 def trunc(s: str, n: int) -> str:
@@ -225,6 +243,51 @@ class ConsoleRenderer:
                     f"out={int(stats.get('tokens_out', 0)):>6,}",
                     file=self._out,
                 )
+
+    async def render_stream(
+        self,
+        events: AsyncIterator[BusEvent],
+        *,
+        terminal_event_type: EventType | None = None,
+        top_level_only: bool = True,
+        cancel_message: str = "[cancelled by user]",
+        print_cancel_banner: bool = True,
+    ) -> StreamResult:
+        """Render an event stream until completion or user Esc.
+
+        Composes the rendering loop (``self.render``), the per-event
+        terminal capture (so callers don't repeat the "find last
+        TASK_DONE / DONE" boilerplate), and the Esc-cancel listener from
+        ``harness.cancellation`` into one call. Most consumers only need
+        this — the lower-level ``consume_with_cancel`` is the escape
+        hatch for bespoke per-event handling (orchestrator demos that
+        print a custom report on DONE, etc.).
+
+        Returns ``StreamResult(cancelled, terminal)``. Defaults to
+        printing a banner when ``cancelled`` so call sites don't repeat
+        the ``sep / print / sep`` pattern; pass
+        ``print_cancel_banner=False`` to suppress.
+        """
+        # Local import keeps ``ConsoleRenderer`` light to import for
+        # consumers that never render a stream (snapshot/JSON output etc.).
+        from harness.cancellation import consume_with_cancel  # noqa: PLC0415
+
+        terminal_holder: list[BusEvent | None] = [None]
+
+        def _on_event(event: BusEvent) -> None:
+            self.render(event)
+            if terminal_event_type is None or event.type != terminal_event_type:
+                return
+            if top_level_only and event.parent_agent_id:
+                return
+            terminal_holder[0] = event
+
+        cancelled = await consume_with_cancel(events, on_event=_on_event)
+        if cancelled and print_cancel_banner:
+            self.sep("═")
+            print(cancel_message, file=self._out)
+            self.sep("═")
+        return StreamResult(cancelled=cancelled, terminal=terminal_holder[0])
 
     # ── private helpers ───────────────────────────────────────────────────────
 

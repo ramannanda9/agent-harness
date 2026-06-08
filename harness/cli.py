@@ -204,14 +204,17 @@ def _policy_clear(path: Path) -> int:
 
 
 async def _trace_replay(path: str, *, realtime: bool, speed: float) -> int:
-    """Read a JSONL trace and render it via ConsoleRenderer."""
-    from harness.console import ConsoleRenderer
-    from harness.trace import replay
+    """Read a JSONL trace and render it via ConsoleRenderer.
+
+    Esc cancels the replay — useful when ``--realtime`` is in effect and
+    the original run was long.
+    """
+    from harness.console import ConsoleRenderer  # noqa: PLC0415
+    from harness.trace import replay  # noqa: PLC0415
 
     renderer = ConsoleRenderer()
-    async for event in replay(path, realtime=realtime, speed=speed):
-        renderer.render(event)
-    return 0
+    cancelled, _ = await renderer.render_stream(replay(path, realtime=realtime, speed=speed))
+    return 130 if cancelled else 0
 
 
 if __name__ == "__main__":
