@@ -125,13 +125,14 @@ async def main() -> None:
 
     # dispatch_stream: classifier decides simple→routed or complex→orchestrated.
     # User only provides a goal — routing and planning happen automatically.
-    final: dict = {}
-    async for event in runtime.dispatch_stream(GOAL):
-        if event.type == EventType.TASK_DONE:
-            final = event.payload
-        else:
-            _renderer.render(event)
-
+    # Press Esc during the run to cancel it cleanly.
+    cancelled, terminal = await _renderer.render_stream(
+        runtime.dispatch_stream(GOAL),
+        terminal_event_type=EventType.TASK_DONE,
+    )
+    if cancelled:
+        return
+    final: dict = terminal.payload if terminal else {}
     _renderer.sep()
     print(f"Final answer:\n{final.get('answer', '(no answer)')}")
     print(f"Confidence:  {final.get('confidence')}")

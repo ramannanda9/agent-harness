@@ -115,13 +115,14 @@ async def main() -> None:
             ),
         )
 
-        final: dict = {}
-        async for event in runtime.run_stream(goal):
-            if event.type == EventType.DONE:
-                final = event.payload
-            else:
-                _renderer.render(event)
-
+        # Press Esc during the run to cancel cleanly.
+        cancelled, terminal = await _renderer.render_stream(
+            runtime.run_stream(goal),
+            terminal_event_type=EventType.DONE,
+        )
+        if cancelled:
+            return
+        final: dict = terminal.payload if terminal else {}
         _renderer.sep()
         print(f"Final answer:\n{final.get('answer', '(no answer)')}")
         print(f"Confidence:  {final.get('confidence')}")

@@ -829,7 +829,12 @@ class BaseAgent:
         into the action JSON and yields it as a THOUGHT event. Otherwise
         falls back to one `complete` call.
         """
-        messages = self._working_memory.get_messages()
+        # Working memory stores the system prompt as a role="system"
+        # entry for uniform summarisation + token accounting; split it
+        # back out here so Anthropic's top-level ``system=`` contract is
+        # honoured. OpenAI's adapter re-injects it inline when needed.
+        # See ``_split_system`` docstring for the full rationale.
+        system_text, messages = _split_system(self._working_memory.get_messages())
         accumulated = ""
         before_usage = self._working_memory.context_usage()
         before_summarizations = self._working_memory.summarization_count
@@ -853,7 +858,7 @@ class BaseAgent:
                 # don't take the kwarg (older custom stubs) get it via
                 # ``**kwargs`` and ignore it.
                 async for token in self._llm.stream_complete(
-                    system=None,
+                    system=system_text,
                     messages=messages,
                     source=react_source,
                     response_format={"type": "json_object"},
@@ -868,13 +873,14 @@ class BaseAgent:
                 response = _normalize_response(accumulated)
                 if response is None:
                     response = await self._retry_complete_after_bad_stream(
+                        system_text=system_text,
                         messages=messages,
                         react_source=react_source,
                         accumulated=accumulated,
                     )
             else:
                 raw = await self._llm.complete(
-                    system=None,
+                    system=system_text,
                     messages=messages,
                     response_format={"type": "json_object"},
                     source=react_source,
@@ -934,6 +940,7 @@ class BaseAgent:
     async def _retry_complete_after_bad_stream(
         self,
         *,
+        system_text: str | None,
         messages: list[dict],
         react_source: str,
         accumulated: str,
@@ -946,7 +953,7 @@ class BaseAgent:
         )
         try:
             raw = await self._llm.complete(
-                system=None,
+                system=system_text,
                 messages=[
                     *messages,
                     {
@@ -1273,6 +1280,51 @@ class BaseAgent:
             )
             await self._working_memory.append("user", f"Observation: {obs_text}")
         await self._commit_checkpoint(run_id, step)
+
+
+# ── LLM call shaping (module-level for testability) ──────────────────────────
+
+
+def _split_system(messages: list[dict]) -> tuple[str | None, list[dict]]:
+    """Pull system-role entries out of a messages list and join them.
+
+    Returns ``(system_text, non_system_messages)``. ``system_text`` is the
+    concatenation of every ``role == "system"`` entry's ``content``
+    (joined with a blank line) or ``None`` when no system entries are
+    present.
+
+    Why this exists
+    ---------------
+    ``BaseAgent`` keeps the system prompt inside ``WorkingMemory`` (as a
+    pinned ``role="system"`` entry) so summarisation, token accounting,
+    and checkpoint serialisation treat it uniformly with every other
+    message. But the two LLM adapter contracts diverge at the wire:
+
+    - **OpenAI** accepts ``role="system"`` entries *inside* the messages
+      array — passing ``system=None`` + an inline system entry works.
+    - **Anthropic** requires the system prompt as a *top-level* ``system=``
+      parameter and ``_build_messages`` silently drops any
+      ``role="system"`` entries in the messages list. Passing
+      ``system=None`` + an inline system entry causes the entire system
+      prompt to be discarded — the model sees only the user turn.
+
+    Splitting at the call boundary picks up any system entries (including
+    those that arrived via ``prior_messages`` priors, not just the one
+    BaseAgent appended itself), produces one joined system string, and
+    leaves the rest as a clean user/assistant transcript. Both adapter
+    contracts are then satisfied identically.
+    """
+    system_parts: list[str] = []
+    rest: list[dict] = []
+    for m in messages:
+        if m.get("role") == "system":
+            content = m.get("content", "")
+            if isinstance(content, str) and content:
+                system_parts.append(content)
+            continue
+        rest.append(m)
+    system_text = "\n\n".join(system_parts) if system_parts else None
+    return system_text, rest
 
 
 # ── Response normalization (module-level for testability) ────────────────────

@@ -50,8 +50,9 @@ import sys
 from pathlib import Path
 
 from agents.base import AgentConfig
+from harness.cancellation import consume_with_cancel
 from harness.console import ConsoleRenderer, trunc
-from harness.events import EventType
+from harness.events import BusEvent, EventType
 from harness.executor_bridge import ExecutorBridge, ExecutorConfig, ExecutorTool, find_executor
 from harness.llm.openai import OpenAILLM
 from harness.runtime import AgentRegistry, AgentRuntime, GuardrailConfig, ToolRegistry
@@ -336,32 +337,52 @@ async def main() -> None:
 
         task_results: list[dict] = []
 
-        async for event in audit_runtime.dispatch_stream(AUDIT_GOAL):
+        # Esc cancels the whole DAG run. The orchestrator's `dispatch_stream`
+        # surfaces `DONE` as its terminal event; we capture the payload in
+        # the on_event callback and render the report after the stream
+        # ends (or skip rendering on cancel and exit pass 1).
+        pass1_done: BusEvent | None = None
+
+        def _on_pass1_event(event: BusEvent) -> None:
+            nonlocal pass1_done
             if event.type == EventType.DONE:
-                p = event.payload
-                budget = p.get("budget") or {}
-                print()
-                _renderer.sep("═")
-                print("PROJECT HEALTH REPORT")
-                _renderer.sep("═")
-                print(p.get("answer", "(no answer)"))
-                _renderer.sep()
-                print(
-                    f"Confidence: {p.get('confidence', 0):.2f}  |  "
-                    f"Tasks: {len(task_results)}  |  "
-                    f"Replans: {p.get('replan_count', 0)}  |  "
-                    f"Cost: ${budget.get('cost_usd', p.get('cost_usd', 0)):.4f}  |  "
-                    f"Time: {budget.get('elapsed_seconds', p.get('elapsed_seconds', 0)):.1f}s"
-                )
-                # Tokens + per-call-site breakdown — visible only when the
-                # adapter reported usage to the BudgetGuard. Subscription
-                # adapters surface tokens here even though cost stays $0.
-                _renderer.render_budget(budget)
+                pass1_done = event
             elif event.type == EventType.TASK_DONE:
                 task_results.append(event.payload)
                 _renderer.render(event)
             else:
                 _renderer.render(event)
+
+        cancelled = await consume_with_cancel(
+            audit_runtime.dispatch_stream(AUDIT_GOAL),
+            on_event=_on_pass1_event,
+        )
+        if cancelled:
+            print()
+            _renderer.sep("═")
+            print("[pass 1 cancelled by user — exiting before memory inspection]")
+            _renderer.sep("═")
+            return
+        if pass1_done is not None:
+            p = pass1_done.payload
+            budget = p.get("budget") or {}
+            print()
+            _renderer.sep("═")
+            print("PROJECT HEALTH REPORT")
+            _renderer.sep("═")
+            print(p.get("answer", "(no answer)"))
+            _renderer.sep()
+            print(
+                f"Confidence: {p.get('confidence', 0):.2f}  |  "
+                f"Tasks: {len(task_results)}  |  "
+                f"Replans: {p.get('replan_count', 0)}  |  "
+                f"Cost: ${budget.get('cost_usd', p.get('cost_usd', 0)):.4f}  |  "
+                f"Time: {budget.get('elapsed_seconds', p.get('elapsed_seconds', 0)):.1f}s"
+            )
+            # Tokens + per-call-site breakdown — visible only when the
+            # adapter reported usage to the BudgetGuard. Subscription
+            # adapters surface tokens here even though cost stays $0.
+            _renderer.render_budget(budget)
 
         # ── Memory inspection ─────────────────────────────────────────────────
         # Show exactly what was extracted and stored so the second pass is
@@ -409,23 +430,39 @@ async def main() -> None:
         print(f"PASS 2 — follow-up (memory recall)\nGoal: {FOLLOWUP_GOAL}")
         _renderer.sep("═")
 
-        async for event in followup_runtime.dispatch_stream(FOLLOWUP_GOAL):
+        pass2_done: BusEvent | None = None
+
+        def _on_pass2_event(event: BusEvent) -> None:
+            nonlocal pass2_done
             if event.type == EventType.TASK_DONE:
-                p = event.payload
-                print()
-                _renderer.sep("═")
-                print("PRIORITISED ACTION LIST (from memory)")
-                _renderer.sep("═")
-                print(p.get("answer", "(no answer)"))
-                _renderer.sep()
-                print(
-                    f"Confidence: {p.get('confidence', 0):.2f}  |  "
-                    f"Steps: {p.get('steps', '?')}  "
-                    f"(fewer steps = agent answered from memory, not tools)"
-                )
-                _renderer.render_budget(p.get("budget"))
+                pass2_done = event
             else:
                 _renderer.render(event)
+
+        cancelled = await consume_with_cancel(
+            followup_runtime.dispatch_stream(FOLLOWUP_GOAL),
+            on_event=_on_pass2_event,
+        )
+        if cancelled:
+            print()
+            _renderer.sep("═")
+            print("[pass 2 cancelled by user]")
+            _renderer.sep("═")
+            return
+        if pass2_done is not None:
+            p = pass2_done.payload
+            print()
+            _renderer.sep("═")
+            print("PRIORITISED ACTION LIST (from memory)")
+            _renderer.sep("═")
+            print(p.get("answer", "(no answer)"))
+            _renderer.sep()
+            print(
+                f"Confidence: {p.get('confidence', 0):.2f}  |  "
+                f"Steps: {p.get('steps', '?')}  "
+                f"(fewer steps = agent answered from memory, not tools)"
+            )
+            _renderer.render_budget(p.get("budget"))
 
 
 if __name__ == "__main__":

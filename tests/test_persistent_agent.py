@@ -688,11 +688,19 @@ async def test_system_prompt_stays_byte_identical_within_compaction_window():
     [event async for event in app.chat("what about Paris", session_id="sysstable")]
 
     agent_calls = [c for c in llm.calls if c["kwargs"].get("source") != "reconciler"]
-    system_messages = [
-        next(m["content"] for m in c["messages"] if m["role"] == "system") for c in agent_calls
-    ]
-    assert len(system_messages) >= 3
-    assert system_messages[0] == system_messages[1] == system_messages[2], (
+    # System prompt now arrives via the top-level ``system=`` parameter
+    # rather than as an inline ``role="system"`` message — that change
+    # was required to fix the Anthropic adapter dropping inline system
+    # entries silently. The cache-stability contract is the same: every
+    # plain chat turn must see byte-identical system text.
+    system_prompts = [c["system"] for c in agent_calls]
+    assert len(system_prompts) >= 3
+    assert all(s is not None and s != "" for s in system_prompts), (
+        "system prompt must be passed via the ``system=`` parameter to "
+        "every LLM call, not stuffed inline as a role=system message — "
+        "Anthropic-style adapters silently drop the inline form"
+    )
+    assert system_prompts[0] == system_prompts[1] == system_prompts[2], (
         "system prompt must not vary between plain chat turns — varying "
         "system prompt invalidates the prefix cache from position 0"
     )

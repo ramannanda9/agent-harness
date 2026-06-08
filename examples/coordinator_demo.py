@@ -181,21 +181,26 @@ async def main() -> None:
     print(f"\nGOAL: {GOAL}\n")
     renderer.sep("═")
 
-    async for event in runtime.run_agent_stream("coordinator", GOAL):
-        # ConsoleRenderer handles parent_agent_id-tagged events by labeling
-        # the sub-agent's id; the human can see indentation by reading
-        # `event.parent_agent_id` themselves if they want deeper formatting.
-        renderer.render(event)
-        # Only fire the FINAL ANSWER banner on the *top-level* TASK_DONE —
-        # sub-agent TASK_DONEs bubble up through the parent's stream
-        # (carrying ``parent_agent_id``) and would otherwise trigger the
-        # banner once per delegation, with stale budget snapshots.
-        if event.type == EventType.TASK_DONE and not event.parent_agent_id:
-            renderer.sep("═")
-            print("\nFINAL ANSWER\n")
-            print(event.payload.get("answer", "(no answer)"))
-            renderer.sep("═")
-            renderer.render_budget(event.payload.get("budget"))
+    # ConsoleRenderer handles parent_agent_id-tagged events by labeling
+    # the sub-agent's id; the human can see indentation by reading
+    # `event.parent_agent_id` themselves if they want deeper formatting.
+    # ``terminal_event_type=TASK_DONE`` + ``top_level_only=True`` (default)
+    # captures the *top-level* TASK_DONE — sub-agent TASK_DONEs that
+    # bubble up through the parent's stream carry ``parent_agent_id`` and
+    # are skipped, so the FINAL ANSWER banner only fires once.
+    # Press Esc during the run to cancel cleanly.
+    cancelled, terminal = await renderer.render_stream(
+        runtime.run_agent_stream("coordinator", GOAL),
+        terminal_event_type=EventType.TASK_DONE,
+    )
+    if cancelled:
+        return
+    if terminal is not None:
+        renderer.sep("═")
+        print("\nFINAL ANSWER\n")
+        print(terminal.payload.get("answer", "(no answer)"))
+        renderer.sep("═")
+        renderer.render_budget(terminal.payload.get("budget"))
 
 
 if __name__ == "__main__":

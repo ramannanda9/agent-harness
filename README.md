@@ -716,6 +716,26 @@ The demo uses that utility for:
 - `/delete [id] confirm` deletes a transcript row; long-term memory is retained
 - `/end` exits the demo — no auto-flush; call `/save` first if you want pending facts persisted
 
+**Press `Esc` during a turn to cancel it.** Every example that streams a
+`BusEvent` loop wraps it in `ConsoleRenderer.render_stream(events, *,
+terminal_event_type=...)` — one call that renders each event, captures
+the top-level terminal (TASK_DONE / DONE), and listens for Esc on stdin.
+The cancel raises `asyncio.CancelledError` through the agent's `await`
+points, which propagates out of `PersistentAgent.chat` (and every other
+stream) before `_finalize_turn` runs — so a cancelled turn writes
+nothing to the session store, matching the standard chat-UX "cancelled
+turn = never happened" semantic.
+
+The underlying primitives in `harness/cancellation.py` are reusable for
+any "run X but stop early on Y" pattern: `run_until_cancelled(coro, *,
+trigger)` races a coroutine against an `asyncio.Event`,
+`escape_listener(trigger)` is the prompt_toolkit Esc binding,
+`consume_with_cancel(events, *, on_event)` is the renderer-agnostic
+lower-level form for demos that need bespoke per-event handling (e.g.
+`complex_sysaudit_demo.py` capturing a custom DONE payload). The Esc
+binding is a no-op on non-TTY stdin, so the same code paths work for
+pipe / file / CI input without conditional wiring.
+
 Each chat turn gets a fresh `WorkingMemory`. Continuity comes from the
 SQLite session state (rolling summary + recent messages) and normal
 `MemoryManager` recall, not from carrying old ReAct scratchpads forever.
