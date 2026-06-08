@@ -311,9 +311,25 @@ class BaseAgent:
                 check_key=self._ckp_id,
             ) as hint:
                 async for event in self._run_stream_internal(run_id):
-                    if event.type == EventType.TASK_DONE:
-                        await self._clear_checkpoint(run_id)
-                        hint.done = True
+                    # ``parent_agent_id`` filtering: sub-agent events bubble up
+                    # through this loop tagged with their invoker's id. A sub's
+                    # TASK_DONE / ERROR is NOT terminal for the outer agent —
+                    # the outer keeps running. Without this guard the FIRST
+                    # delegated sub-agent that completes would wrongly clear
+                    # the outer's checkpoint and suppress its resume hint.
+                    if not event.parent_agent_id:
+                        if event.type == EventType.TASK_DONE:
+                            await self._clear_checkpoint(run_id)
+                            hint.done = True
+                        elif event.type == EventType.ERROR:
+                            # Terminal ERROR (max_steps, budget exceeded, mid-run
+                            # crash translated to ERROR by ``_run_stream_internal``)
+                            # is "the agent ran to completion but failed", NOT a
+                            # user interrupt. Suppress the misleading "interrupted
+                            # — Resume:" banner; leave the checkpoint intact so the
+                            # user can deliberately resume with new config (higher
+                            # max_steps, larger budget) if they want.
+                            hint.done = True
                     yield event
 
     async def _resume_stream(
@@ -350,9 +366,17 @@ class BaseAgent:
                 check_key=self._ckp_id,
             ) as hint:
                 async for event in self._run_stream_internal(run_id, start_step=start_step):
-                    if event.type == EventType.TASK_DONE:
-                        await self._clear_checkpoint(run_id)
-                        hint.done = True
+                    # See ``run_stream`` for why both branches gate on
+                    # ``not event.parent_agent_id`` (sub-agent terminals are
+                    # not terminal for the outer) and why a top-level ERROR
+                    # marks ``done`` without clearing the checkpoint
+                    # (it's "ran-but-failed", not an interrupt).
+                    if not event.parent_agent_id:
+                        if event.type == EventType.TASK_DONE:
+                            await self._clear_checkpoint(run_id)
+                            hint.done = True
+                        elif event.type == EventType.ERROR:
+                            hint.done = True
                     yield event
 
     async def _run_stream_internal(
