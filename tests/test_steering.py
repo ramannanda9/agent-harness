@@ -461,6 +461,22 @@ async def test_router_claim_next_line_resolves_with_typed_answer():
     assert received == []
 
 
+@pytest.mark.asyncio
+async def test_router_claim_next_line_resolves_empty_enter():
+    """Empty Enter must satisfy HITL claims so [Y/n] prompts approve in one keypress."""
+    received: list[str] = []
+    with _piped_router() as (router, pipe_in):
+        router.subscribe(None, received.append)
+        await router.start()
+        await asyncio.sleep(0.02)
+        fut = router.claim_next_line(prompt="approve? ")
+        pipe_in.send_text("\r")
+        line = await asyncio.wait_for(fut, timeout=1.0)
+        await router.stop()
+    assert line == ""
+    assert received == []
+
+
 def test_router_rejects_star_as_subscription_prefix():
     router = StdinRouter()
     with pytest.raises(ValueError):

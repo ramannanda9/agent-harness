@@ -721,8 +721,8 @@ The demo uses that utility for:
 coordinator's LLM produces a structured plan (`{summary, steps[]}`) before
 any tools run; `PersistentAgent.chat` yields a `PLAN_PROPOSED` event so
 the renderer can display it, then routes approval through
-`harness.hitl.request_approval` — the same primitive that already gates
-individual tool calls.
+`harness.hitl.request_plan_approval` — the plan-specific sibling of the
+primitive that already gates individual tool calls.
 
 **Plan mode approves intent, not arguments.** Most realistic agent tasks
 have args that can only be known at runtime — a URL discovered by a
@@ -737,12 +737,11 @@ The approved-plan prior tells the executor explicitly that
 `(resolved at runtime)` means *"derive the argument from your
 observations of the prior step,"* not *"a value you must invent."*
 
-Reuses HITL's full UX surface:
+Plan approval uses a focused HITL surface:
 
-- `y` approves the plan and runs the ReAct loop with the plan injected as a pinned prior.
+- `Enter` or `y` approves the plan and runs the ReAct loop with the plan injected as a pinned prior.
 - `n` rejects; an `ERROR` event is yielded and **nothing is written to the session store** (cancelled turn = never happened, same as `Esc`-cancel).
 - Free text becomes a correction — the planner re-runs with the feedback folded into the system prompt. Up to `_PLAN_REVISION_LIMIT` revision cycles before the gate yields a clean "revision limit reached" error.
-- `a` / `A` register session-allow / persistent-allow policies for the `plan/<summary>` slot — typing `a` on a plan kind you trust means future plans on similar prompts skip the banner.
 
 Plan mode is off by default and persists per-session in SQLite, so the
 preference survives process restart (and `/clear`, which is a transcript

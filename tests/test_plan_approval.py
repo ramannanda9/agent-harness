@@ -66,18 +66,22 @@ def test_free_text_becomes_revision():
     assert resp.correction == "use step 3 instead of step 2"
 
 
-def test_empty_input_is_plain_rejection_no_correction():
-    """Empty input distinguishes plain rejection (``correction=None``)
-    from a revision request — chat() treats them differently (plain
-    rejection ends the turn; revision triggers a re-plan)."""
+def test_empty_input_approves_by_default():
+    """Enter alone approves — the plan has already been rendered above
+    the prompt and the capital ``Y`` in ``[Y/n/revision]`` signals the
+    default. Matches the apt / pip ``[Y/n]`` convention so a reviewer's
+    "I read it, proceed" gesture is the cheapest possible keystroke."""
     resp = _parse_plan_stdin("")
-    assert resp.approved is False
+    assert resp.approved is True
     assert resp.correction is None
 
 
-def test_whitespace_input_is_plain_rejection_no_correction():
+def test_whitespace_only_input_approves_by_default():
+    """Whitespace-only input is the same gesture as plain Enter —
+    don't make the user re-type because their terminal sent a stray
+    newline."""
     resp = _parse_plan_stdin("   \n  \n  ")
-    assert resp.approved is False
+    assert resp.approved is True
     assert resp.correction is None
 
 

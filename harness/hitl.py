@@ -237,7 +237,11 @@ async def request_plan_approval(
 
     async with stdout_lock:
         router = get_active_router()
-        approve_prompt = "  Approve plan? [y/n/revision]: "
+        # Capital ``Y`` signals that Enter alone approves. Plan mode is
+        # opt-in and the full plan has already been rendered above this
+        # banner, so the reviewer's "I read it, proceed" gesture should
+        # be the cheapest possible — matches the apt / pip convention.
+        approve_prompt = "  Approve plan? [Y/n/revision]: "
         hitl_future: Any = (
             router.claim_next_line(prompt=approve_prompt) if router is not None else None
         )
@@ -298,7 +302,7 @@ def _print_plan_banner(
         detail += f"  ({dynamic_step_count} with args resolved at runtime)"
     print(f"  Steps:   {detail}")
     print(_SEP)
-    print("  y = approve and run  |  n = reject  |  any other text = revise the plan")
+    print("  Enter or y = approve and run  |  n = reject  |  any other text = revise the plan")
     print(_SEP)
 
 
@@ -307,10 +311,15 @@ def _parse_plan_stdin(raw: str) -> PlanApprovalResponse:
 
     No a / A handling — plan mode gates per turn, not per tool. Any
     text that isn't ``y/yes/n/no`` is treated as a revision request.
+
+    Empty input (just Enter) approves — the plan has already been
+    rendered above the prompt and the capital ``Y`` in the prompt
+    text signals the default. Mirrors the apt / pip ``[Y/n]``
+    convention.
     """
     stripped = (raw or "").strip()
     lo = stripped.lower()
-    if lo in ("y", "yes"):
+    if lo in ("", "y", "yes"):
         return PlanApprovalResponse(approved=True)
     if lo in ("n", "no"):
         return PlanApprovalResponse(approved=False)
