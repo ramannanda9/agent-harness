@@ -860,30 +860,19 @@ class BaseAgent:
         # See ``_split_system`` docstring for the full rationale.
         system_text, messages = _split_system(self._working_memory.get_messages())
 
-        # Defensive trailing-user normalisation. Some inference proxies
-        # (notably AWS Bedrock via OpenAI-compatible gateways) reject
-        # any messages array ending with an assistant role — they
-        # interpret it as an Anthropic-style "assistant message
-        # prefill" request and refuse with:
-        #   "This model does not support assistant message prefill.
-        #    The conversation must end with a user message."
-        # The ReAct loop is structurally ``assistant_response ->
-        # user_observation`` in lockstep at every exit point, so
-        # working memory *should* always end with ``user`` here. If it
-        # doesn't, log loudly with the role sequence (so we can
-        # diagnose the upstream cause) and append a terse continuation
-        # cue. The agent's system prompt already enforces the ReAct
-        # JSON format, so a one-word cue suffices to elicit the next
-        # step without confusing the model. Remove once the upstream
-        # cause is identified.
+        # The ReAct loop should call the LLM only after a user task or
+        # user observation. If working memory ends with an assistant
+        # message, log the invalid shape, but do not fabricate a user
+        # turn. Synthetic cues such as "Continue." hide the missing
+        # observation and can make the model continue from the wrong
+        # state.
         if messages and messages[-1].get("role") == "assistant":
             logger.warning(
-                "Agent %s: messages would end with assistant before LLM call; "
-                "appending defensive 'Continue.' user cue. role_sequence=%r",
+                "Agent %s: messages end with assistant before LLM call; "
+                "leaving messages unchanged. role_sequence=%r",
                 self.config.agent_id,
                 [m.get("role") for m in messages],
             )
-            messages = [*messages, {"role": "user", "content": "Continue."}]
 
         accumulated = ""
         before_usage = self._working_memory.context_usage()
