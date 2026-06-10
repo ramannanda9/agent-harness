@@ -1189,6 +1189,7 @@ class PersistentAgent:
                 sub_info = {
                     "agent_id": sub.config.agent_id,
                     "role": sub.role,
+                    "skills": _describe_skills(sub),
                     "tool_name": tool_name,
                     "parent_agent_id": parent_agent_id,
                     "tools": sorted(getattr(sub, "_tools", {}).keys()),
@@ -1874,6 +1875,7 @@ def _describe_agent(agent: BaseAgent) -> dict[str, Any]:
     return {
         "agent_id": agent.config.agent_id,
         "role": agent.role,
+        "skills": _describe_skills(agent),
         "tools": sorted(tools.keys()),
         "mcp_tools": [
             _describe_mcp_tool(tool, owner_agent_id=agent.config.agent_id)
@@ -1881,6 +1883,10 @@ def _describe_agent(agent: BaseAgent) -> dict[str, Any]:
             if _is_mcp_tool(tool)
         ],
     }
+
+
+def _describe_skills(agent: BaseAgent) -> list[dict[str, Any]]:
+    return [skill.summary() for skill in getattr(agent.config, "skills", [])]
 
 
 def _subagent_tool_agent(tool: Any) -> BaseAgent | None:

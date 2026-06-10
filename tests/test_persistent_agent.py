@@ -16,6 +16,7 @@ from harness.persistent import (
     SQLiteSessionStore,
 )
 from harness.runtime import BudgetGuard, GuardrailConfig, Tracer
+from harness.skills import Skill
 from memory.manager import MemoryManager
 from memory.stores import InMemoryEpisodicStore, InMemorySemanticStore
 from tools.builtin.subagent import SubAgentTool
@@ -319,12 +320,27 @@ def test_persistent_agent_capabilities_lists_subagents_and_mcp_tools():
     )
     researcher.config.agent_id = "researcher"
     researcher.role = "research role"
+    researcher.config.skills = [
+        Skill(
+            name="source-checking",
+            description="Check retrieved material against primary sources.",
+            instructions="Prefer primary sources.",
+            tool_hints=["mcp_query"],
+        )
+    ]
     delegate = SubAgentTool(researcher, name="delegate_research")
     coordinator = _agent(
         llm=llm,
         memory=memory,
         tools={"delegate_research": delegate, "mcp_query": MCPToolAdapter()},
     )
+    coordinator.config.skills = [
+        Skill(
+            name="coordination",
+            description="Coordinate specialist agents.",
+            instructions="Delegate precisely.",
+        )
+    ]
     app = PersistentAgent(
         coordinator=coordinator,
         session_store=InMemorySessionStore(),
@@ -336,7 +352,21 @@ def test_persistent_agent_capabilities_lists_subagents_and_mcp_tools():
 
     assert caps["coordinator"]["agent_id"] == "coordinator"
     assert caps["coordinator"]["tools"] == ["delegate_research", "mcp_query"]
+    assert caps["coordinator"]["skills"] == [
+        {
+            "name": "coordination",
+            "description": "Coordinate specialist agents.",
+            "tool_hints": [],
+        }
+    ]
     assert caps["subagents"][0]["agent_id"] == "researcher"
+    assert caps["subagents"][0]["skills"] == [
+        {
+            "name": "source-checking",
+            "description": "Check retrieved material against primary sources.",
+            "tool_hints": ["mcp_query"],
+        }
+    ]
     assert caps["subagents"][0]["tool_name"] == "delegate_research"
     assert caps["subagents"][0]["parent_agent_id"] == "coordinator"
     assert caps["subagents"][0]["mcp_tools"][0]["name"] == "mcp_query"

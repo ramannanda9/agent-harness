@@ -114,6 +114,53 @@ agents.register(AgentConfig(
 result = await runtime.dispatch("my goal")
 ```
 
+Agents can also attach reusable prompt skills from Agent Skills-style
+directories:
+
+```text
+skills/
+  web-research/
+    SKILL.md
+    references/   # optional
+    scripts/      # optional
+```
+
+```md
+---
+name: web-research
+description: Research current information from primary sources.
+allowed-tools:
+  - browser_navigate
+  - browser_snapshot
+---
+
+Prefer primary sources, capture dates, and cite URLs.
+```
+
+```python
+from harness.skills import load_skill, load_skills
+
+web_research = load_skill("skills/web-research")
+# Or load every immediate child directory with a SKILL.md:
+# skills = load_skills("skills")
+# Calling load_skills() with no path loads ~/.agent-harness/skills
+# and returns [] when that default directory does not exist.
+
+agents.register(AgentConfig(
+    agent_id="researcher",
+    role="researches current information",
+    system_prompt="You are a careful research agent.",
+    allowed_tools=["browser_navigate", "browser_snapshot"],
+    skills=[web_research],
+))
+```
+
+Skills add reusable instructions and tool hints to that agent's system prompt.
+They do not grant tools; `allowed-tools` in `SKILL.md` is treated as a hint
+only. Tool access still comes from the wired tool map and the agent's
+configured tool surface. You can also construct `Skill(...)` directly when a
+programmatic skill is more convenient.
+
 ## LLM clients
 
 The harness is **BYO-LLM.** Any object with
@@ -1728,6 +1775,7 @@ agents alongside HITL on the shell tool.
 | `role` | required | Plain-English description used by the planner for agent selection |
 | `system_prompt` | required | Base system prompt for the agent |
 | `allowed_tools` | required | Tool names the agent may call |
+| `skills` | `[]` | Reusable prompt/context bundles attached to this agent; skills do not grant tools |
 | `max_steps` | `10` | Maximum ReAct iterations before the run is terminated |
 | `max_wall_time_seconds` | (guardrail) | See `GuardrailConfig` |
 | `memory_context_enabled` | `True` | Prepend relevant long-term memory to the system prompt |
