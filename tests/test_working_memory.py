@@ -378,6 +378,37 @@ async def test_recency_window_relaxes_when_budget_forces_it():
     assert wm.summarization_count >= 1
 
 
+@pytest.mark.asyncio
+async def test_hard_drop_preserves_recent_user_observation_shape():
+    """Hard-drop fallback must not leave a trailing assistant action.
+
+    A large tool observation can remain over budget even after two
+    summarization passes. In that case, preserve the newest ReAct suffix
+    when possible instead of dropping the user observation and leaving
+    Bedrock-style providers with an assistant-prefill shaped transcript.
+    """
+    wm = WorkingMemory(
+        llm=_scripted_llm("ok"),
+        max_tokens=120,
+        recency_window=4,
+        token_counter=len,
+    )
+    await wm.append("system", "s", pinned=True)
+    await wm.append("user", "task")
+    await wm.append("assistant", "old action")
+    await wm.append("user", "old observation")
+    await wm.append("assistant", "snapshot action")
+    await wm.append("user", "huge snapshot observation " + ("x" * 500))
+
+    msgs = wm.get_messages()
+    assert msgs[-1]["role"] == "user", [m["role"] for m in msgs]
+    assert "huge snapshot observation" in msgs[-1]["content"]
+    assert not any(
+        prev["role"] == cur["role"] == "assistant"
+        for prev, cur in zip(msgs, msgs[1:], strict=False)
+    ), [m["role"] for m in msgs]
+
+
 # ── Checkpoint backward compatibility ─────────────────────────────────────────
 
 

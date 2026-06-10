@@ -686,6 +686,7 @@ class BaseAgent:
                 await self._commit_checkpoint(run_id, step)
 
                 combined: list[dict] = []
+                observation_events: list[BusEvent] = []
                 for i, (act, obs) in enumerate(zip(parallel_actions, observations, strict=False)):
                     tool_name = act.get("tool", "")
                     tool_args = act.get("args", {})
@@ -700,10 +701,12 @@ class BaseAgent:
                             "observation": obs_display,
                         },
                     )
-                    yield BusEvent(
-                        type=EventType.OBSERVATION,
-                        agent_id=self.config.agent_id,
-                        payload={"step": step, "tool": tool_name, "observation": obs_display},
+                    observation_events.append(
+                        BusEvent(
+                            type=EventType.OBSERVATION,
+                            agent_id=self.config.agent_id,
+                            payload={"step": step, "tool": tool_name, "observation": obs_display},
+                        )
                     )
                     combined.append({"tool": tool_name, "result": obs_display})
                     if obs and not isinstance(obs, str) and not _is_image_block(obs):
@@ -716,29 +719,15 @@ class BaseAgent:
                             )
                         )
 
-                await self._working_memory.append("assistant", json.dumps(response))
                 # Inject image observations as content blocks; text observations as a string.
                 image_blocks = [
                     (act.get("tool", ""), obs)
                     for act, obs in zip(parallel_actions, observations, strict=False)
                     if _is_image_block(obs)
                 ]
-                if image_blocks:
-                    content: list = [
-                        {
-                            "type": "text",
-                            "text": f"Observations:\n{json.dumps(combined, default=str)}",
-                        }
-                    ]
-                    for tool_name_img, img_block in image_blocks:
-                        content.append({"type": "text", "text": f"\nImage from {tool_name_img}:"})
-                        content.append(img_block)
-                    await self._working_memory.append("user", content)
-                else:
-                    await self._working_memory.append(
-                        "user",
-                        f"Observations:\n{json.dumps(combined, default=str)}",
-                    )
+                await self._record_parallel_observations(response, combined, image_blocks)
+                for event in observation_events:
+                    yield event
             else:
                 # Single action path.
                 tool_name = response.get("action", "")
@@ -774,6 +763,7 @@ class BaseAgent:
                     if observation is _HITL_CORRECTION:
                         continue
 
+                await self._record_tool_observation(response, tool_name, observation)
                 obs_display = "[image]" if _is_image_block(observation) else str(observation)[:500]
                 self._tracer.log(
                     "action",
@@ -809,23 +799,6 @@ class BaseAgent:
                         )
                     )
 
-                await self._working_memory.append("assistant", json.dumps(response))
-                if _is_image_block(observation):
-                    await self._working_memory.append(
-                        "user",
-                        [
-                            {"type": "text", "text": f"Observation ({tool_name}):"},
-                            observation,
-                        ],
-                    )
-                else:
-                    obs_text = (
-                        json.dumps(observation, default=str)
-                        if not isinstance(observation, str)
-                        else observation
-                    )
-                    await self._working_memory.append("user", f"Observation: {obs_text}")
-
         # Max steps exhausted.
         self._tracer.log(
             "task_result",
@@ -859,6 +832,21 @@ class BaseAgent:
         # honoured. OpenAI's adapter re-injects it inline when needed.
         # See ``_split_system`` docstring for the full rationale.
         system_text, messages = _split_system(self._working_memory.get_messages())
+
+        # The ReAct loop should call the LLM only after a user task or
+        # user observation. If working memory ends with an assistant
+        # message, log the invalid shape, but do not fabricate a user
+        # turn. Synthetic cues such as "Continue." hide the missing
+        # observation and can make the model continue from the wrong
+        # state.
+        if messages and messages[-1].get("role") == "assistant":
+            logger.warning(
+                "Agent %s: messages end with assistant before LLM call; "
+                "leaving messages unchanged. role_sequence=%r",
+                self.config.agent_id,
+                [m.get("role") for m in messages],
+            )
+
         accumulated = ""
         before_usage = self._working_memory.context_usage()
         before_summarizations = self._working_memory.summarization_count
@@ -1001,6 +989,55 @@ class BaseAgent:
             if response is None:
                 self._last_think_error = f"Unparseable stream response: {accumulated[:300]}"
         return response
+
+    async def _record_tool_observation(
+        self,
+        response: dict,
+        tool_name: str,
+        observation: Any,
+    ) -> None:
+        """Record one ReAct action and its observation in working memory."""
+        await self._working_memory.append("assistant", json.dumps(response))
+        if _is_image_block(observation):
+            await self._working_memory.append(
+                "user",
+                [
+                    {"type": "text", "text": f"Observation ({tool_name}):"},
+                    observation,
+                ],
+            )
+            return
+        obs_text = (
+            json.dumps(observation, default=str)
+            if not isinstance(observation, str)
+            else observation
+        )
+        await self._working_memory.append("user", f"Observation: {obs_text}")
+
+    async def _record_parallel_observations(
+        self,
+        response: dict,
+        combined: list[dict],
+        image_blocks: list[tuple[str, Any]],
+    ) -> None:
+        """Record one parallel ReAct action batch and its observations."""
+        await self._working_memory.append("assistant", json.dumps(response))
+        if image_blocks:
+            content: list = [
+                {
+                    "type": "text",
+                    "text": f"Observations:\n{json.dumps(combined, default=str)}",
+                }
+            ]
+            for tool_name_img, img_block in image_blocks:
+                content.append({"type": "text", "text": f"\nImage from {tool_name_img}:"})
+                content.append(img_block)
+            await self._working_memory.append("user", content)
+            return
+        await self._working_memory.append(
+            "user",
+            f"Observations:\n{json.dumps(combined, default=str)}",
+        )
 
     # ── Tool Execution ────────────────────────────────────────────────────────
 
@@ -1284,25 +1321,13 @@ class BaseAgent:
             if approval is None or approval.approved
             else f"Tool rejected by human: {approval.correction or 'no reason given'}"
         )
+        await self._record_tool_observation(llm_response, tool_name, observation)
         obs_display = "[image]" if _is_image_block(observation) else str(observation)[:500]
         yield BusEvent(
             type=EventType.OBSERVATION,
             agent_id=self.config.agent_id,
             payload={"step": step, "tool": tool_name, "observation": obs_display},
         )
-        await self._working_memory.append("assistant", json.dumps(llm_response))
-        if _is_image_block(observation):
-            await self._working_memory.append(
-                "user",
-                [{"type": "text", "text": f"Observation ({tool_name}):"}, observation],
-            )
-        else:
-            obs_text = (
-                json.dumps(observation, default=str)
-                if not isinstance(observation, str)
-                else observation
-            )
-            await self._working_memory.append("user", f"Observation: {obs_text}")
         await self._commit_checkpoint(run_id, step)
 
 

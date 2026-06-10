@@ -392,23 +392,64 @@ class WorkingMemory:
             await self._evict(_depth=_depth + 1)
             return
 
-        # Safety valve: hard FIFO drop. Drops oldest non-pinned non-summary
-        # first; only touches the summary or recency-window messages if
-        # nothing else is left.
+        # Safety valve: hard FIFO drop. Drops oldest non-pinned, non-summary,
+        # non-recency-window messages first. The newest ReAct action /
+        # observation pair is the provider-valid continuation point; dropping
+        # only its user observation can leave the transcript ending with
+        # assistant, which Bedrock-compatible providers reject as assistant
+        # prefill. Only relax recency protection when there is no older
+        # unpinned material left.
+        hard_dropped = False
         while self._token_total > self.max_tokens:
+            protected_recent = set(self._protected_recent_indices())
             drop_idx = next(
-                (i for i, m in enumerate(self._messages) if not m.pinned and not m.is_summary),
+                (
+                    i
+                    for i, m in enumerate(self._messages)
+                    if not m.pinned and not m.is_summary and i not in protected_recent
+                ),
                 None,
             )
             if drop_idx is None:
                 drop_idx = next(
-                    (i for i, m in enumerate(self._messages) if not m.pinned),
+                    (i for i, m in enumerate(self._messages) if not m.pinned and m.is_summary),
                     None,
                 )
             if drop_idx is None:
-                break  # only pinned messages remain — accept overshoot
+                break  # only pinned/protected-recent messages remain — accept overshoot
             self._token_total -= self._messages[drop_idx].token_count
             self._messages.pop(drop_idx)
+            hard_dropped = True
+
+        if hard_dropped:
+            self._repair_trailing_assistant()
+
+    def _protected_recent_indices(self) -> list[int]:
+        """Newest non-pinned, non-summary indices protected by recency_window."""
+        if self.recency_window <= 0:
+            return []
+        protected: list[int] = []
+        for i in range(len(self._messages) - 1, -1, -1):
+            m = self._messages[i]
+            if m.pinned or m.is_summary:
+                continue
+            protected.append(i)
+            if len(protected) >= self.recency_window:
+                break
+        return protected
+
+    def _repair_trailing_assistant(self) -> None:
+        """Never leave the transcript ending with an assistant message.
+
+        This is a last-resort repair after hard drops. It removes trailing
+        non-pinned assistant messages rather than fabricating a user message.
+        """
+        while self._messages and self._messages[-1].role == "assistant":
+            last = self._messages[-1]
+            if last.pinned:
+                break
+            self._token_total -= last.token_count
+            self._messages.pop()
 
     # ── Summarization helpers ─────────────────────────────────────────────────
 

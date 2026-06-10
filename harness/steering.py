@@ -51,10 +51,11 @@ HITL coordination:
    printing the banner. The next text submitted by the user into the
    already-active steering prompt (`> `) is intercepted by
    `_serve_steering` and routed to the HITL Future instead of being
-   dispatched to subscribers. If the user submits empty text (or the
-   claim is set between prompt cycles), `_serve_hitl` shows a dedicated
-   HITL prompt as a fallback. No `app.exit()` is used — that caused a
-   race where user input was consumed and lost by the dying prompt.
+   dispatched to subscribers, including empty text so Enter can be a
+   default approval gesture. If the claim is set between prompt cycles,
+   `_serve_hitl` shows a dedicated HITL prompt as a fallback. No
+   `app.exit()` is used — that caused a race where user input was
+   consumed and lost by the dying prompt.
 """
 
 from __future__ import annotations
@@ -229,10 +230,9 @@ class StdinRouter:
            prompt returns text while a claim is pending,
            ``_serve_steering`` routes it to the HITL future instead of
            dispatching to subscribers.
-        2. **Fallback** — the user submits empty text (or the claim is
-           set between prompt cycles).  The ``_run`` loop sees the
-           still-pending claim and calls ``_serve_hitl``, which shows
-           the dedicated HITL prompt text.
+        2. **Fallback** — the claim is set between prompt cycles.  The
+           ``_run`` loop sees the still-pending claim and calls
+           ``_serve_hitl``, which shows the dedicated HITL prompt text.
 
         No ``app.exit()`` is used — that caused a race where input
         typed between the exit and the new prompt was consumed and lost
@@ -302,8 +302,6 @@ class StdinRouter:
         except asyncio.CancelledError:
             # stop() was called.  Just return — loop decides.
             return
-        if text is None or not text.strip():
-            return
         # HITL fast-path: if a claim arrived while the steering prompt
         # was active, the user's typed answer should go to HITL, not to
         # steering dispatch.  This avoids the app.exit() race where
@@ -312,8 +310,10 @@ class StdinRouter:
         if claim is not None:
             _, fut = claim
             if not fut.done():
-                fut.set_result(text.strip())
+                fut.set_result((text or "").strip())
             self._hitl_claim = None
+            return
+        if text is None or not text.strip():
             return
         self._dispatch(text)
 

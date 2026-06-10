@@ -190,3 +190,62 @@ def test_extra_key_bindings_are_merged(monkeypatch: pytest.MonkeyPatch):
     # real Application, but at least confirm the session was constructed
     # (merge succeeded, didn't crash on the merge_key_bindings call).
     assert session.app.key_bindings is not None
+
+
+# ── Shift-Tab plan-mode toggle ────────────────────────────────────────────
+
+
+def test_shift_tab_binding_absent_when_no_plan_mode_toggle():
+    """Without a toggle callable, Shift-Tab must not be claimed — leaves
+    the keystroke free for whatever terminal-level behaviour the user
+    expects (back-tab, completion-reverse, etc.)."""
+    bindings = _chat_key_bindings()
+    handler_names = list(_binding_handler_names(bindings))
+    assert "_shift_tab_plan_toggle" not in handler_names
+
+
+def test_shift_tab_binding_registered_when_plan_mode_toggle_given():
+    async def _toggle() -> bool:
+        return True
+
+    bindings = _chat_key_bindings(plan_mode_toggle=_toggle)
+    handler_names = list(_binding_handler_names(bindings))
+    assert "_shift_tab_plan_toggle" in handler_names, (
+        "Shift-Tab must be bound to a plan-mode toggle handler when "
+        "build_chat_prompt_session is given a plan_mode_toggle callable"
+    )
+
+
+def test_build_session_threads_plan_mode_toggle_to_bindings():
+    """End-to-end: build_chat_prompt_session(plan_mode_toggle=...) must
+    register the Shift-Tab handler on the returned session's bindings."""
+    from prompt_toolkit.keys import Keys
+
+    async def _toggle() -> bool:
+        return True
+
+    session = build_chat_prompt_session(_app(), plan_mode_toggle=_toggle)
+    # session.app.key_bindings is the merged KeyBindings prompt_toolkit
+    # actually consults at runtime. The Shift-Tab handler should be in it.
+    all_bindings = session.app.key_bindings
+    assert all_bindings is not None
+    found = any(
+        getattr(b, "handler", None) is not None and b.handler.__name__ == "_shift_tab_plan_toggle"
+        # ``get_bindings_for_keys`` is the proper lookup API but it
+        # requires running inside an Application context; iterate the
+        # flat bindings list directly instead.
+        for b in _all_bindings(all_bindings)
+        if Keys.BackTab in b.keys or "s-tab" in b.keys
+    )
+    assert found, (
+        "Shift-Tab binding must appear in the merged keybindings the "
+        "PromptSession actually consults"
+    )
+
+
+def _all_bindings(bindings_or_merged: Any) -> list:
+    """Flatten ``KeyBindings`` or ``_MergedKeyBindings`` into a list of
+    ``Binding`` records. prompt_toolkit's two types both expose
+    ``.bindings`` but the merged form returns a list lazily; this just
+    materialises it for inspection."""
+    return list(bindings_or_merged.bindings)

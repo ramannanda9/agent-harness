@@ -153,9 +153,13 @@ def _print_banner(req: ApprovalRequest) -> None:
     print(_SEP)
     print(f"  Tool:  {req.tool}")
     print(f"  Args:  {json.dumps(req.args, default=str)}")
+    # ``Agent: X  step=N`` is the only context line — Run/ID UUIDs used
+    # to print here but the run_id is already echoed in the resume hint
+    # below (so the top line was duplicate) and the approval_id is a
+    # purely internal correlation token that's never user-actionable in
+    # the synchronous CLI flow. Both fields remain on ``ApprovalRequest``
+    # for callers that need them (tests, future async-approval systems).
     print(f"  Agent: {req.agent_id}  step={req.step}")
-    print(f"  Run:   {req.run_id}")
-    print(f"  ID:    {req.approval_id}")
     print(_SEP)
     print(
         "  y = approve once  |  "
@@ -181,6 +185,145 @@ def _parse_stdin(approval_id: str, raw: str) -> ApprovalResponse:
     if lo in ("n", "no"):
         return ApprovalResponse(approval_id=approval_id, approved=False)
     return ApprovalResponse(approval_id=approval_id, approved=True, correction=stripped or None)
+
+
+@dataclass
+class PlanApprovalResponse:
+    """Sibling of ``ApprovalResponse`` for ``request_plan_approval``.
+
+    Plan mode is per-turn, not per-tool — there's no a / A here because
+    "allow plans for the session" silently turns plan mode off (defeats
+    the whole feature), and "always allow plans" persistently always-
+    allows the gate, which is the same thing forever.
+
+    Three outcomes:
+    - ``approved=True``: run the plan.
+    - ``approved=False, correction=None``: user rejected — abort the turn.
+    - ``approved=False, correction=<text>``: user wants a revision; the
+      planner re-runs with the correction folded into its system prompt.
+    """
+
+    approved: bool
+    correction: str | None = None
+
+
+async def request_plan_approval(
+    *,
+    summary: str,
+    step_count: int,
+    dynamic_step_count: int,
+    agent_id: str,
+    guard: Any,
+) -> PlanApprovalResponse:
+    """Plan-mode approval prompt: y / n / revision text.
+
+    Sibling of :func:`request_approval` that drops the session-allow and
+    persistent-allow options. They make sense for per-tool gating
+    (approve ``shell/grep`` for the session and stop nagging) but they're
+    actively wrong for plan-mode approval: ``a`` turns plan mode off
+    silently, ``A`` does it permanently. Both contradict the user's
+    intent in turning plan mode on at all.
+
+    Shares ``stdout_lock``, the steering router interop, and the
+    BudgetGuard suspend/resume cycle with :func:`request_approval`, so
+    the input plumbing stays one place.
+
+    The full plan was already rendered by the consumer when the
+    ``PLAN_PROPOSED`` event fired upstream of this call; the banner here
+    is a short confirmation prompt with just enough context to re-anchor
+    a reviewer who scrolled.
+    """
+    from harness.steering import get_active_router
+
+    async with stdout_lock:
+        router = get_active_router()
+        # Capital ``Y`` signals that Enter alone approves. Plan mode is
+        # opt-in and the full plan has already been rendered above this
+        # banner, so the reviewer's "I read it, proceed" gesture should
+        # be the cheapest possible — matches the apt / pip convention.
+        approve_prompt = "  Approve plan? [Y/n/revision]: "
+        hitl_future: Any = (
+            router.claim_next_line(prompt=approve_prompt) if router is not None else None
+        )
+
+        _print_plan_banner(
+            summary=summary,
+            step_count=step_count,
+            dynamic_step_count=dynamic_step_count,
+            agent_id=agent_id,
+        )
+
+        guard.suspend()
+        try:
+            if hitl_future is not None:
+                raw = await hitl_future
+            else:
+                from prompt_toolkit import PromptSession
+
+                from harness.steering import StdinRouter
+
+                session: PromptSession = PromptSession()
+                raw = await session.prompt_async(
+                    approve_prompt,
+                    multiline=True,
+                    key_bindings=StdinRouter._build_key_bindings(),
+                )
+        finally:
+            guard.resume()
+
+        print()
+        return _parse_plan_stdin(raw)
+
+
+def _print_plan_banner(
+    *,
+    summary: str,
+    step_count: int,
+    dynamic_step_count: int,
+    agent_id: str,
+) -> None:
+    """Compact banner for plan approval. The full plan already streamed
+    via PLAN_PROPOSED — this banner is just a confirmation prompt with
+    summary / step counts as scroll anchors.
+
+    No ``--resume <run_id>`` hint here because PersistentAgent's
+    resumption model is session-id-based — the next ``chat()`` call on
+    the same session_id picks up state automatically. The
+    orchestrator-style ``--resume`` flag this banner used to print
+    doesn't apply.
+    """
+    print(f"\n{_SEP}")
+    print(f"  Plan ready for {agent_id}")
+    print(_SEP)
+    if summary:
+        print(f"  Summary: {summary}")
+    detail = f"{step_count} step{'' if step_count == 1 else 's'}"
+    if dynamic_step_count:
+        detail += f"  ({dynamic_step_count} with args resolved at runtime)"
+    print(f"  Steps:   {detail}")
+    print(_SEP)
+    print("  Enter or y = approve and run  |  n = reject  |  any other text = revise the plan")
+    print(_SEP)
+
+
+def _parse_plan_stdin(raw: str) -> PlanApprovalResponse:
+    """Parse a plan-approval response.
+
+    No a / A handling — plan mode gates per turn, not per tool. Any
+    text that isn't ``y/yes/n/no`` is treated as a revision request.
+
+    Empty input (just Enter) approves — the plan has already been
+    rendered above the prompt and the capital ``Y`` in the prompt
+    text signals the default. Mirrors the apt / pip ``[Y/n]``
+    convention.
+    """
+    stripped = (raw or "").strip()
+    lo = stripped.lower()
+    if lo in ("", "y", "yes"):
+        return PlanApprovalResponse(approved=True)
+    if lo in ("n", "no"):
+        return PlanApprovalResponse(approved=False)
+    return PlanApprovalResponse(approved=False, correction=stripped or None)
 
 
 async def request_approval(
