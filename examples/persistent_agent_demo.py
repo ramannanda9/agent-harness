@@ -368,6 +368,8 @@ async def main() -> None:
             llm=llm,
             guard_factory=lambda: BudgetGuard(guard_config),
             config=persistent_config,
+            llm_registry={llm_label: lambda: _build_llm(args.provider)[0]},
+            default_model=llm_label,
         )
         renderer = ConsoleRenderer()
         controls = PersistentCommandHandler(app)

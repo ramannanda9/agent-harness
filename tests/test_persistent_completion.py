@@ -21,7 +21,7 @@ class _LLM:
         return {"thought": "done", "action": "finish", "answer": "ok", "confidence": 1.0}
 
 
-def _app() -> PersistentAgent:
+def _app(*, models: bool = False) -> PersistentAgent:
     llm = _LLM()
     memory = MemoryManager(
         semantic_store=InMemorySemanticStore(),
@@ -48,6 +48,8 @@ def _app() -> PersistentAgent:
         memory=memory,
         llm=llm,
         config=PersistentAgentConfig(),
+        llm_registry={"fast": lambda: _LLM(), "deep": lambda: _LLM()} if models else None,
+        default_model="fast" if models else None,
     )
 
 
@@ -119,6 +121,17 @@ async def test_completer_offers_session_ids_then_confirm_for_delete():
 
     after_id = await _collect(completer, "/delete research ")
     assert after_id == ["confirm"]
+
+
+@pytest.mark.asyncio
+async def test_completer_offers_agents_and_models_for_model_switch():
+    completer = SlashCommandCompleter(_app(models=True))
+
+    agents = await _collect(completer, "/model ")
+    assert agents == ["coordinator"]
+
+    models = await _collect(completer, "/model coordinator ")
+    assert set(models) == {"fast", "deep", "default"}
 
 
 @pytest.mark.asyncio

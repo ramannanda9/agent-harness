@@ -52,6 +52,46 @@ class _ChatLLM:
         }
 
 
+class _NamedLLM(_ChatLLM):
+    def __init__(self, name: str) -> None:
+        super().__init__()
+        self.name = name
+
+    async def complete(self, system, messages, **kwargs):
+        self.calls.append({"system": system, "messages": messages, "kwargs": kwargs})
+        return {
+            "thought": f"using {self.name}",
+            "action": "finish",
+            "answer": f"model={self.name}",
+            "confidence": 0.9,
+        }
+
+
+class _DeepLLM(_NamedLLM):
+    created: dict[str, int] = {}
+
+    def __init__(self) -> None:
+        self.created["deep"] = self.created.get("deep", 0) + 1
+        super().__init__("deep")
+
+
+class _DelegatingLLM(_ChatLLM):
+    async def complete(self, system, messages, **kwargs):
+        self.calls.append({"system": system, "messages": messages, "kwargs": kwargs})
+        if len(self.calls) == 1:
+            return {
+                "thought": "delegate",
+                "action": "delegate_sub",
+                "args": {"task": "answer with your model"},
+            }
+        return {
+            "thought": "done",
+            "action": "finish",
+            "answer": "delegated",
+            "confidence": 0.9,
+        }
+
+
 class _SpyMemory(MemoryManager):
     def __init__(self, llm: Any) -> None:
         super().__init__(
@@ -199,6 +239,21 @@ async def test_sqlite_session_store_lists_clears_and_deletes_sessions(tmp_path):
     assert await store.delete("alpha") is True
     assert await store.delete("missing") is False
     assert {state.session_id for state in await store.list_sessions()} == {"beta"}
+
+
+@pytest.mark.asyncio
+async def test_sqlite_session_store_persists_model_overrides(tmp_path):
+    path = tmp_path / "sessions.sqlite"
+    store = SQLiteSessionStore(path)
+
+    state = await store.set_model_override("s", "coordinator", "fast")
+
+    assert state.model_overrides == {"coordinator": "fast"}
+    reloaded = await SQLiteSessionStore(path).load("s")
+    assert reloaded.model_overrides == {"coordinator": "fast"}
+
+    cleared = await store.set_model_override("s", "coordinator", None)
+    assert cleared.model_overrides == {}
 
 
 def test_persistent_demo_parser_accepts_session_controls(monkeypatch):
@@ -553,6 +608,150 @@ async def test_persistent_agent_refreshes_guard_per_turn_for_coordinator_and_sub
     assert sub._guard is created_guards[0]
     assert coordinator._guard is not original_coordinator_guard
     assert sub._guard is not original_sub_guard
+
+
+@pytest.mark.asyncio
+async def test_persistent_agent_switches_coordinator_model_per_session():
+    default_llm = _NamedLLM("fast")
+    memory = _SpyMemory(default_llm)
+    coordinator = _agent(llm=default_llm, memory=memory)
+    app = PersistentAgent(
+        coordinator=coordinator,
+        session_store=InMemorySessionStore(),
+        memory=memory,
+        llm=default_llm,
+        llm_registry={
+            "fast": lambda: _NamedLLM("fast"),
+            "deep": lambda: _NamedLLM("deep"),
+        },
+        default_model="fast",
+    )
+
+    await app.switch_model("s", "coordinator", "fast")
+    events = [event async for event in app.chat("hello", session_id="s")]
+
+    done = next(event for event in events if event.type == EventType.TASK_DONE)
+    assert done.payload["answer"] == "model=fast"
+    assert await app.model_overrides("s") == {"coordinator": "fast"}
+
+    events = [event async for event in app.chat("other session", session_id="other")]
+    done = next(event for event in events if event.type == EventType.TASK_DONE)
+    assert done.payload["answer"] == "model=fast"
+
+    await app.clear_model_override("s", "coordinator")
+    events = [event async for event in app.chat("hello again", session_id="s")]
+    done = next(event for event in events if event.type == EventType.TASK_DONE)
+    assert done.payload["answer"] == "model=fast"
+
+
+@pytest.mark.asyncio
+async def test_persistent_agent_preserves_explicit_control_llm_after_model_apply():
+    coordinator_llm = _NamedLLM("coordinator")
+    control_llm = _NamedLLM("control")
+    memory = _SpyMemory(control_llm)
+    coordinator = _agent(llm=coordinator_llm, memory=memory)
+    app = PersistentAgent(
+        coordinator=coordinator,
+        session_store=InMemorySessionStore(),
+        memory=memory,
+        llm=control_llm,
+    )
+
+    [event async for event in app.chat("hello", session_id="s")]
+
+    assert app.llm is control_llm
+
+
+@pytest.mark.asyncio
+async def test_persistent_agent_registry_uses_class_factories_once_per_model():
+    _DeepLLM.created.clear()
+    control_llm = _NamedLLM("control")
+    memory = _SpyMemory(control_llm)
+    coordinator = _agent(llm=_NamedLLM("fast"), memory=memory)
+    app = PersistentAgent(
+        coordinator=coordinator,
+        session_store=InMemorySessionStore(),
+        memory=memory,
+        llm=control_llm,
+        llm_registry={"deep": _DeepLLM},
+    )
+
+    await app.switch_model("s", "coordinator", "deep")
+    [event async for event in app.chat("first", session_id="s")]
+    [event async for event in app.chat("second", session_id="s")]
+
+    assert _DeepLLM.created["deep"] == 1
+
+
+def test_persistent_agent_rejects_ambiguous_model_registry_names():
+    llm = _NamedLLM("fast")
+    memory = _SpyMemory(llm)
+    coordinator = _agent(llm=llm, memory=memory)
+
+    with pytest.raises(ValueError, match="reserved"):
+        PersistentAgent(
+            coordinator=coordinator,
+            session_store=InMemorySessionStore(),
+            memory=memory,
+            llm=llm,
+            llm_registry={"default": lambda: _NamedLLM("default")},
+        )
+
+    with pytest.raises(ValueError, match="not present"):
+        PersistentAgent(
+            coordinator=coordinator,
+            session_store=InMemorySessionStore(),
+            memory=memory,
+            llm=llm,
+            llm_registry={"fast": lambda: _NamedLLM("fast")},
+            default_model="deep",
+        )
+
+
+@pytest.mark.asyncio
+async def test_persistent_agent_can_clear_stale_model_override():
+    store = InMemorySessionStore()
+    await store.set_model_override("s", "old_agent", "fast")
+    llm = _NamedLLM("fast")
+    memory = _SpyMemory(llm)
+    coordinator = _agent(llm=llm, memory=memory)
+    app = PersistentAgent(
+        coordinator=coordinator,
+        session_store=store,
+        memory=memory,
+        llm=llm,
+        llm_registry={"fast": lambda: _NamedLLM("fast")},
+    )
+
+    state = await app.clear_model_override("s", "old_agent")
+
+    assert state.model_overrides == {}
+
+
+@pytest.mark.asyncio
+async def test_persistent_agent_switches_subagent_model_per_session():
+    coordinator_llm = _DelegatingLLM()
+    default_sub_llm = _NamedLLM("sub-default")
+    memory = _SpyMemory(coordinator_llm)
+    sub = _agent(llm=default_sub_llm, memory=memory)
+    sub.config.agent_id = "sub"
+    delegate = SubAgentTool(sub, name="delegate_sub")
+    coordinator = _agent(llm=coordinator_llm, memory=memory, tools={"delegate_sub": delegate})
+    app = PersistentAgent(
+        coordinator=coordinator,
+        session_store=InMemorySessionStore(),
+        memory=memory,
+        llm=coordinator_llm,
+        llm_registry={"sub-fast": lambda: _NamedLLM("sub-fast")},
+    )
+
+    await app.switch_model("s", "sub", "sub-fast")
+    events = [event async for event in app.chat("delegate", session_id="s")]
+
+    sub_done = next(
+        event for event in events if event.type == EventType.TASK_DONE and event.agent_id == "sub"
+    )
+    assert sub_done.payload["answer"] == "model=sub-fast"
 
 
 @pytest.mark.asyncio
