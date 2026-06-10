@@ -9,6 +9,7 @@ recency window separately.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
@@ -376,6 +377,62 @@ async def test_recency_window_relaxes_when_budget_forces_it():
         "recency window failed to relax — no summary produced"
     )
     assert wm.summarization_count >= 1
+
+
+@pytest.mark.asyncio
+async def test_evict_tolerates_selected_messages_removed_during_summary():
+    """Regression: do not leak StopIteration if messages disappear during await."""
+
+    class MutatingLLM:
+        def __init__(self) -> None:
+            self.wm: WorkingMemory | None = None
+
+        async def complete(self, system: Any, messages: Any, **_: Any) -> dict:
+            assert self.wm is not None
+            self.wm._messages = [m for m in self.wm._messages if m.pinned]
+            self.wm._token_total = sum(m.token_count for m in self.wm._messages)
+            return {"text": "ok"}
+
+    llm = MutatingLLM()
+    wm = WorkingMemory(llm=llm, max_tokens=150, recency_window=0, token_counter=len)
+    llm.wm = wm
+
+    await wm.append("system", "s", pinned=True)
+    await wm.append("user", MSG)
+    await wm.append("assistant", MSG)
+
+    assert wm.get_messages() == [{"role": "system", "content": "s"}]
+    assert wm.token_count() == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_appends_do_not_create_duplicate_summaries():
+    """Concurrent append-triggered evictions are serialized into one summary stream."""
+
+    class SlowLLM:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete(self, system: Any, messages: Any, **_: Any) -> dict:
+            self.calls += 1
+            await asyncio.sleep(0)
+            return {"text": f"summary {self.calls}"}
+
+    llm = SlowLLM()
+    wm = WorkingMemory(llm=llm, max_tokens=250, recency_window=0, token_counter=len)
+    await wm.append("system", "s", pinned=True)
+    await wm.append("user", MSG)
+
+    await asyncio.gather(
+        wm.append("assistant", MSG),
+        wm.append("user", MSG),
+    )
+
+    summary_messages = [
+        m for m in wm._messages if m.is_summary or str(m.content).startswith(SUMMARY_HEADER)
+    ]
+    assert len(summary_messages) <= 1
+    assert wm.token_count() == sum(m.token_count for m in wm._messages)
 
 
 @pytest.mark.asyncio

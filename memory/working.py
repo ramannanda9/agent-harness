@@ -27,6 +27,7 @@ zero dependencies. For exact counts, pass a custom `token_counter`:
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -207,6 +208,7 @@ class WorkingMemory:
         self._messages: list[Message] = []
         self._token_total: int = 0
         self._summarization_count: int = 0
+        self._eviction_lock = asyncio.Lock()
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -221,7 +223,9 @@ class WorkingMemory:
         self._token_total += msg.token_count
 
         if self._token_total > self.max_tokens:
-            await self._evict()
+            async with self._eviction_lock:
+                if self._token_total > self.max_tokens:
+                    await self._evict_unlocked()
 
     def get_messages(self) -> list[dict]:
         return [{"role": m.role, "content": m.content} for m in self._messages]
@@ -333,7 +337,7 @@ class WorkingMemory:
         # candidates_back is newest-first; protect the first `protect` of them.
         return sorted(candidates_back[protect:])
 
-    async def _evict(self, _depth: int = 0) -> None:
+    async def _evict_unlocked(self, _depth: int = 0) -> None:
         # Find eligible messages, relaxing recency_window only if necessary.
         relax = 0
         eligible_idx = self._eligible_indices(relax)
@@ -347,6 +351,17 @@ class WorkingMemory:
             to_summarize = [self._messages[i] for i in chosen_idx]
 
             prior_summary = next((m for m in self._messages if m.is_summary), None)
+            prior_summary_idx = (
+                next(
+                    (i for i, m in enumerate(self._messages) if m is prior_summary),
+                    None,
+                )
+                if prior_summary is not None
+                else None
+            )
+            insert_idx = min(
+                [*chosen_idx, *([] if prior_summary_idx is None else [prior_summary_idx])]
+            )
             if prior_summary is None:
                 summary_text = await self._summarize_initial(to_summarize)
             else:
@@ -364,32 +379,41 @@ class WorkingMemory:
             if prior_summary is not None:
                 removed_ids.add(id(prior_summary))
 
-            insert_idx = next(i for i, m in enumerate(self._messages) if id(m) in removed_ids)
-            remaining = [m for m in self._messages if id(m) not in removed_ids]
+            if not any(id(m) in removed_ids for m in self._messages):
+                # The summarizer is awaited above. If callers accidentally
+                # mutate the same WorkingMemory concurrently, the selected
+                # messages may already be gone. Do not reinsert a stale
+                # summary or leak StopIteration out of this coroutine; fall
+                # through to the second-pass / hard-drop safety logic.
+                self._token_total = sum(m.token_count for m in self._messages)
+            else:
+                remaining = [m for m in self._messages if id(m) not in removed_ids]
 
-            # Role = opposite of the next non-pinned non-summary message so
-            # the ReAct alternating invariant holds. No such message → "user".
-            first_after = next(
-                (m for m in remaining if not m.pinned and not m.is_summary),
-                None,
-            )
-            summary_role = "assistant" if (first_after and first_after.role == "user") else "user"
+                # Role = opposite of the next non-pinned non-summary message so
+                # the ReAct alternating invariant holds. No such message → "user".
+                first_after = next(
+                    (m for m in remaining if not m.pinned and not m.is_summary),
+                    None,
+                )
+                summary_role = (
+                    "assistant" if (first_after and first_after.role == "user") else "user"
+                )
 
-            summary_msg = Message(
-                role=summary_role,
-                content=summary_content,
-                token_count=self._count(summary_content),
-                is_summary=True,
-            )
+                summary_msg = Message(
+                    role=summary_role,
+                    content=summary_content,
+                    token_count=self._count(summary_content),
+                    is_summary=True,
+                )
 
-            self._messages = remaining
-            self._messages.insert(insert_idx, summary_msg)
-            self._token_total = sum(m.token_count for m in self._messages)
-            self._summarization_count += 1
+                self._messages = remaining
+                self._messages.insert(min(insert_idx, len(self._messages)), summary_msg)
+                self._token_total = sum(m.token_count for m in self._messages)
+                self._summarization_count += 1
 
         # Second pass before resorting to hard drops (max 2 passes).
         if self._token_total > self.max_tokens and _depth < 1:
-            await self._evict(_depth=_depth + 1)
+            await self._evict_unlocked(_depth=_depth + 1)
             return
 
         # Safety valve: hard FIFO drop. Drops oldest non-pinned, non-summary,
