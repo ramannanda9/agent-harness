@@ -5,9 +5,9 @@ When ``SessionState.plan_mode_enabled`` is True, ``chat()`` should:
 1. Call the LLM for a structured plan.
 2. Yield a ``PLAN_PROPOSED`` event so renderers can show it.
 3. Route plan approval via ``harness.hitl.request_plan_approval`` (the
-   plan-specific sibling of ``request_approval`` — y / n / revision
-   only; no session-allow or persistent-allow because those defeat the
-   per-turn-approval intent of plan mode).
+   plan-specific sibling of ``request_approval`` — Enter / y / n /
+   revision only; no session-allow or persistent-allow because those
+   defeat the per-turn-approval intent of plan mode).
 4. On approval, run the existing ReAct flow with the plan injected as
    a prior message; on rejection, yield an ERROR and write nothing to
    the session store.

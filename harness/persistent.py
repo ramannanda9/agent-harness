@@ -32,9 +32,9 @@ def _now() -> str:
 # When ``SessionState.plan_mode_enabled`` is True, ``PersistentAgent.chat``
 # asks the coordinator's LLM for a structured plan before any tools run,
 # yields a ``PLAN_PROPOSED`` event so renderers can display it, and gates
-# execution on ``harness.hitl.request_approval``. HITL handles the y / n /
-# correction / session-allow / persistent-allow UX — plan mode is
-# deliberately thin on top of it.
+# execution on ``harness.hitl.request_plan_approval``. Plan approval handles
+# Enter / y / n / correction only; there is no session-allow or persistent-
+# allow shortcut because plan mode is intentionally per-turn.
 
 _PLAN_SYSTEM_PROMPT = """You are in plan mode for an autonomous agent.
 
