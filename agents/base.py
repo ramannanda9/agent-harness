@@ -39,6 +39,7 @@ from typing import Any, Final
 
 from harness.checkpoint import _ResumeHint
 from harness.events import BusEvent, EventType
+from harness.skills import Skill
 from harness.utils import fire
 from memory.manager import MemoryManager
 from memory.working import WorkingMemory
@@ -89,6 +90,10 @@ class AgentConfig:
     # other's lookups (HTTPFetch on stable URLs, ``kubectl get …`` style
     # discovery, MCP filesystem reads).
     cache_tool_results: bool = False
+    # Prompt/context bundles attached explicitly to this agent. Skills do
+    # not grant tools; they only add reusable instructions and hints to the
+    # system prompt.
+    skills: list[Skill] = None
     # Hard cap on how deep a SubAgentTool chain may recurse. Depth 0 = the
     # top-level agent invoked by AgentRuntime; depth 1 = a sub-agent
     # delegated to from the top; depth 2 = a sub-agent that itself
@@ -100,6 +105,8 @@ class AgentConfig:
     def __post_init__(self):
         if self.hitl_tools is None:
             self.hitl_tools = []
+        if self.skills is None:
+            self.skills = []
 
 
 # ── ReAct Response Schema ─────────────────────────────────────────────────────
@@ -440,6 +447,11 @@ class BaseAgent:
         as before.
         """
         parts = [self.config.system_prompt]
+
+        if self.config.skills:
+            rendered_skills = "\n\n".join(skill.render() for skill in self.config.skills)
+            if rendered_skills:
+                parts.append("## Skills\n" + rendered_skills)
 
         memory_in_system_prompt = (
             self.config.memory_context_enabled and precomputed_memory_context != "_skip_"

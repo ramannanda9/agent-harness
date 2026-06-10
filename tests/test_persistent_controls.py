@@ -14,6 +14,7 @@ from harness.persistent_controls import (
     slash_command_specs,
 )
 from harness.runtime import BudgetGuard, GuardrailConfig, Tracer
+from harness.skills import Skill
 from memory.manager import MemoryManager
 from memory.stores import InMemoryEpisodicStore, InMemorySemanticStore
 
@@ -73,6 +74,13 @@ def _app():
             role="coordinates",
             system_prompt="You coordinate.",
             allowed_tools=[],
+            skills=[
+                Skill(
+                    name="session-control",
+                    description="Keep persistent session state easy to inspect.",
+                    instructions="Keep session state clear.",
+                )
+            ],
             max_steps=2,
         ),
         tools={},
@@ -205,6 +213,18 @@ async def test_command_handler_usage_displays_session_totals():
 
     assert "total tokens: in=123 out=45" in result.text
     assert "agent:coordinator" in result.text
+
+
+@pytest.mark.asyncio
+async def test_command_handler_formats_agent_skills():
+    app, _, _ = _app()
+    handler = PersistentCommandHandler(app)
+
+    agents = await handler.handle("/agents", session_id="s")
+    capabilities = await handler.handle("/capabilities", session_id="s")
+
+    assert "skills: session-control" in agents.text
+    assert "skills: session-control" in capabilities.text
 
 
 @pytest.mark.asyncio

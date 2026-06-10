@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from agents.base import AgentConfig
 from harness.events import EventType
+from harness.skills import Skill
 from tests.conftest import EchoTool, FailingTool, ScriptedLLM, SlowTool
 
 
@@ -23,6 +24,35 @@ async def test_finish_on_first_step_returns_answer(agent_factory, llm: ScriptedL
     assert result["steps"] == 1
     assert "error" not in result
     assert "done:" in result["answer"]
+
+
+async def test_agent_skills_are_injected_without_granting_tools(agent_factory, llm: ScriptedLLM):
+    config = AgentConfig(
+        agent_id="skilled",
+        role="uses reusable instructions",
+        system_prompt="Base prompt.",
+        allowed_tools=[],
+        skills=[
+            Skill(
+                name="web-research",
+                description="Research current information from primary sources.",
+                instructions="Prefer primary sources and cite dates.",
+                tool_hints=["browser_snapshot"],
+            )
+        ],
+    )
+    agent = agent_factory(config)
+
+    await agent.run("summarize")
+
+    system = llm.calls[0]["system"]
+    assert "## Skills" in system
+    assert "### web-research" in system
+    assert "Description: Research current information from primary sources." in system
+    assert "Instructions:" in system
+    assert "Prefer primary sources and cite dates." in system
+    assert "Useful tools: browser_snapshot" in system
+    assert "Available tools: none" in system
 
 
 async def test_tool_call_then_finish(agent_factory, llm: ScriptedLLM):

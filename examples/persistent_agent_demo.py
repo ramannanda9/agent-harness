@@ -48,6 +48,7 @@ from harness.persistent import PersistentAgent, PersistentAgentConfig, SQLiteSes
 from harness.persistent_controls import PersistentCommandHandler
 from harness.persistent_prompt import build_chat_prompt_session
 from harness.runtime import BudgetGuard, GuardrailConfig, Tracer
+from harness.skills import Skill, load_skills
 from memory.manager import MemoryManager
 from memory.stores import SQLiteSemanticStore
 from tools.builtin.subagent import SubAgentTool
@@ -99,6 +100,7 @@ def _build_agent(
     # and one-source retries each cost a ReAct step. Override per-agent
     # when more is needed (the researcher does — see below).
     max_steps: int = 10,
+    skills: list[Skill] | None = None,
 ) -> BaseAgent:
     return BaseAgent(
         config=AgentConfig(
@@ -107,6 +109,7 @@ def _build_agent(
             system_prompt=system_prompt,
             allowed_tools=list(tools.keys()),
             max_steps=max_steps,
+            skills=skills,
         ),
         tools=tools,
         memory=memory,
@@ -259,6 +262,7 @@ async def main() -> None:
     await episodic_store.initialize()
 
     llm, llm_label = _build_llm(args.provider)
+    default_skills = load_skills()
     memory = MemoryManager(
         semantic_store=SQLiteSemanticStore(semantic_path),
         episodic_store=episodic_store,
@@ -341,6 +345,7 @@ async def main() -> None:
             llm=llm,
             memory=memory,
             guard=guard,
+            skills=default_skills,
         )
 
         session_id = f"sess_{uuid4().hex[:12]}" if args.new_session else args.session_id

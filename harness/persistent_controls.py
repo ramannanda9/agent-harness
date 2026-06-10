@@ -529,12 +529,16 @@ def _format_capabilities(app: PersistentAgent) -> str:
     caps = app.capabilities()
     coordinator = caps["coordinator"]
     lines = [f"Coordinator: {coordinator['agent_id']}"]
+    if coordinator.get("skills"):
+        lines.append(f"  skills: {_format_skill_names(coordinator['skills'])}")
     for tool in coordinator.get("tools", []):
         sub = next((s for s in caps["subagents"] if s["tool_name"] == tool), None)
         if sub is None:
             lines.append(f"  - {tool}")
             continue
         lines.append(f"  - {tool} -> {sub['agent_id']}")
+        if sub.get("skills"):
+            lines.append(f"      skills: {_format_skill_names(sub['skills'])}")
         for sub_tool in sub.get("tools", []):
             lines.append(f"      - {sub_tool}")
     return "\n".join(lines)
@@ -544,9 +548,17 @@ def _format_agents(app: PersistentAgent) -> str:
     caps = app.capabilities()
     coordinator = caps["coordinator"]
     lines = [f"{coordinator['agent_id']}: {coordinator['role']}"]
+    if coordinator.get("skills"):
+        lines.append(f"  skills: {_format_skill_names(coordinator['skills'])}")
     for sub in caps["subagents"]:
         lines.append(f"{sub['agent_id']}: {sub['role']} (via {sub['tool_name']})")
+        if sub.get("skills"):
+            lines.append(f"  skills: {_format_skill_names(sub['skills'])}")
     return "\n".join(lines)
+
+
+def _format_skill_names(skills: list[dict]) -> str:
+    return ", ".join(str(skill["name"]) for skill in skills)
 
 
 def _format_mcp(app: PersistentAgent) -> str:
