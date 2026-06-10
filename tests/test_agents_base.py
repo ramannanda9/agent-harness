@@ -64,6 +64,54 @@ async def test_tool_call_then_finish(agent_factory, llm: ScriptedLLM):
     assert step["n"] == 2
 
 
+async def test_sequential_tool_calls_keep_llm_messages_trailing_user(
+    agent_factory, llm: ScriptedLLM
+):
+    """Bedrock-style providers reject assistant-prefill shaped messages.
+
+    After every tool observation, the next LLM call must see the prior
+    assistant action followed by a user observation, not a trailing assistant.
+    """
+    step = {"n": 0}
+    role_sequences: list[list[str]] = []
+
+    def react(system, messages, kwargs):
+        step["n"] += 1
+        roles = [m["role"] for m in messages]
+        role_sequences.append(roles)
+        assert roles[-1] == "user", f"LLM call {step['n']} ended with {roles[-1]}: {roles!r}"
+        if step["n"] == 1:
+            return {"thought": "first", "action": "echo", "args": {"message": "one"}}
+        if step["n"] == 2:
+            assert "Observation:" in messages[-1]["content"]
+            return {"thought": "second", "action": "echo", "args": {"message": "two"}}
+        assert "Observation:" in messages[-1]["content"]
+        return {
+            "thought": "done",
+            "action": "finish",
+            "answer": "used both observations",
+            "confidence": 0.9,
+        }
+
+    llm.routes = {"react": react}
+
+    config = AgentConfig(
+        agent_id="bedrock-shape",
+        role="uses tools",
+        system_prompt="ReAct.",
+        allowed_tools=["echo"],
+        max_steps=5,
+    )
+    agent = agent_factory(config, tools={"echo": EchoTool()})
+
+    result = await agent.run("call tools")
+
+    assert result["answer"] == "used both observations"
+    assert step["n"] == 3
+    assert role_sequences[1][-2:] == ["assistant", "user"]
+    assert role_sequences[2][-2:] == ["assistant", "user"]
+
+
 async def test_unknown_tool_returns_error_observation(agent_factory, llm: ScriptedLLM):
     """Unknown tool name should not crash — returns error string as observation."""
     step = {"n": 0}
