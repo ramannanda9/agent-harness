@@ -113,6 +113,47 @@ class ConsoleRenderer:
                     file=self._out,
                 )
 
+        elif t == EventType.PLAN_PROPOSED:
+            # PersistentAgent plan-mode preview, before HITL approval.
+            # Renders the full plan so the user can read it before the
+            # approval banner prints; HITL's banner repeats the summary
+            # in a yes/no/correction context.
+            #
+            # Steps whose args are deferred to runtime render as
+            # ``args: (resolved at runtime)`` rather than fabricating
+            # placeholder JSON — keep the renderer convention in lock-
+            # step with ``_render_plan_for_banner`` so the user sees the
+            # same shape twice.
+            plan = p.get("plan", {}) if isinstance(p.get("plan"), dict) else {}
+            revision = p.get("revision", 0)
+            summary = plan.get("summary") or "(no summary)"
+            steps = plan.get("steps") or []
+            header = "[plan propose]"
+            if revision:
+                header = f"[plan rev {revision}]"
+            print(f"\n{header}  {summary}", file=self._out)
+            for step in steps:
+                idx = step.get("step")
+                intent = step.get("intent") or "(no intent)"
+                tool = step.get("tool")
+                why = step.get("why")
+                prefix = f"  {idx}." if idx is not None else "  -"
+                print(f"{prefix} {intent}", file=self._out)
+                if tool:
+                    # Convention: ``"args"`` key missing or ``args is None``
+                    # → deferred. ``args == {}`` → "tool takes no args".
+                    args_present = "args" in step and step["args"] is not None
+                    if not args_present:
+                        print(f"      tool: {tool}  args: (resolved at runtime)", file=self._out)
+                    else:
+                        args = step["args"] or {}
+                        args_repr = (
+                            json.dumps(args, ensure_ascii=False, default=str) if args else "{}"
+                        )
+                        print(f"      tool: {tool}  args: {args_repr}", file=self._out)
+                if why:
+                    print(f"      why:  {why}", file=self._out)
+
         elif t == EventType.THOUGHT:
             thought = p.get("thought", "")
             if thought:

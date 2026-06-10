@@ -16,11 +16,12 @@ in one place.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from prompt_toolkit import PromptSession
+from prompt_toolkit.application import run_in_terminal
 from prompt_toolkit.filters import has_completions
 from prompt_toolkit.history import FileHistory, History, InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
@@ -41,6 +42,7 @@ def build_chat_prompt_session(
     multiline: bool = True,
     complete_while_typing: bool = False,
     extra_key_bindings: KeyBindings | None = None,
+    plan_mode_toggle: Callable[[], Awaitable[bool]] | None = None,
 ) -> PromptSession[str]:
     """Construct a ``PromptSession`` suitable for multi-turn chat input.
 
@@ -55,6 +57,14 @@ def build_chat_prompt_session(
     - **Ctrl+J** and **Esc-Enter** (Meta-Enter / Alt-Enter) insert a
       literal newline. Two bindings because some terminals strip Esc
       modifiers, and Ctrl+J is the convention modern AI CLIs use.
+    - **Shift-Tab** toggles plan mode when ``plan_mode_toggle`` is given —
+      matches the Claude Code convention. The callable is invoked async
+      and should return the new bool state; the helper prints a
+      ``[plan mode: on|off]`` confirmation via ``run_in_terminal`` so the
+      prompt doesn't get torn up by the print. Pass ``plan_mode_toggle``
+      a thunk that reads the *live* current session id (sessions change
+      mid-demo via ``/switch`` / ``/new`` / ``/delete``); see the persistent
+      demo for the canonical wiring.
     - ``complete_while_typing=False``: Tab-triggered completion. The
       session-id completer otherwise hits the store on every keystroke.
     - ``completer=SlashCommandCompleter(app)`` when ``app`` is given.
@@ -69,7 +79,7 @@ def build_chat_prompt_session(
     ``extra_key_bindings`` are merged after the chat defaults, so user
     bindings can override them.
     """
-    bindings = _chat_key_bindings()
+    bindings = _chat_key_bindings(plan_mode_toggle=plan_mode_toggle)
     if extra_key_bindings is not None:
         # KeyBindings.add_binding via merge: prompt_toolkit's
         # merge_key_bindings is the proper composition primitive when
@@ -94,7 +104,10 @@ def build_chat_prompt_session(
     )
 
 
-def _chat_key_bindings() -> KeyBindings:
+def _chat_key_bindings(
+    *,
+    plan_mode_toggle: Callable[[], Awaitable[bool]] | None = None,
+) -> KeyBindings:
     """The default keybinding set for chat-style multi-line input.
 
     Kept as a module-level factory so tests can introspect the bindings
@@ -127,6 +140,32 @@ def _chat_key_bindings() -> KeyBindings:
         # terminals strip the Esc modifier and some users have one or
         # the other in muscle memory.
         event.current_buffer.insert_text("\n")
+
+    if plan_mode_toggle is not None:
+
+        @bindings.add("s-tab")
+        def _shift_tab_plan_toggle(event: Any) -> None:
+            # Claude Code convention: Shift-Tab cycles plan mode. The
+            # toggle hits the session store (async); prompt_toolkit
+            # keybindings are sync, so we schedule the work on the
+            # running event loop. Output goes through ``run_in_terminal``
+            # so it doesn't tear up the active prompt rendering — the
+            # prompt suspends, the line prints, the prompt re-renders.
+            async def _do_toggle() -> None:
+                try:
+                    new_state = await plan_mode_toggle()
+                except Exception as exc:  # noqa: BLE001 — keybinding must not crash the loop
+                    # ``exc`` bound via default arg so the closure
+                    # captures *this* exception, not whatever the
+                    # variable might be after the except scope ends.
+                    await run_in_terminal(
+                        lambda exc=exc: print(f"\n[plan mode toggle failed: {exc}]")
+                    )
+                    return
+                label = "on" if new_state else "off"
+                await run_in_terminal(lambda: print(f"\n[plan mode: {label}]"))
+
+            event.app.create_background_task(_do_toggle())
 
     return bindings
 

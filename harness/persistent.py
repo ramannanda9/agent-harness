@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
 
-from agents.base import BaseAgent
+from agents.base import BaseAgent, _parse_action_json
 from harness.events import BusEvent, EventType
 from harness.utils import fire
 from memory.manager import MemoryManager
@@ -25,6 +25,206 @@ from memory.manager import MemoryManager
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+# ── Plan mode ────────────────────────────────────────────────────────────────
+#
+# When ``SessionState.plan_mode_enabled`` is True, ``PersistentAgent.chat``
+# asks the coordinator's LLM for a structured plan before any tools run,
+# yields a ``PLAN_PROPOSED`` event so renderers can display it, and gates
+# execution on ``harness.hitl.request_approval``. HITL handles the y / n /
+# correction / session-allow / persistent-allow UX — plan mode is
+# deliberately thin on top of it.
+
+_PLAN_SYSTEM_PROMPT = """You are in plan mode for an autonomous agent.
+
+Output rules — read carefully, these are strict:
+- Output ONE JSON object. Nothing else.
+- No markdown code fences (no triple-backticks).
+- No prose before or after the object.
+- No ``<thinking>`` tags or other XML wrappers.
+- The first character of your response MUST be ``{``.
+- The last character of your response MUST be ``}``.
+
+Do NOT execute any tools. Do NOT plan to execute tools yourself — the
+plan is a description for a separate executor to follow.
+
+The plan is the user's chance to approve INTENT, not arguments. Many
+real tasks have args that can only be known at runtime — a URL
+discovered by a search, a file path extracted from a directory listing,
+a row id returned by a query. Be honest about which step args you can
+fill in upfront and which depend on the previous step's observation.
+
+Output schema:
+{
+  "summary": "<one-line summary of what the plan will accomplish>",
+  "steps": [
+    {
+      "step": 1,
+      "intent": "<what this step achieves>",
+      "tool": "<tool name from the available list, or null if no tool>",
+      "args": {<concrete arguments, OR null when args depend on prior observation>},
+      "why": "<one-line justification>"
+    },
+    ...
+  ]
+}
+
+Available tools: {tools}
+
+Argument rules:
+- Use concrete ``args`` only when the value was supplied by the user
+  (e.g. they said "fetch https://x.com/y") or is otherwise knowable
+  without running any tool first.
+- Use ``null`` (or omit the field) when the value depends on an earlier
+  step's tool output — e.g. "navigate to the most-cited paper's URL"
+  after a search. Fabricating placeholder URLs / paths the agent will
+  ignore is misleading.
+
+If the user's request is conversational and needs no tool calls, return
+a plan with a single step whose ``tool`` is null."""
+
+
+_PLAN_CORRECTION_HINT = (
+    "\n\nThe user reviewed your previous plan and asked for this revision:\n"
+    "\n{correction}\n\n"
+    "Output a revised JSON plan."
+)
+
+
+# Hard cap on revision loops to protect against pathological re-planning
+# cycles. Each revision is one LLM call + one HITL prompt; users with
+# stronger feedback can always reject (n) and start fresh.
+_PLAN_REVISION_LIMIT = 3
+
+
+def _coerce_plan(raw: Any) -> dict[str, Any] | None:
+    """Best-effort plan extraction from whatever the LLM returned.
+
+    Why this isn't a simple ``json.loads``: ``response_format={"type":
+    "json_object"}`` is passed on every planner call, but **only the
+    OpenAI adapter honours it** (``harness/llm/openai.py:178``). The
+    Anthropic and Claude Code adapters silently drop the kwarg, so the
+    model is free to wrap its JSON in markdown code fences or sandwich
+    it inside prose — and routinely does.
+
+    Recovery rides the existing extractor: ``_parse_action_json`` (in
+    ``agents/base.py``) is the same helper the ReAct loop uses to pull
+    JSON out of Anthropic / Claude Code responses every turn. It walks
+    each ``{`` in the text and lets Python's ``JSONDecoder.raw_decode``
+    handle bracket balancing, so fence-wrapped, prose-wrapped, and
+    plain-JSON inputs all parse without bespoke logic here.
+    """
+    # Peel adapter wrapping. Every harness LLM adapter returns
+    # ``{"text": <content>, "usage": <dict>}``; v0.9.x checked
+    # ``len(raw) == 1`` and wrongly rejected the two-key shape.
+    if isinstance(raw, dict) and isinstance(raw.get("text"), str):
+        raw = raw["text"]
+
+    if isinstance(raw, str):
+        raw = _parse_action_json(raw)
+        if raw is None:
+            return None
+
+    if not isinstance(raw, dict):
+        return None
+    steps = raw.get("steps")
+    if not isinstance(steps, list):
+        return None
+    summary = raw.get("summary")
+    return {
+        "summary": str(summary) if summary is not None else "",
+        "steps": [s for s in steps if isinstance(s, dict)],
+    }
+
+
+def _step_args_deferred(step: dict[str, Any]) -> bool:
+    """Whether a step's args are deferred to runtime.
+
+    A step is "deferred" when the planner could not commit to concrete
+    args upfront — usually because the value depends on what an earlier
+    step's tool observes (URL discovered by a search, file path from a
+    directory listing, row id from a query, etc.).
+
+    Convention:
+    - ``"args"`` key missing → deferred
+    - ``args is None`` → deferred (explicit null in the planner JSON)
+    - ``args == {}`` → NOT deferred ("tool takes no arguments")
+    - ``args == {...}`` → NOT deferred (concrete)
+
+    Drives the "(resolved at runtime)" banner line and the
+    ``dynamic_steps`` count in the HITL approval args.
+    """
+    if "args" not in step:
+        return True
+    return step["args"] is None
+
+
+def _dynamic_step_count(plan: dict[str, Any]) -> int:
+    """Number of plan steps whose args will be resolved at runtime."""
+    steps = plan.get("steps") or []
+    return sum(
+        1
+        for step in steps
+        if isinstance(step, dict) and step.get("tool") and _step_args_deferred(step)
+    )
+
+
+def _render_plan_for_banner(plan: dict[str, Any]) -> str:
+    """Multi-line text used as the HITL banner ``command`` field. Compact
+    enough to read quickly but structured enough that a reviewer can spot
+    a wrong tool / wrong URL before approving.
+
+    Steps whose args are deferred to runtime render as
+    ``args: (resolved at runtime)`` rather than fabricating placeholder
+    JSON — the planner can't know e.g. a URL that a prior search step
+    will return, and showing ``{}`` would imply otherwise.
+    """
+    lines: list[str] = []
+    summary = plan.get("summary") or "(no summary)"
+    lines.append(f"Plan: {summary}")
+    steps = plan.get("steps") or []
+    for step in steps:
+        idx = step.get("step")
+        intent = step.get("intent") or "(no intent)"
+        tool = step.get("tool")
+        why = step.get("why")
+        prefix = f"  {idx}." if idx is not None else "  -"
+        lines.append(f"{prefix} {intent}")
+        if tool:
+            if _step_args_deferred(step):
+                lines.append(f"      tool: {tool}  args: (resolved at runtime)")
+            else:
+                args = step.get("args") or {}
+                args_repr = json.dumps(args, ensure_ascii=False) if args else "{}"
+                lines.append(f"      tool: {tool}  args: {args_repr}")
+        if why:
+            lines.append(f"      why:  {why}")
+    return "\n".join(lines)
+
+
+def _render_plan_for_priors(plan: dict[str, Any]) -> str:
+    """Prior-message body shown to the coordinator after approval.
+
+    Kept distinct from the banner format so the wording can drift
+    independently (the LLM sees prose; the human sees a structured
+    inspector view) and so we can mark the prior with an unambiguous
+    ``[Approved plan]`` header the planner / executor system prompts can
+    pattern-match against if needed.
+    """
+    body = _render_plan_for_banner(plan)
+    return (
+        "[Approved plan]\n"
+        f"{body}\n\n"
+        "The plan above is the agreed INTENT for this turn. Args shown "
+        "are concrete only where the user supplied them or where they're "
+        "knowable without running any tool first; everywhere else the "
+        "value '(resolved at runtime)' means: derive the argument from "
+        "your observations of the prior step, NOT from any placeholder "
+        "in this prior. You may skip or merge steps when an observation "
+        "makes them unnecessary; report any such deviation in your next "
+        "thought."
+    )
 
 
 @dataclass
@@ -47,6 +247,12 @@ class SessionState:
     last_run_tokens_in: int = 0
     last_run_tokens_out: int = 0
     last_usage: dict[str, Any] = field(default_factory=dict)
+    # When True, ``PersistentAgent.chat`` proposes a plan and gates
+    # execution on HITL approval before running the ReAct loop. Per
+    # session so plan-mode preference is sticky across process restarts
+    # without bleeding between unrelated workspaces. Toggle via the
+    # ``/plan`` slash command or ``PersistentAgent.set_plan_mode``.
+    plan_mode_enabled: bool = False
     updated_at: str = field(default_factory=_now)
 
 
@@ -81,6 +287,8 @@ class SessionStore(Protocol):
     async def clear(self, session_id: str) -> SessionState: ...
 
     async def delete(self, session_id: str) -> bool: ...
+
+    async def set_plan_mode(self, session_id: str, enabled: bool) -> SessionState: ...
 
 
 class InMemorySessionStore:
@@ -178,6 +386,12 @@ class InMemorySessionStore:
 
     async def delete(self, session_id: str) -> bool:
         return self._sessions.pop(session_id, None) is not None
+
+    async def set_plan_mode(self, session_id: str, enabled: bool) -> SessionState:
+        state = self._sessions.setdefault(session_id, SessionState(session_id=session_id))
+        state.plan_mode_enabled = bool(enabled)
+        state.updated_at = _now()
+        return _copy_state(state)
 
 
 class SQLiteSessionStore:
@@ -368,6 +582,21 @@ class SQLiteSessionStore:
             conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
             return True
 
+    async def set_plan_mode(self, session_id: str, enabled: bool) -> SessionState:
+        self._ensure_schema()
+        with self._connect() as conn:
+            self._ensure_session(conn, session_id)
+            conn.execute(
+                """
+                UPDATE sessions
+                SET plan_mode_enabled = ?,
+                    updated_at = ?
+                WHERE session_id = ?
+                """,
+                (1 if enabled else 0, _now(), session_id),
+            )
+            return self._load_locked(conn, session_id)
+
     async def _mark(self, session_id: str, column: str, turn_count: int) -> SessionState:
         self._ensure_schema()
         if column not in {"last_reconcile_turn", "last_compact_turn"}:
@@ -403,6 +632,7 @@ class SQLiteSessionStore:
                     last_run_tokens_in INTEGER NOT NULL DEFAULT 0,
                     last_run_tokens_out INTEGER NOT NULL DEFAULT 0,
                     last_usage_json TEXT NOT NULL DEFAULT '{}',
+                    plan_mode_enabled INTEGER NOT NULL DEFAULT 0,
                     updated_at TEXT NOT NULL
                 )
                 """
@@ -429,6 +659,12 @@ class SQLiteSessionStore:
         self._ready = True
 
     def _ensure_usage_columns(self, conn: sqlite3.Connection) -> None:
+        # Additive column migrations for the ``sessions`` table. Each entry
+        # is ``column → DDL fragment for ALTER TABLE ADD COLUMN``. Existing
+        # databases get the new column with the declared default; fresh
+        # databases pick the column up via the ``CREATE TABLE`` above.
+        # Name kept for historical reasons — this function now handles all
+        # additive sessions-table columns, not just usage ones.
         existing = {row["name"] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()}
         additions = {
             "tokens_in_total": "INTEGER NOT NULL DEFAULT 0",
@@ -436,6 +672,7 @@ class SQLiteSessionStore:
             "last_run_tokens_in": "INTEGER NOT NULL DEFAULT 0",
             "last_run_tokens_out": "INTEGER NOT NULL DEFAULT 0",
             "last_usage_json": "TEXT NOT NULL DEFAULT '{}'",
+            "plan_mode_enabled": "INTEGER NOT NULL DEFAULT 0",
         }
         for column, ddl in additions.items():
             if column not in existing:
@@ -456,7 +693,7 @@ class SQLiteSessionStore:
             SELECT session_id, summary, turn_count, last_reconcile_turn,
                    last_compact_turn, tokens_in_total, tokens_out_total,
                    last_run_tokens_in, last_run_tokens_out, last_usage_json,
-                   updated_at
+                   plan_mode_enabled, updated_at
             FROM sessions
             WHERE session_id = ?
             """,
@@ -490,6 +727,7 @@ class SQLiteSessionStore:
             last_run_tokens_in=row["last_run_tokens_in"],
             last_run_tokens_out=row["last_run_tokens_out"],
             last_usage=json.loads(row["last_usage_json"] or "{}"),
+            plan_mode_enabled=bool(row["plan_mode_enabled"]),
             updated_at=row["updated_at"],
         )
 
@@ -570,6 +808,23 @@ class PersistentAgent:
         """LLM used for session summarization/control introspection."""
         return self._llm
 
+    # ── Plan mode public surface ──────────────────────────────────────────
+
+    async def set_plan_mode(self, session_id: str, enabled: bool) -> bool:
+        """Toggle plan mode on or off for ``session_id``.
+
+        When enabled, the next ``chat()`` call generates a plan, yields
+        ``PLAN_PROPOSED``, and gates execution on HITL approval before
+        running the ReAct loop. Returns the new value.
+        """
+        state = await self._session_store.set_plan_mode(session_id, enabled)
+        return state.plan_mode_enabled
+
+    async def plan_mode_enabled(self, session_id: str) -> bool:
+        """Return the current plan-mode setting for ``session_id``."""
+        state = await self._session_store.load(session_id)
+        return state.plan_mode_enabled
+
     async def chat(
         self,
         message: str,
@@ -577,7 +832,13 @@ class PersistentAgent:
         session_id: str = "default",
         run_id: str | None = None,
     ) -> AsyncGenerator[BusEvent, None]:
-        """Run one user turn with fresh working memory and durable session context."""
+        """Run one user turn with fresh working memory and durable session context.
+
+        When plan mode is enabled for the session, generates a plan first,
+        yields ``PLAN_PROPOSED``, and gates execution on HITL approval.
+        Rejection or unrecoverable plan-generation failure yields an
+        ``ERROR`` and returns without writing to the session store.
+        """
         state = await self._session_store.load(session_id)
         run_id = run_id or str(uuid.uuid4())
         memory_context_text = await self._get_session_memory_context(session_id, message=message)
@@ -591,6 +852,104 @@ class PersistentAgent:
         else:
             turn_guard = getattr(self._coordinator, "_guard", None)
         usage_before = _guard_token_totals(turn_guard)
+
+        # Plan-mode gate. Inserts a pinned plan prior into the priors list
+        # before the ReAct loop runs; or yields ERROR and returns if the
+        # user rejected the plan. Plan generation + HITL approval both
+        # propagate ``asyncio.CancelledError`` (Esc-cancel) cleanly without
+        # writing to the session store.
+        if state.plan_mode_enabled:
+            # Inline the plan-and-approve loop so PLAN_PROPOSED events
+            # yield to the consumer (renderer) BEFORE the approval
+            # banner blocks on stdin. Yielding directly preserves the
+            # order: plan first, then banner, then user input.
+            #
+            # Uses ``request_plan_approval`` (sibling of the per-tool
+            # ``request_approval``) — same input plumbing, but no
+            # ``a`` / ``A`` options. Session-allow / persistent-allow
+            # make sense when the "tool" is something like
+            # ``shell/grep`` that fires repeatedly; they're actively
+            # wrong when the gate is the plan itself (``a`` would
+            # silently turn plan mode off for the session).
+            from harness.hitl import request_plan_approval  # noqa: PLC0415
+
+            approved_plan: dict[str, Any] | None = None
+            plan_rejected = False
+            correction: str | None = None
+
+            for revision in range(_PLAN_REVISION_LIMIT + 1):
+                try:
+                    candidate_plan = await self._generate_plan(
+                        message=message,
+                        session_id=session_id,
+                        correction=correction,
+                    )
+                except Exception as exc:  # noqa: BLE001 — surface as ERROR
+                    yield BusEvent(
+                        type=EventType.ERROR,
+                        agent_id=self._coordinator.config.agent_id,
+                        error=f"plan generation failed: {exc}",
+                    )
+                    plan_rejected = True
+                    break
+
+                # Yield FIRST so the renderer prints the plan, then
+                # block for approval so the user is responding to a
+                # plan they've actually seen.
+                yield BusEvent(
+                    type=EventType.PLAN_PROPOSED,
+                    agent_id=self._coordinator.config.agent_id,
+                    payload={"plan": candidate_plan, "revision": revision},
+                )
+
+                response = await request_plan_approval(
+                    summary=candidate_plan.get("summary", ""),
+                    step_count=len(candidate_plan.get("steps", [])),
+                    dynamic_step_count=_dynamic_step_count(candidate_plan),
+                    agent_id=self._coordinator.config.agent_id,
+                    guard=turn_guard,
+                )
+                if response.approved:
+                    approved_plan = candidate_plan
+                    break
+                if response.correction:
+                    # Free-text revision — re-plan with this feedback.
+                    correction = response.correction
+                    continue
+                # Plain rejection (no correction text).
+                yield BusEvent(
+                    type=EventType.ERROR,
+                    agent_id=self._coordinator.config.agent_id,
+                    error="plan rejected by user",
+                )
+                plan_rejected = True
+                break
+            else:
+                # Revision budget exhausted — give the user a clean
+                # rejection rather than silently executing the last plan.
+                yield BusEvent(
+                    type=EventType.ERROR,
+                    agent_id=self._coordinator.config.agent_id,
+                    error=(
+                        f"plan revision limit ({_PLAN_REVISION_LIMIT}) reached; "
+                        "send 'y' to approve, 'n' to reject, or shorten the feedback"
+                    ),
+                )
+                plan_rejected = True
+
+            if plan_rejected:
+                return
+            if approved_plan is not None:
+                # Inject as a pinned prior so the ReAct loop's system
+                # prompt + memory prior stays byte-identical across the
+                # turn, and the plan rides as a user/assistant pair the
+                # coordinator clearly sees as "approved guidance."
+                plan_priors = [
+                    ("user", _render_plan_for_priors(approved_plan)),
+                    ("assistant", "Acknowledged. Executing the approved plan."),
+                ]
+                prior_messages = list(prior_messages) + plan_priors
+                pinned_priors += len(plan_priors)
 
         final_result: dict | None = None
         trace: list[dict[str, Any]] = []
@@ -648,6 +1007,51 @@ class PersistentAgent:
                 usage_guard=turn_guard,
                 usage_before=usage_before,
             )
+
+    async def _generate_plan(
+        self,
+        *,
+        message: str,
+        session_id: str,  # noqa: ARG002 — reserved for future per-session context
+        correction: str | None,
+    ) -> dict[str, Any]:
+        """Call the coordinator's LLM with the planner system prompt.
+
+        Returns the parsed plan dict. Raises ``ValueError`` if the LLM
+        response can't be coerced into the expected ``{summary, steps}``
+        shape.
+        """
+        tools = self._available_tool_names()
+        system = _PLAN_SYSTEM_PROMPT.replace("{tools}", ", ".join(tools) or "(none)")
+        if correction:
+            system = system + _PLAN_CORRECTION_HINT.replace("{correction}", correction)
+
+        raw = await self._llm.complete(
+            system=system,
+            messages=[{"role": "user", "content": message}],
+            response_format={"type": "json_object"},
+            source="planner",
+        )
+        plan = _coerce_plan(raw)
+        if plan is None:
+            raise ValueError(
+                "planner returned a response that could not be parsed as "
+                "a {summary, steps} JSON object"
+            )
+        return plan
+
+    def _available_tool_names(self) -> list[str]:
+        """Tools the coordinator (and any wired sub-agents at first level)
+        can call. Surfaces this to the planner so it doesn't propose tools
+        that don't exist."""
+        names: set[str] = set()
+        names.update(self._coordinator.config.allowed_tools or [])
+        # Also surface sub-agent delegate-tool names so plan mode can
+        # reference them — the SubAgentTool registers as a tool on the
+        # coordinator with name ``delegate_<sub_agent_id>``.
+        for tool_name in getattr(self._coordinator, "_tools", {}):
+            names.add(str(tool_name))
+        return sorted(names)
 
     def capabilities(self) -> dict[str, Any]:
         """Describe the coordinator, sub-agents, tools, and MCP tools wired in.
@@ -1270,6 +1674,7 @@ def _copy_state(state: SessionState) -> SessionState:
         last_run_tokens_in=state.last_run_tokens_in,
         last_run_tokens_out=state.last_run_tokens_out,
         last_usage=dict(state.last_usage),
+        plan_mode_enabled=state.plan_mode_enabled,
         updated_at=state.updated_at,
     )
 

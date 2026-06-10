@@ -45,6 +45,7 @@ class EventType(str, Enum):
     DISPATCH = "dispatch"
     ROUTE = "route"
     PLAN = "plan"
+    PLAN_PROPOSED = "plan_proposed"  # PersistentAgent plan-mode: pre-HITL plan
     THOUGHT = "thought"
     TOKEN = "token"
     ACTION = "action"

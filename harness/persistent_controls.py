@@ -39,6 +39,7 @@ class SlashCommandSpec:
     - ``"optional_session_id"`` — one optional session id (e.g. ``/new``)
     - ``"session_id_then_confirm"`` — optional session id + required ``confirm`` (e.g. ``/delete``)
     - ``"query"`` — one optional free-text token (e.g. ``/sessions [query]``)
+    - ``"plan_toggle"`` — one optional ``on`` / ``off`` literal (e.g. ``/plan``)
     """
 
     name: str
@@ -94,6 +95,13 @@ SLASH_COMMAND_SPECS: tuple[SlashCommandSpec, ...] = (
         "/forget",
         "Drop cached memory context for this session",
         category="Memory",
+    ),
+    SlashCommandSpec(
+        "/plan",
+        "Toggle plan-before-execute mode (on / off / status)",
+        category="Memory",
+        arg_hint="[on|off]",
+        arg_kind="plan_toggle",
     ),
     SlashCommandSpec(
         "/switch",
@@ -173,6 +181,7 @@ class PersistentCommandHandler:
             "/save": self._cmd_save,
             "/compact": self._cmd_compact,
             "/forget": self._cmd_forget,
+            "/plan": self._cmd_plan,
             "/switch": self._cmd_switch,
             "/new": self._cmd_new,
             "/clear": self._cmd_clear,
@@ -270,6 +279,38 @@ class PersistentCommandHandler:
     ) -> PersistentCommandResult:
         self._app.forget_memory_cache(session_id)
         return self._result(session_id, f"forgot cached memory context for session {session_id}")
+
+    async def _cmd_plan(
+        self, *, message: str, command: str, session_id: str
+    ) -> PersistentCommandResult:
+        # ``/plan`` → show current state; ``/plan on`` or ``/plan off`` →
+        # toggle. Anything else is a usage error. The persistence /
+        # SQLite side lives on ``PersistentAgent.set_plan_mode``; this
+        # handler is just argument parsing and a friendly message.
+        arg = message[len(command) :].strip().lower()
+        if arg == "":
+            enabled = await self._app.plan_mode_enabled(session_id)
+            state = "on" if enabled else "off"
+            return self._result(
+                session_id,
+                f"plan mode: {state}  (toggle with `/plan on` or `/plan off`)",
+            )
+        if arg in {"on", "true", "1", "yes"}:
+            await self._app.set_plan_mode(session_id, True)
+            return self._result(
+                session_id,
+                "plan mode: on — the agent will propose a plan and wait for "
+                "approval before each turn",
+            )
+        if arg in {"off", "false", "0", "no"}:
+            await self._app.set_plan_mode(session_id, False)
+            return self._result(
+                session_id, "plan mode: off — the agent will execute turns directly"
+            )
+        return self._result(
+            session_id,
+            f"unrecognised plan argument: {arg!r}. Use `/plan`, `/plan on`, or `/plan off`.",
+        )
 
     async def _cmd_switch(
         self, *, message: str, command: str, session_id: str

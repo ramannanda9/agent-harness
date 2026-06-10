@@ -371,13 +371,25 @@ async def main() -> None:
         )
         renderer = ConsoleRenderer()
         controls = PersistentCommandHandler(app)
+
+        # Shift-Tab toggles plan mode for the *current* session id.
+        # ``session_id`` is rebound across the loop (by /switch, /new,
+        # /delete), so the toggle reads it via a thunk rather than
+        # capturing a stale value at construction time.
+        async def _toggle_plan_mode() -> bool:
+            new_state = not await app.plan_mode_enabled(session_id)
+            await app.set_plan_mode(session_id, new_state)
+            return new_state
+
         # Chat-style input: multi-line buffer with Enter to submit,
-        # Ctrl+J / Esc-Enter for newline, slash-command + session-id
-        # Tab-completion, command history persisted in ``state_dir``.
-        # All configured in one place — see ``build_chat_prompt_session``.
+        # Ctrl+J / Esc-Enter for newline, Shift-Tab to toggle plan mode,
+        # slash-command + session-id Tab-completion, command history
+        # persisted in ``state_dir``. All configured in one place — see
+        # ``build_chat_prompt_session``.
         prompt_session = build_chat_prompt_session(
             app,
             history_path=Path(args.state_dir).expanduser() / "demo_history",
+            plan_mode_toggle=_toggle_plan_mode,
         )
 
         print("Persistent agent ready.")
@@ -396,7 +408,9 @@ async def main() -> None:
             print(json.dumps(app.capabilities(), indent=2, default=str))
         print(
             "\nType a message. Enter submits; Ctrl+J or Esc-Enter inserts a newline. "
-            "Use /help for controls. Press Esc while the agent is running to cancel "
+            "Use /help for controls. Shift-Tab (or `/plan on`) toggles plan mode — "
+            "the agent will propose a plan and wait for approval before each turn. "
+            "Press Esc while the agent is running to cancel "
             "the current turn. Ctrl-D, /end, or an empty line exits.\n"
         )
 

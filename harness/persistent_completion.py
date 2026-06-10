@@ -103,6 +103,16 @@ class SlashCommandCompleter(Completer):
                     start_position=-len(current_word),
                     display_meta="confirm deletion",
                 )
+        elif spec.arg_kind == "plan_toggle":
+            if arg_index != 0:
+                return
+            for literal in ("on", "off"):
+                if literal.startswith(current_word):
+                    yield Completion(
+                        literal,
+                        start_position=-len(current_word),
+                        display_meta="enable" if literal == "on" else "disable",
+                    )
         elif spec.arg_kind == "query":
             # Free text — suggest session ids as a hint for /sessions filter.
             if arg_index == 0:

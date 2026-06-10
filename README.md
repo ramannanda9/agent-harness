@@ -710,11 +710,45 @@ The demo uses that utility for:
 - `/save` flushes turns after the last reconcile checkpoint into long-term memory **without** evicting the cached prior (foreground prefix stays warm)
 - `/compact` forces a structural reorg — summary + trim + reconcile + cache evict — used when the transcript is bloating, not for routine "save"
 - `/forget` evicts cached memory context so the next turn refetches it
+- `/plan [on|off]` toggles plan-before-execute mode — see below
 - `/switch <id>` resumes or creates a logical session id
 - `/new [id]` starts a fresh session id and refuses to collide with an existing id
 - `/clear` clears the current transcript/summary/counters; long-term memory is retained
 - `/delete [id] confirm` deletes a transcript row; long-term memory is retained
 - `/end` exits the demo — no auto-flush; call `/save` first if you want pending facts persisted
+
+**Plan mode** (`/plan on`, or **Shift-Tab** at the prompt) gates each turn behind an approval step. The
+coordinator's LLM produces a structured plan (`{summary, steps[]}`) before
+any tools run; `PersistentAgent.chat` yields a `PLAN_PROPOSED` event so
+the renderer can display it, then routes approval through
+`harness.hitl.request_approval` — the same primitive that already gates
+individual tool calls.
+
+**Plan mode approves intent, not arguments.** Most realistic agent tasks
+have args that can only be known at runtime — a URL discovered by a
+search, a file path extracted from a directory listing, a row id from a
+query. The planner is told to use concrete `args` only when the value
+was user-supplied or otherwise knowable upfront; for everything else it
+returns `args: null` (or omits the field), and the renderer shows
+`args: (resolved at runtime)` instead of fabricating placeholder JSON.
+The approval banner surfaces `dynamic_steps: N` alongside the summary so
+the reviewer sees how many step args will be filled in during execution.
+The approved-plan prior tells the executor explicitly that
+`(resolved at runtime)` means *"derive the argument from your
+observations of the prior step,"* not *"a value you must invent."*
+
+Reuses HITL's full UX surface:
+
+- `y` approves the plan and runs the ReAct loop with the plan injected as a pinned prior.
+- `n` rejects; an `ERROR` event is yielded and **nothing is written to the session store** (cancelled turn = never happened, same as `Esc`-cancel).
+- Free text becomes a correction — the planner re-runs with the feedback folded into the system prompt. Up to `_PLAN_REVISION_LIMIT` revision cycles before the gate yields a clean "revision limit reached" error.
+- `a` / `A` register session-allow / persistent-allow policies for the `plan/<summary>` slot — typing `a` on a plan kind you trust means future plans on similar prompts skip the banner.
+
+Plan mode is off by default and persists per-session in SQLite, so the
+preference survives process restart (and `/clear`, which is a transcript
+reset, not a settings reset). Esc during plan generation or during the
+HITL wait unwinds `asyncio.CancelledError` through the chat generator
+cleanly — no partial plan written. The setting is on `SessionState.plan_mode_enabled`; flip it programmatically via `PersistentAgent.set_plan_mode(session_id, enabled)`.
 
 **Press `Esc` during a turn to cancel it.** Every example that streams a
 `BusEvent` loop wraps it in `ConsoleRenderer.render_stream(events, *,
