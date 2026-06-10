@@ -113,11 +113,36 @@ class SlashCommandCompleter(Completer):
                         start_position=-len(current_word),
                         display_meta="enable" if literal == "on" else "disable",
                     )
+        elif spec.arg_kind == "model_switch":
+            if arg_index == 0:
+                for agent_id in self._agent_ids():
+                    if agent_id.startswith(current_word):
+                        yield Completion(
+                            agent_id,
+                            start_position=-len(current_word),
+                            display_meta="agent",
+                        )
+            elif arg_index == 1:
+                for model in [*self._app.available_models(), "default"]:
+                    if model.startswith(current_word):
+                        yield Completion(
+                            model,
+                            start_position=-len(current_word),
+                            display_meta="model" if model != "default" else "clear override",
+                        )
         elif spec.arg_kind == "query":
             # Free text — suggest session ids as a hint for /sessions filter.
             if arg_index == 0:
                 async for completion in self._session_id_completions(current_word):
                     yield completion
+
+    def _agent_ids(self) -> list[str]:
+        try:
+            caps = self._app.capabilities()
+        except Exception:  # noqa: BLE001 — completer must never raise into the prompt loop
+            return []
+        agents = [caps.get("coordinator", {}), *caps.get("subagents", [])]
+        return sorted(str(agent.get("agent_id")) for agent in agents if agent.get("agent_id"))
 
     async def _session_id_completions(
         self,

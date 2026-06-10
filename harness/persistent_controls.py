@@ -14,7 +14,6 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any
 from uuid import uuid4
 
 from harness.persistent import PersistentAgent, PersistentAgentConfig, SessionState
@@ -40,6 +39,7 @@ class SlashCommandSpec:
     - ``"session_id_then_confirm"`` — optional session id + required ``confirm`` (e.g. ``/delete``)
     - ``"query"`` — one optional free-text token (e.g. ``/sessions [query]``)
     - ``"plan_toggle"`` — one optional ``on`` / ``off`` literal (e.g. ``/plan``)
+    - ``"model_switch"`` — agent id plus model name/default (e.g. ``/model researcher gpt-5``)
     """
 
     name: str
@@ -73,6 +73,14 @@ SLASH_COMMAND_SPECS: tuple[SlashCommandSpec, ...] = (
         "/usage",
         "Show token usage totals + last-run breakdown",
         category="Inspect",
+    ),
+    SlashCommandSpec("/models", "List switchable models", category="Inspect"),
+    SlashCommandSpec(
+        "/model",
+        "Show or switch a session-scoped agent model",
+        category="Session",
+        arg_hint="[agent_id] [model|default]",
+        arg_kind="model_switch",
     ),
     SlashCommandSpec(
         "/sessions",
@@ -158,11 +166,9 @@ class PersistentCommandHandler:
         app: PersistentAgent,
         *,
         config: PersistentAgentConfig | None = None,
-        llm: Any | None = None,
     ) -> None:
         self._app = app
         self._config = config or app.config
-        self._llm = llm or app.llm
         self._dispatch: dict[str, _CommandHandler] = self._build_dispatch()
 
     def _build_dispatch(self) -> dict[str, _CommandHandler]:
@@ -177,6 +183,8 @@ class PersistentCommandHandler:
             "/session": self._cmd_session,
             "/memory": self._cmd_memory,
             "/usage": self._cmd_usage,
+            "/models": self._cmd_models,
+            "/model": self._cmd_model,
             "/sessions": self._cmd_sessions,
             "/save": self._cmd_save,
             "/compact": self._cmd_compact,
@@ -244,6 +252,40 @@ class PersistentCommandHandler:
         self, *, message: str, command: str, session_id: str
     ) -> PersistentCommandResult:
         return self._result(session_id, await self._format_usage(session_id))
+
+    async def _cmd_models(
+        self, *, message: str, command: str, session_id: str
+    ) -> PersistentCommandResult:
+        return self._result(session_id, _format_models(self._app))
+
+    async def _cmd_model(
+        self, *, message: str, command: str, session_id: str
+    ) -> PersistentCommandResult:
+        parts = message[len(command) :].strip().split()
+        if not parts:
+            return self._result(session_id, await _format_model_overrides(self._app, session_id))
+        if len(parts) == 1:
+            return self._result(
+                session_id,
+                await _format_model_overrides(self._app, session_id, agent_id=parts[0]),
+            )
+        if len(parts) != 2:
+            return self._result(session_id, "usage: /model [agent_id] [model|default]")
+        agent_id, model_name = parts
+        try:
+            if model_name.lower() in {"default", "reset", "clear"}:
+                await self._app.clear_model_override(session_id, agent_id)
+                return self._result(
+                    session_id,
+                    f"model override cleared for {agent_id} in session {session_id}",
+                )
+            await self._app.switch_model(session_id, agent_id, model_name)
+            return self._result(
+                session_id,
+                f"model override set for {agent_id} in session {session_id}: {model_name}",
+            )
+        except ValueError as exc:
+            return self._result(session_id, f"cannot switch model: {exc}")
 
     async def _cmd_sessions(
         self, *, message: str, command: str, session_id: str
@@ -397,7 +439,7 @@ class PersistentCommandHandler:
     async def _format_session(self, session_id: str) -> str:
         state = await self._app.session_state(session_id)
         tokens = _estimate_session_tokens(state)
-        budget = getattr(self._llm, "input_token_budget", None)
+        budget = self._app.context_token_budget()
         if isinstance(budget, int) and budget > 0:
             pct = (tokens / budget) * 100
             token_line = f"{tokens:,} / {budget:,} tokens ({pct:.1f}%)"
@@ -409,6 +451,11 @@ class PersistentCommandHandler:
             reconcile = f"turn {state.turn_count + remaining} ({remaining} turn(s))"
         else:
             reconcile = "disabled"
+        model_line = (
+            ", ".join(f"{agent}={model}" for agent, model in sorted(state.model_overrides.items()))
+            if state.model_overrides
+            else "(none)"
+        )
         return "\n".join(
             [
                 f"session_id: {state.session_id}",
@@ -416,6 +463,7 @@ class PersistentCommandHandler:
                 f"transcript: {token_line}",
                 f"usage total: in={state.tokens_in_total:,} out={state.tokens_out_total:,}",
                 f"last run: in={state.last_run_tokens_in:,} out={state.last_run_tokens_out:,}",
+                f"model overrides: {model_line}",
                 f"last reconcile turn: {state.last_reconcile_turn or 'never'}",
                 f"next async reconcile: {reconcile}",
                 f"last compaction turn: {state.last_compact_turn or 'never'}",
@@ -520,6 +568,46 @@ def _format_mcp(app: PersistentAgent) -> str:
             lines.append(
                 f"  - {tool['name']}{suffix}" + (f" — {description}" if description else "")
             )
+    return "\n".join(lines)
+
+
+def _format_models(app: PersistentAgent) -> str:
+    models = app.available_models()
+    default = app.default_model()
+    if not models:
+        return "No model registry is configured for this PersistentAgent."
+    lines = ["available models:"]
+    for model in models:
+        suffix = " (default)" if default and model == default else ""
+        lines.append(f"  - {model}{suffix}")
+    lines.append("switch with: /model <agent_id> <model>")
+    return "\n".join(lines)
+
+
+async def _format_model_overrides(
+    app: PersistentAgent,
+    session_id: str,
+    *,
+    agent_id: str | None = None,
+) -> str:
+    caps = app.capabilities()
+    agents = [caps["coordinator"], *caps["subagents"]]
+    known_ids = {str(agent["agent_id"]) for agent in agents}
+    if agent_id is not None and agent_id not in known_ids:
+        return f"unknown agent: {agent_id}"
+    overrides = await app.model_overrides(session_id)
+    default = app.default_model() or "(construction default)"
+    selected = [agent for agent in agents if agent_id is None or agent["agent_id"] == agent_id]
+    lines = [f"session model overrides for {session_id}:"]
+    for agent in selected:
+        aid = str(agent["agent_id"])
+        model = overrides.get(aid)
+        suffix = f"{model} (override)" if model else default
+        lines.append(f"  - {aid}: {suffix}")
+    if app.available_models():
+        lines.append("available: " + ", ".join(app.available_models()))
+    else:
+        lines.append("available: (no model registry configured)")
     return "\n".join(lines)
 
 

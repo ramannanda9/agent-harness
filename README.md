@@ -633,6 +633,11 @@ app = PersistentAgent(
     session_store=SQLiteSessionStore("~/.agent-harness/sessions.sqlite"),
     memory=memory_manager,
     llm=llm,
+    llm_registry={
+        "fast": lambda: OpenAILLM(model="gpt-5.4-mini"),
+        "deep": lambda: OpenAILLM(model="gpt-5"),
+    },
+    default_model="fast",
 )
 
 async for event in app.chat("I like the above; can you do X?", session_id="thread-1"):
@@ -642,6 +647,23 @@ async for event in app.chat("I like the above; can you do X?", session_id="threa
 Use `app.capabilities()` to inspect the already-wired coordinator,
 sub-agents, and MCP tools. The demo exposes this with
 `--show-capabilities`.
+
+Model switching is session-scoped when an `llm_registry` is configured:
+
+```python
+await app.switch_model("thread-1", "coordinator", "deep")
+await app.clear_model_override("thread-1", "coordinator")
+```
+
+Registry values are zero-argument factories. Model names `default`,
+`reset`, and `clear` are reserved for clearing overrides in interactive
+controls.
+
+The durable session stores only `{agent_id: model_name}` overrides; the
+transcript is unchanged. At the start of each turn, `PersistentAgent`
+resets agents to their construction-time LLMs, then applies that session's
+overrides. The facade assumes one active chat turn at a time for a given
+`PersistentAgent` instance.
 
 Persistent sessions also expose a small control surface for user interfaces:
 
@@ -705,6 +727,8 @@ The demo uses that utility for:
 - `/capabilities`, `/agents`, `/mcp` inspect wired agents and tools
 - `/session` shows turns, context-pressure estimate, reconcile cadence, and summary
 - `/usage` shows persisted total and last-run provider-reported token usage
+- `/models` lists switchable model names when an LLM registry is configured
+- `/model [agent_id] [model|default]` shows or changes a session-scoped model override
 - `/sessions [query]` lists known session ids, optionally filtered by id text
 - `/memory` shows the cached per-session memory context
 - `/save` flushes turns after the last reconcile checkpoint into long-term memory **without** evicting the cached prior (foreground prefix stays warm)

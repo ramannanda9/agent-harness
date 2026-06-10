@@ -247,6 +247,10 @@ class SessionState:
     last_run_tokens_in: int = 0
     last_run_tokens_out: int = 0
     last_usage: dict[str, Any] = field(default_factory=dict)
+    # Session-scoped model overrides: agent_id -> model registry key.
+    # Applied at chat-turn start so switching models does not mutate the
+    # durable transcript.
+    model_overrides: dict[str, str] = field(default_factory=dict)
     # When True, ``PersistentAgent.chat`` proposes a plan and gates
     # execution on HITL approval before running the ReAct loop. Per
     # session so plan-mode preference is sticky across process restarts
@@ -289,6 +293,10 @@ class SessionStore(Protocol):
     async def delete(self, session_id: str) -> bool: ...
 
     async def set_plan_mode(self, session_id: str, enabled: bool) -> SessionState: ...
+
+    async def set_model_override(
+        self, session_id: str, agent_id: str, model_name: str | None
+    ) -> SessionState: ...
 
 
 class InMemorySessionStore:
@@ -390,6 +398,17 @@ class InMemorySessionStore:
     async def set_plan_mode(self, session_id: str, enabled: bool) -> SessionState:
         state = self._sessions.setdefault(session_id, SessionState(session_id=session_id))
         state.plan_mode_enabled = bool(enabled)
+        state.updated_at = _now()
+        return _copy_state(state)
+
+    async def set_model_override(
+        self, session_id: str, agent_id: str, model_name: str | None
+    ) -> SessionState:
+        state = self._sessions.setdefault(session_id, SessionState(session_id=session_id))
+        if model_name:
+            state.model_overrides[agent_id] = model_name
+        else:
+            state.model_overrides.pop(agent_id, None)
         state.updated_at = _now()
         return _copy_state(state)
 
@@ -597,6 +616,29 @@ class SQLiteSessionStore:
             )
             return self._load_locked(conn, session_id)
 
+    async def set_model_override(
+        self, session_id: str, agent_id: str, model_name: str | None
+    ) -> SessionState:
+        self._ensure_schema()
+        with self._connect() as conn:
+            self._ensure_session(conn, session_id)
+            state = self._load_locked(conn, session_id)
+            overrides = dict(state.model_overrides)
+            if model_name:
+                overrides[agent_id] = model_name
+            else:
+                overrides.pop(agent_id, None)
+            conn.execute(
+                """
+                UPDATE sessions
+                SET model_overrides_json = ?,
+                    updated_at = ?
+                WHERE session_id = ?
+                """,
+                (json.dumps(overrides, sort_keys=True), _now(), session_id),
+            )
+            return self._load_locked(conn, session_id)
+
     async def _mark(self, session_id: str, column: str, turn_count: int) -> SessionState:
         self._ensure_schema()
         if column not in {"last_reconcile_turn", "last_compact_turn"}:
@@ -632,6 +674,7 @@ class SQLiteSessionStore:
                     last_run_tokens_in INTEGER NOT NULL DEFAULT 0,
                     last_run_tokens_out INTEGER NOT NULL DEFAULT 0,
                     last_usage_json TEXT NOT NULL DEFAULT '{}',
+                    model_overrides_json TEXT NOT NULL DEFAULT '{}',
                     plan_mode_enabled INTEGER NOT NULL DEFAULT 0,
                     updated_at TEXT NOT NULL
                 )
@@ -672,6 +715,7 @@ class SQLiteSessionStore:
             "last_run_tokens_in": "INTEGER NOT NULL DEFAULT 0",
             "last_run_tokens_out": "INTEGER NOT NULL DEFAULT 0",
             "last_usage_json": "TEXT NOT NULL DEFAULT '{}'",
+            "model_overrides_json": "TEXT NOT NULL DEFAULT '{}'",
             "plan_mode_enabled": "INTEGER NOT NULL DEFAULT 0",
         }
         for column, ddl in additions.items():
@@ -693,7 +737,7 @@ class SQLiteSessionStore:
             SELECT session_id, summary, turn_count, last_reconcile_turn,
                    last_compact_turn, tokens_in_total, tokens_out_total,
                    last_run_tokens_in, last_run_tokens_out, last_usage_json,
-                   plan_mode_enabled, updated_at
+                   model_overrides_json, plan_mode_enabled, updated_at
             FROM sessions
             WHERE session_id = ?
             """,
@@ -727,6 +771,7 @@ class SQLiteSessionStore:
             last_run_tokens_in=row["last_run_tokens_in"],
             last_run_tokens_out=row["last_run_tokens_out"],
             last_usage=json.loads(row["last_usage_json"] or "{}"),
+            model_overrides=json.loads(row["model_overrides_json"] or "{}"),
             plan_mode_enabled=bool(row["plan_mode_enabled"]),
             updated_at=row["updated_at"],
         )
@@ -781,13 +826,39 @@ class PersistentAgent:
         llm: Any | None = None,
         guard_factory: Callable[[], Any] | None = None,
         config: PersistentAgentConfig | None = None,
+        llm_registry: dict[str, Callable[[], Any]] | None = None,
+        default_model: str | None = None,
     ) -> None:
         self._coordinator = coordinator
         self._session_store = session_store
         self._memory = memory
+        self._explicit_llm = llm is not None
         self._llm = llm or coordinator._llm
         self._guard_factory = guard_factory
         self._config = config or PersistentAgentConfig()
+        self._llm_registry = dict(llm_registry or {})
+        reserved_models = {"default", "reset", "clear"}
+        collisions = sorted(
+            model for model in self._llm_registry if model.lower() in reserved_models
+        )
+        if collisions:
+            joined = ", ".join(repr(model) for model in collisions)
+            raise ValueError(f"model names are reserved for clearing overrides: {joined}")
+        non_factories = sorted(
+            model for model, factory in self._llm_registry.items() if not callable(factory)
+        )
+        if non_factories:
+            joined = ", ".join(repr(model) for model in non_factories)
+            raise TypeError(f"llm_registry entries must be zero-argument factories: {joined}")
+        if (
+            default_model is not None
+            and self._llm_registry
+            and default_model not in self._llm_registry
+        ):
+            raise ValueError(f"default_model {default_model!r} is not present in llm_registry")
+        self._default_model = default_model
+        self._llm_instances: dict[str, Any] = {}
+        self._default_agent_llms = self._snapshot_agent_llms()
         # Per-session memory-context cache. Memory retrieval used to fire
         # on every turn (inside ``_build_system_prompt``), which made the
         # system prompt content-dependent on whatever ``build_context``
@@ -825,6 +896,48 @@ class PersistentAgent:
         state = await self._session_store.load(session_id)
         return state.plan_mode_enabled
 
+    def available_models(self) -> list[str]:
+        """Return model names available for session-scoped switching."""
+        return sorted(self._llm_registry)
+
+    def default_model(self) -> str | None:
+        """Return the label for the construction-time/default model, if supplied."""
+        return self._default_model
+
+    def model_switching_enabled(self) -> bool:
+        """True when an LLM registry was supplied at construction time."""
+        return bool(self._llm_registry)
+
+    def context_token_budget(self) -> int | None:
+        """Return the live coordinator input budget used for compaction."""
+        return self._coordinator_input_token_budget()
+
+    async def model_overrides(self, session_id: str) -> dict[str, str]:
+        """Return session-scoped agent_id -> model_name overrides."""
+        state = await self._session_store.load(session_id)
+        return dict(state.model_overrides)
+
+    async def switch_model(
+        self,
+        session_id: str,
+        agent_id: str,
+        model_name: str,
+    ) -> SessionState:
+        """Persist and apply a session-scoped model override for one agent."""
+        if model_name not in self._llm_registry:
+            raise ValueError(f"unknown model {model_name!r}")
+        if self._find_agent(agent_id) is None:
+            raise ValueError(f"unknown agent {agent_id!r}")
+        state = await self._session_store.set_model_override(session_id, agent_id, model_name)
+        self._apply_model_overrides(state)
+        return state
+
+    async def clear_model_override(self, session_id: str, agent_id: str) -> SessionState:
+        """Remove and apply a session-scoped model override for one agent."""
+        state = await self._session_store.set_model_override(session_id, agent_id, None)
+        self._apply_model_overrides(state)
+        return state
+
     async def chat(
         self,
         message: str,
@@ -840,6 +953,7 @@ class PersistentAgent:
         ``ERROR`` and returns without writing to the session store.
         """
         state = await self._session_store.load(session_id)
+        self._apply_model_overrides(state)
         run_id = run_id or str(uuid.uuid4())
         memory_context_text = await self._get_session_memory_context(session_id, message=message)
         prior_messages, pinned_priors = self._build_prior_messages(
@@ -1189,6 +1303,60 @@ class PersistentAgent:
         deleted = await self._session_store.delete(session_id)
         self._evict_session_memory_context(session_id)
         return deleted
+
+    def _snapshot_agent_llms(self) -> dict[str, Any]:
+        return {
+            agent.config.agent_id: getattr(agent, "_llm", None) for agent in self._iter_agents()
+        }
+
+    def _iter_agents(self) -> list[BaseAgent]:
+        agents: list[BaseAgent] = []
+        seen: set[int] = set()
+
+        def visit(agent: BaseAgent) -> None:
+            if id(agent) in seen:
+                return
+            seen.add(id(agent))
+            agents.append(agent)
+            for tool in getattr(agent, "_tools", {}).values():
+                sub = _subagent_tool_agent(tool)
+                if sub is not None:
+                    visit(sub)
+
+        visit(self._coordinator)
+        return agents
+
+    def _find_agent(self, agent_id: str) -> BaseAgent | None:
+        for agent in self._iter_agents():
+            if agent.config.agent_id == agent_id:
+                return agent
+        return None
+
+    def _make_registered_llm(self, model_name: str) -> Any:
+        llm = self._llm_instances.get(model_name)
+        if llm is None:
+            llm = self._llm_registry[model_name]()
+            self._llm_instances[model_name] = llm
+        return llm
+
+    def _apply_model_overrides(self, state: SessionState) -> None:
+        # Reset first so switching sessions cannot leak a previous
+        # session's model choice into this one.
+        for agent in self._iter_agents():
+            self._default_agent_llms.setdefault(agent.config.agent_id, getattr(agent, "_llm", None))
+            agent._llm = self._default_agent_llms[agent.config.agent_id]
+
+        for agent_id, model_name in state.model_overrides.items():
+            agent = self._find_agent(agent_id)
+            if agent is None or model_name not in self._llm_registry:
+                continue
+            agent._llm = self._make_registered_llm(model_name)
+            guard = getattr(agent, "_guard", None)
+            if guard is not None and hasattr(agent._llm, "set_budget"):
+                agent._llm.set_budget(guard)
+
+        if not self._explicit_llm:
+            self._llm = self._coordinator._llm
 
     def _assign_guard(self, guard: Any) -> None:
         seen_agents: set[int] = set()
@@ -1674,6 +1842,7 @@ def _copy_state(state: SessionState) -> SessionState:
         last_run_tokens_in=state.last_run_tokens_in,
         last_run_tokens_out=state.last_run_tokens_out,
         last_usage=dict(state.last_usage),
+        model_overrides=dict(state.model_overrides),
         plan_mode_enabled=state.plan_mode_enabled,
         updated_at=state.updated_at,
     )
