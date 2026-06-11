@@ -120,6 +120,20 @@ class _PlainTool:
         return "plain result"
 
 
+class _CheckpointStore:
+    def __init__(self) -> None:
+        self.data: dict[str, dict] = {}
+
+    async def write(self, key: str, value: dict) -> None:
+        self.data[key] = value
+
+    async def read(self, key: str) -> dict | None:
+        return self.data.get(key)
+
+    async def delete(self, key: str) -> None:
+        self.data.pop(key, None)
+
+
 class MCPToolAdapter:
     name = "mcp_query"
     description = "query a fake MCP server"
@@ -964,6 +978,40 @@ async def test_persistent_agent_does_not_reconcile_on_tool_runs_alone():
         f"tool-run-only turn should NOT trigger reconciliation; "
         f"got {len(memory.run_writes)} write(s)"
     )
+
+
+@pytest.mark.asyncio
+async def test_persistent_agent_gated_tool_does_not_write_resume_checkpoint(monkeypatch):
+    from harness.hitl import ApprovalResponse
+
+    llm = _ToolLLM()
+    memory = _SpyMemory(llm)
+    checkpoint_store = _CheckpointStore()
+    coordinator = _agent(llm=llm, memory=memory, tools={"plain": _PlainTool()})
+    coordinator.config.hitl_tools = ["plain"]
+    coordinator._checkpoint_store = checkpoint_store
+    captured_hints: list[str | None] = []
+
+    async def _approve(req, guard):
+        captured_hints.append(req.resume_hint)
+        return ApprovalResponse(approval_id=req.approval_id, approved=True)
+
+    monkeypatch.setattr("harness.hitl.request_approval", _approve)
+    app = PersistentAgent(
+        coordinator=coordinator,
+        session_store=InMemorySessionStore(),
+        memory=memory,
+        llm=llm,
+        config=PersistentAgentConfig(compact_at_context_fraction=1.0),
+    )
+
+    events = [event async for event in app.chat("use a tool")]
+
+    assert any(e.type == EventType.OBSERVATION for e in events)
+    assert checkpoint_store.data == {}
+    assert captured_hints == ["Esc cancels this turn; completed session history is preserved."]
+    assert coordinator._checkpoint_resume_enabled is True
+    assert coordinator._hitl_resume_hint is None
 
 
 @pytest.mark.asyncio

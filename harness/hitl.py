@@ -131,6 +131,7 @@ class ApprovalRequest:
     args: dict
     step: int
     timestamp: str
+    resume_hint: str | None = None
 
 
 @dataclass
@@ -167,7 +168,10 @@ def _print_banner(req: ApprovalRequest) -> None:
         f"A = always allow '{label}'  |  "
         "n = reject  |  <text> = steer"
     )
-    print(f"  Ctrl-C to pause. Resume: python {script} --resume {req.run_id}")
+    if req.resume_hint is None:
+        print(f"  Ctrl-C to pause. Resume: python {script} --resume {req.run_id}")
+    else:
+        print(f"  {req.resume_hint}")
     print(_SEP)
 
 
