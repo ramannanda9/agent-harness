@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 from collections.abc import AsyncIterator
 from typing import NamedTuple, TextIO
 
@@ -44,6 +45,8 @@ class ConsoleRenderer:
         sep_width:          Width of separator lines.
         agent_label_width:  Width of the ``[agent_id]`` label column.
         show_tokens:        If True, TOKEN events are printed inline.
+        spinner:            If True, show a TTY-only busy spinner between events.
+        spinner_delay:      Seconds to wait before drawing the spinner.
         out:                Output stream (defaults to ``sys.stdout``).
     """
 
@@ -55,6 +58,8 @@ class ConsoleRenderer:
         sep_width: int = 72,
         agent_label_width: int = 16,
         show_tokens: bool = False,
+        spinner: bool = True,
+        spinner_delay: float = 0.4,
         out: TextIO | None = None,
     ) -> None:
         self._truncate = truncate
@@ -64,6 +69,12 @@ class ConsoleRenderer:
         self._show_tokens = show_tokens
         self._out = out or sys.stdout
         self._in_token_stream = False
+        is_tty = bool(getattr(self._out, "isatty", lambda: False)())
+        self._spinner = _Spinner(
+            out=self._out,
+            enabled=spinner and is_tty,
+            delay=spinner_delay,
+        )
 
     # ── public helpers ────────────────────────────────────────────────────────
 
@@ -73,6 +84,7 @@ class ConsoleRenderer:
 
     def render(self, event: BusEvent) -> None:
         """Print formatted output for one BusEvent."""
+        self._spinner.stop()
         if event.type == EventType.TOKEN:
             if self._show_tokens:
                 if not self._in_token_stream:
@@ -254,6 +266,12 @@ class ConsoleRenderer:
         elif t == EventType.ERROR:
             print(f"\n[error]      {event.error}", file=sys.stderr)
 
+        self._schedule_spinner(event)
+
+    def close(self) -> None:
+        """Stop any background spinner owned by this renderer."""
+        self._spinner.stop()
+
     def render_budget(self, budget: dict | None) -> None:
         """Print tokens + per-call-site breakdown from a ``BudgetGuard.snapshot()``
         dict. Safe to call with ``{}`` or ``None`` — prints nothing when
@@ -323,7 +341,10 @@ class ConsoleRenderer:
                 return
             terminal_holder[0] = event
 
-        cancelled = await consume_with_cancel(events, on_event=_on_event)
+        try:
+            cancelled = await consume_with_cancel(events, on_event=_on_event)
+        finally:
+            self.close()
         if cancelled and print_cancel_banner:
             self.sep("═")
             print(cancel_message, file=self._out)
@@ -336,3 +357,81 @@ class ConsoleRenderer:
         if event.agent_id:
             return f"[{event.agent_id:<{self._label_w}}]"
         return f"[{event.type.value:<{self._label_w}}]"
+
+    def _schedule_spinner(self, event: BusEvent) -> None:
+        label = self._spinner_label(event)
+        if label:
+            self._spinner.start_later(label)
+
+    def _spinner_label(self, event: BusEvent) -> str | None:
+        if event.type in {
+            EventType.TASK_DONE,
+            EventType.DONE,
+            EventType.ERROR,
+            EventType.PLAN_PROPOSED,
+            EventType.HUMAN_GUIDANCE,
+            EventType.SYNTHESIS,
+        }:
+            return None
+        agent = event.agent_id or (
+            str(event.payload.get("agent_id")) if isinstance(event.payload, dict) else ""
+        )
+        agent = agent or event.type.value
+        if event.type == EventType.ACTION:
+            tool = event.payload.get("tool") if isinstance(event.payload, dict) else None
+            return f"[{agent}] using {tool or 'tool'}..."
+        if event.type in {EventType.OBSERVATION, EventType.CONTEXT, EventType.ROUTE}:
+            return f"[{agent}] thinking..."
+        if event.type in {EventType.DISPATCH, EventType.PLAN, EventType.REPLAN, EventType.MEMORY}:
+            return "[agent-harness] working..."
+        return None
+
+
+class _Spinner:
+    _FRAMES = ("|", "/", "-", "\\")
+
+    def __init__(self, *, out: TextIO, enabled: bool, delay: float) -> None:
+        self._out = out
+        self._enabled = enabled
+        self._delay = max(0.0, delay)
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start_later(self, text: str) -> None:
+        if not self._enabled:
+            return
+        self.stop()
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._run,
+            args=(text,),
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        thread = self._thread
+        if thread is None:
+            return
+        self._stop.set()
+        if thread is not threading.current_thread():
+            thread.join(timeout=self._delay + 0.2)
+        self._thread = None
+        self._clear_line()
+
+    def _run(self, text: str) -> None:
+        if self._stop.wait(self._delay):
+            return
+        idx = 0
+        while not self._stop.is_set():
+            self._out.write(f"\r{text} {self._FRAMES[idx % len(self._FRAMES)]}")
+            self._out.flush()
+            idx += 1
+            if self._stop.wait(0.1):
+                break
+
+    def _clear_line(self) -> None:
+        if not self._enabled:
+            return
+        self._out.write("\r\033[K")
+        self._out.flush()
