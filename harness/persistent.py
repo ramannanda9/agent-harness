@@ -1072,42 +1072,49 @@ class PersistentAgent:
         errors: list[str] = []
         finalized = False
 
-        async for event in self._coordinator.run_stream(
-            message,
-            run_id=run_id,
-            prior_messages=prior_messages,
-            pinned_priors=pinned_priors,
-            # Skip the live ``build_context`` inside ``_build_system_prompt``
-            # — memory is in a pinned prior instead, cached per session and
-            # refreshed only at compaction. Keeps the system prompt
-            # byte-identical across turns so the prefix cache holds.
-            precomputed_memory_context="_skip_",
-        ):
-            trace.append(_event_to_trace(event))
-            if event.type == EventType.ACTION:
-                tool = event.payload.get("tool")
-                if tool:
-                    tools_used.add(str(tool))
-            elif event.type == EventType.TASK_DONE and not event.parent_agent_id:
-                final_result = event.payload
-            elif event.type == EventType.ERROR:
-                errors.append(event.error)
-            if event.parent_agent_id:
-                subagents_used.add(event.agent_id)
-            if not event.parent_agent_id and event.type in (EventType.TASK_DONE, EventType.ERROR):
-                await self._finalize_turn(
-                    session_id=session_id,
-                    message=message,
-                    final_result=final_result,
-                    trace=trace,
-                    tools_used=tools_used,
-                    subagents_used=subagents_used,
-                    errors=errors,
-                    usage_guard=turn_guard,
-                    usage_before=usage_before,
-                )
-                finalized = True
-            yield event
+        restore_hitl_context = self._disable_checkpoint_resume_for_persistent_hitl()
+        try:
+            async for event in self._coordinator.run_stream(
+                message,
+                run_id=run_id,
+                prior_messages=prior_messages,
+                pinned_priors=pinned_priors,
+                # Skip the live ``build_context`` inside ``_build_system_prompt``
+                # — memory is in a pinned prior instead, cached per session and
+                # refreshed only at compaction. Keeps the system prompt
+                # byte-identical across turns so the prefix cache holds.
+                precomputed_memory_context="_skip_",
+            ):
+                trace.append(_event_to_trace(event))
+                if event.type == EventType.ACTION:
+                    tool = event.payload.get("tool")
+                    if tool:
+                        tools_used.add(str(tool))
+                elif event.type == EventType.TASK_DONE and not event.parent_agent_id:
+                    final_result = event.payload
+                elif event.type == EventType.ERROR:
+                    errors.append(event.error)
+                if event.parent_agent_id:
+                    subagents_used.add(event.agent_id)
+                if not event.parent_agent_id and event.type in (
+                    EventType.TASK_DONE,
+                    EventType.ERROR,
+                ):
+                    await self._finalize_turn(
+                        session_id=session_id,
+                        message=message,
+                        final_result=final_result,
+                        trace=trace,
+                        tools_used=tools_used,
+                        subagents_used=subagents_used,
+                        errors=errors,
+                        usage_guard=turn_guard,
+                        usage_before=usage_before,
+                    )
+                    finalized = True
+                yield event
+        finally:
+            restore_hitl_context()
 
         if not finalized:
             await self._finalize_turn(
@@ -1332,6 +1339,28 @@ class PersistentAgent:
             if agent.config.agent_id == agent_id:
                 return agent
         return None
+
+    def _disable_checkpoint_resume_for_persistent_hitl(self) -> Callable[[], None]:
+        agents = self._iter_agents()
+        originals = [
+            (
+                agent,
+                getattr(agent, "_checkpoint_resume_enabled", True),
+                getattr(agent, "_hitl_resume_hint", None),
+            )
+            for agent in agents
+        ]
+        hint = "Esc cancels this turn; completed session history is preserved."
+        for agent in agents:
+            agent._checkpoint_resume_enabled = False
+            agent._hitl_resume_hint = hint
+
+        def restore() -> None:
+            for agent, resume_enabled, resume_hint in originals:
+                agent._checkpoint_resume_enabled = resume_enabled
+                agent._hitl_resume_hint = resume_hint
+
+        return restore
 
     def _make_registered_llm(self, model_name: str) -> Any:
         llm = self._llm_instances.get(model_name)

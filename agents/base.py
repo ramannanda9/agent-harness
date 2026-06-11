@@ -183,6 +183,8 @@ class BaseAgent:
         self._guard = guard
         self._llm = llm
         self._checkpoint_store = checkpoint_store
+        self._checkpoint_resume_enabled: bool = True
+        self._hitl_resume_hint: str | None = None
         self._working_memory: WorkingMemory | None = None
         self._task: str = ""
         self._last_think_error: str | None = None
@@ -479,7 +481,7 @@ class BaseAgent:
     # ── ReAct Loop (stream) ───────────────────────────────────────────────────
 
     async def _write_step_checkpoint(self, run_id: str, step: int) -> None:
-        if self._checkpoint_store is None:
+        if self._checkpoint_store is None or not self._checkpoint_resume_enabled:
             return
         await self._checkpoint_store.write(
             self._ckp_id,
@@ -1108,9 +1110,12 @@ class BaseAgent:
         Run the HITL approval gate for one tool.
 
         Returns ApprovalResponse if the tool is gated, None if not.
-        Writes a crash-resumable checkpoint to the store before blocking on stdin.
+        Writes a crash-resumable checkpoint before blocking when checkpoint
+        resume is enabled.
         """
-        if not (self._checkpoint_store and tool_name in self.config.hitl_tools):
+        if tool_name not in self.config.hitl_tools:
+            return None
+        if self._checkpoint_store is None and self._checkpoint_resume_enabled:
             return None
 
         from harness.hitl import ApprovalRequest, is_allowed, request_approval
@@ -1119,23 +1124,24 @@ class BaseAgent:
             return None  # fast-path: human already allowed this tool/prefix
 
         approval_id = str(uuid.uuid4())
-        await self._checkpoint_store.write(
-            self._ckp_id,
-            {
-                "run_id": run_id,
-                "agent_id": self.config.agent_id,
-                "task": self._task,
-                "step": step,
-                "memory": self._working_memory.to_dict(),
-                "pending": {
-                    "approval_id": approval_id,
-                    "tool": tool_name,
-                    "args": tool_args,
+        if self._checkpoint_store is not None and self._checkpoint_resume_enabled:
+            await self._checkpoint_store.write(
+                self._ckp_id,
+                {
+                    "run_id": run_id,
+                    "agent_id": self.config.agent_id,
+                    "task": self._task,
                     "step": step,
-                    "llm_response": llm_response,
+                    "memory": self._working_memory.to_dict(),
+                    "pending": {
+                        "approval_id": approval_id,
+                        "tool": tool_name,
+                        "args": tool_args,
+                        "step": step,
+                        "llm_response": llm_response,
+                    },
                 },
-            },
-        )
+            )
         return await request_approval(
             ApprovalRequest(
                 approval_id=approval_id,
@@ -1145,6 +1151,7 @@ class BaseAgent:
                 args=tool_args,
                 step=step,
                 timestamp=datetime.now(timezone.utc).isoformat(),
+                resume_hint=self._hitl_resume_hint if not self._checkpoint_resume_enabled else None,
             ),
             self._guard,
         )
