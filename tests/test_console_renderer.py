@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import time
 from io import StringIO
 
 from harness.console import ConsoleRenderer
 from harness.events import BusEvent, EventType
+
+
+class _TTYStringIO(StringIO):
+    def isatty(self) -> bool:
+        return True
 
 
 def test_console_renderer_context_levels():
@@ -143,3 +149,64 @@ def test_console_renderer_memory_summary_marker():
     assert "memory" in text
     assert "summarized" in text
     assert "12,000 -> 4,200 tokens" in text
+
+
+def test_console_renderer_spinner_is_tty_only():
+    out = StringIO()
+    renderer = ConsoleRenderer(out=out, spinner=True, spinner_delay=0)
+
+    renderer.render(
+        BusEvent(
+            type=EventType.ACTION,
+            agent_id="agent",
+            payload={"tool": "browser_snapshot", "args": {}},
+        )
+    )
+    time.sleep(0.05)
+    renderer.close()
+
+    assert "using browser_snapshot" not in out.getvalue()
+
+
+def test_console_renderer_spinner_draws_and_clears_before_next_event():
+    out = _TTYStringIO()
+    renderer = ConsoleRenderer(out=out, spinner=True, spinner_delay=0)
+
+    renderer.render(
+        BusEvent(
+            type=EventType.ACTION,
+            agent_id="agent",
+            payload={"tool": "browser_snapshot", "args": {}},
+        )
+    )
+    time.sleep(0.05)
+    renderer.render(
+        BusEvent(
+            type=EventType.OBSERVATION,
+            agent_id="agent",
+            payload={"observation": "done"},
+        )
+    )
+    renderer.close()
+
+    text = out.getvalue()
+    assert "[agent] using browser_snapshot..." in text
+    assert "\r\033[K" in text
+    assert "[agent           ] obs" in text
+
+
+def test_console_renderer_terminal_events_do_not_restart_spinner():
+    out = _TTYStringIO()
+    renderer = ConsoleRenderer(out=out, spinner=True, spinner_delay=0)
+
+    renderer.render(
+        BusEvent(
+            type=EventType.TASK_DONE,
+            agent_id="agent",
+            payload={"confidence": 1.0, "steps": 1},
+        )
+    )
+    time.sleep(0.05)
+    renderer.close()
+
+    assert "thinking..." not in out.getvalue()
