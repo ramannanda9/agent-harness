@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from agents.base import AgentConfig, BaseAgent
@@ -17,6 +19,7 @@ from harness.runtime import BudgetGuard, GuardrailConfig, Tracer
 from harness.skills import Skill
 from memory.manager import MemoryManager
 from memory.stores import InMemoryEpisodicStore, InMemorySemanticStore
+from tools.builtin.subagent import SubAgentTool
 
 
 class _LLM:
@@ -99,6 +102,48 @@ def _app():
     return app, memory, llm
 
 
+def _subagent_app():
+    llm = _LLM()
+    memory = _Memory(llm)
+    sub = BaseAgent(
+        config=AgentConfig(
+            agent_id="researcher",
+            role="researches",
+            system_prompt="You research.",
+            allowed_tools=[],
+            max_steps=2,
+        ),
+        tools={},
+        memory=memory,
+        tracer=Tracer(),
+        guard=BudgetGuard(GuardrailConfig(max_total_cost_usd=10.0)),
+        llm=llm,
+    )
+    delegate = SubAgentTool(sub, name="delegate_researcher")
+    coordinator = BaseAgent(
+        config=AgentConfig(
+            agent_id="coordinator",
+            role="coordinates",
+            system_prompt="You coordinate.",
+            allowed_tools=[delegate.name],
+            max_steps=2,
+        ),
+        tools={delegate.name: delegate},
+        memory=memory,
+        tracer=Tracer(),
+        guard=BudgetGuard(GuardrailConfig(max_total_cost_usd=10.0)),
+        llm=llm,
+    )
+    app = PersistentAgent(
+        coordinator=coordinator,
+        session_store=InMemorySessionStore(),
+        memory=memory,
+        llm=llm,
+        config=PersistentAgentConfig(),
+    )
+    return app, memory, llm
+
+
 def _model_app():
     llm = _NamedLLM("default")
     memory = _Memory(llm)
@@ -126,6 +171,16 @@ def _model_app():
         default_model="fast",
     )
     return app, memory, llm
+
+
+async def _wait_background_done(app: PersistentAgent, session_id: str, task_id: str) -> None:
+    for _ in range(20):
+        tasks = await app.list_background_tasks(session_id)
+        task = next(task for task in tasks if task.task_id == task_id)
+        if task.status != "running":
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"background task still running: {task_id}")
 
 
 @pytest.mark.asyncio
@@ -213,6 +268,31 @@ async def test_command_handler_usage_displays_session_totals():
 
     assert "total tokens: in=123 out=45" in result.text
     assert "agent:coordinator" in result.text
+
+
+@pytest.mark.asyncio
+async def test_command_handler_background_tasks_list_and_collect():
+    app, _, _ = _subagent_app()
+    handler = PersistentCommandHandler(app)
+
+    started = await handler.handle("/background researcher gather facts", session_id="work")
+    assert started.handled is True
+    assert "started background task" in started.text
+    task_id = started.text.split()[3].rstrip(":")
+
+    await _wait_background_done(app, "work", task_id)
+
+    listed = await handler.handle("/tasks", session_id="work")
+    assert task_id in listed.text
+    assert "done" in listed.text
+    session = await handler.handle("/session", session_id="work")
+    assert "background tasks: running=0 pending=1" in session.text
+
+    collected = await handler.handle(f"/tasks collect {task_id}", session_id="work")
+    assert f"collected background task {task_id}" in collected.text
+    state = await app.session_state("work")
+    assert state.messages
+    assert task_id in state.messages[-1].content
 
 
 @pytest.mark.asyncio

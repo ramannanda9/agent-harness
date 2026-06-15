@@ -780,6 +780,8 @@ The demo uses that utility for:
 - `/usage` shows persisted total and last-run provider-reported token usage
 - `/models` lists switchable model names when an LLM registry is configured
 - `/model [agent_id] [model|default]` shows or changes a session-scoped model override
+- `/background <agent_id> <task>` launches a sub-agent task in the background for the current process
+- `/tasks [collect|cancel] [id|all]` lists background tasks, appends completed results to the transcript, or cancels running work
 - `/sessions [query]` lists known session ids, optionally filtered by id text
 - `/memory` shows the cached per-session memory context
 - `/save` flushes turns after the last reconcile checkpoint into long-term memory **without** evicting the cached prior (foreground prefix stays warm)
@@ -790,6 +792,12 @@ The demo uses that utility for:
 - `/new [id]` starts a fresh session id and refuses to collide with an existing id
 - `/clear` clears the current transcript/summary/counters; long-term memory is retained
 - `/delete [id] confirm` deletes a transcript row; long-term memory is retained
+
+Background sub-agent tasks are process-local. They keep running while the
+REPL/server process is alive; completed results become durable only when
+collected into the session transcript with `/tasks collect <id|all>`. Avoid
+launching overlapping work against the same sub-agent instance unless that
+agent's tools and LLM adapter are safe for concurrent use.
 - `/end` exits the demo — no auto-flush; call `/save` first if you want pending facts persisted
 
 **Plan mode** (`/plan on`, or **Shift-Tab** at the prompt) gates each turn behind an approval step. The

@@ -130,6 +130,33 @@ class SlashCommandCompleter(Completer):
                             start_position=-len(current_word),
                             display_meta="model" if model != "default" else "clear override",
                         )
+        elif spec.arg_kind == "background_task":
+            if arg_index == 0:
+                for agent_id in self._subagent_ids():
+                    if agent_id.startswith(current_word):
+                        yield Completion(
+                            agent_id,
+                            start_position=-len(current_word),
+                            display_meta="sub-agent",
+                        )
+        elif spec.arg_kind == "task_control":
+            if arg_index == 0:
+                for literal in ("collect", "cancel"):
+                    if literal.startswith(current_word):
+                        yield Completion(
+                            literal,
+                            start_position=-len(current_word),
+                            display_meta="background task action",
+                        )
+            elif arg_index == 1:
+                task_ids = await self._background_task_ids()
+                for task_id in [*task_ids, "all"]:
+                    if task_id.startswith(current_word):
+                        yield Completion(
+                            task_id,
+                            start_position=-len(current_word),
+                            display_meta="background task",
+                        )
         elif spec.arg_kind == "query":
             # Free text — suggest session ids as a hint for /sessions filter.
             if arg_index == 0:
@@ -143,6 +170,24 @@ class SlashCommandCompleter(Completer):
             return []
         agents = [caps.get("coordinator", {}), *caps.get("subagents", [])]
         return sorted(str(agent.get("agent_id")) for agent in agents if agent.get("agent_id"))
+
+    def _subagent_ids(self) -> list[str]:
+        try:
+            caps = self._app.capabilities()
+        except Exception:  # noqa: BLE001 — completer must never raise into the prompt loop
+            return []
+        return sorted(
+            str(agent.get("agent_id"))
+            for agent in caps.get("subagents", [])
+            if agent.get("agent_id")
+        )
+
+    async def _background_task_ids(self) -> list[str]:
+        try:
+            tasks = await self._app.list_background_tasks()
+        except Exception:  # noqa: BLE001 — completer must never raise into the prompt loop
+            return []
+        return sorted(task.task_id for task in tasks)
 
     async def _session_id_completions(
         self,

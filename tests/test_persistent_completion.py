@@ -11,6 +11,7 @@ from harness.persistent_completion import SlashCommandCompleter
 from harness.runtime import BudgetGuard, GuardrailConfig, Tracer
 from memory.manager import MemoryManager
 from memory.stores import InMemoryEpisodicStore, InMemorySemanticStore
+from tools.builtin.subagent import SubAgentTool
 
 
 class _LLM:
@@ -50,6 +51,51 @@ def _app(*, models: bool = False) -> PersistentAgent:
         config=PersistentAgentConfig(),
         llm_registry={"fast": lambda: _LLM(), "deep": lambda: _LLM()} if models else None,
         default_model="fast" if models else None,
+    )
+
+
+def _subagent_app() -> PersistentAgent:
+    llm = _LLM()
+    memory = MemoryManager(
+        semantic_store=InMemorySemanticStore(),
+        episodic_store=InMemoryEpisodicStore(),
+        llm=llm,
+    )
+    sub = BaseAgent(
+        config=AgentConfig(
+            agent_id="researcher",
+            role="researches",
+            system_prompt="You research.",
+            allowed_tools=[],
+            max_steps=2,
+        ),
+        tools={},
+        memory=memory,
+        tracer=Tracer(),
+        guard=BudgetGuard(GuardrailConfig(max_total_cost_usd=10.0)),
+        llm=llm,
+    )
+    delegate = SubAgentTool(sub, name="delegate_researcher")
+    coordinator = BaseAgent(
+        config=AgentConfig(
+            agent_id="coordinator",
+            role="coordinates",
+            system_prompt="You coordinate.",
+            allowed_tools=[delegate.name],
+            max_steps=2,
+        ),
+        tools={delegate.name: delegate},
+        memory=memory,
+        tracer=Tracer(),
+        guard=BudgetGuard(GuardrailConfig(max_total_cost_usd=10.0)),
+        llm=llm,
+    )
+    return PersistentAgent(
+        coordinator=coordinator,
+        session_store=InMemorySessionStore(),
+        memory=memory,
+        llm=llm,
+        config=PersistentAgentConfig(),
     )
 
 
@@ -132,6 +178,30 @@ async def test_completer_offers_agents_and_models_for_model_switch():
 
     models = await _collect(completer, "/model coordinator ")
     assert set(models) == {"fast", "deep", "default"}
+
+
+@pytest.mark.asyncio
+async def test_completer_offers_subagents_for_background_tasks():
+    completer = SlashCommandCompleter(_subagent_app())
+
+    agents = await _collect(completer, "/background ")
+
+    assert agents == ["researcher"]
+
+
+@pytest.mark.asyncio
+async def test_completer_offers_background_task_actions_and_ids():
+    app = _subagent_app()
+    task = await app.start_background_subagent("s", "researcher", "work")
+    completer = SlashCommandCompleter(app)
+
+    actions = await _collect(completer, "/tasks ")
+    ids = await _collect(completer, "/tasks collect ")
+
+    assert set(actions) == {"collect", "cancel"}
+    assert task.task_id in ids
+    assert "all" in ids
+    await app.cancel_background_task("s", task.task_id)
 
 
 @pytest.mark.asyncio

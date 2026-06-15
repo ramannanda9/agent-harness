@@ -8,6 +8,7 @@ at a time.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 import uuid
@@ -257,6 +258,24 @@ class SessionState:
     # without bleeding between unrelated workspaces. Toggle via the
     # ``/plan`` slash command or ``PersistentAgent.set_plan_mode``.
     plan_mode_enabled: bool = False
+    updated_at: str = field(default_factory=_now)
+
+
+@dataclass
+class BackgroundTaskState:
+    """Process-local background sub-agent task metadata."""
+
+    task_id: str
+    session_id: str
+    agent_id: str
+    instruction: str
+    status: str = "running"
+    answer: str = ""
+    confidence: float = 0.0
+    steps: int = 0
+    error: str = ""
+    collected: bool = False
+    created_at: str = field(default_factory=_now)
     updated_at: str = field(default_factory=_now)
 
 
@@ -859,6 +878,8 @@ class PersistentAgent:
         self._default_model = default_model
         self._llm_instances: dict[str, Any] = {}
         self._default_agent_llms = self._snapshot_agent_llms()
+        self._background_tasks: dict[str, BackgroundTaskState] = {}
+        self._background_handles: dict[str, asyncio.Task[None]] = {}
         # Per-session memory-context cache. Memory retrieval used to fire
         # on every turn (inside ``_build_system_prompt``), which made the
         # system prompt content-dependent on whatever ``build_context``
@@ -895,6 +916,94 @@ class PersistentAgent:
         """Return the current plan-mode setting for ``session_id``."""
         state = await self._session_store.load(session_id)
         return state.plan_mode_enabled
+
+    async def start_background_subagent(
+        self,
+        session_id: str,
+        agent_id: str,
+        instruction: str,
+    ) -> BackgroundTaskState:
+        """Launch ``agent_id`` on ``instruction`` without blocking the caller.
+
+        Background tasks are process-local: completed metadata stays available
+        through this ``PersistentAgent`` instance, and ``collect_background_task``
+        can write the result back into the durable transcript.
+        """
+        instruction = instruction.strip()
+        if not instruction:
+            raise ValueError("background task instruction is required")
+        agent = self._find_agent(agent_id)
+        if agent is None or agent is self._coordinator:
+            raise ValueError(f"unknown sub-agent {agent_id!r}")
+        state = await self._session_store.load(session_id)
+        self._apply_model_overrides(state)
+        task_id = f"bg_{uuid.uuid4().hex[:12]}"
+        task = BackgroundTaskState(
+            task_id=task_id,
+            session_id=session_id,
+            agent_id=agent_id,
+            instruction=instruction,
+        )
+        self._background_tasks[task_id] = task
+        self._background_handles[task_id] = asyncio.create_task(
+            self._run_background_subagent(task, agent)
+        )
+        return _copy_background_task(task)
+
+    async def list_background_tasks(
+        self, session_id: str | None = None
+    ) -> list[BackgroundTaskState]:
+        """Return process-local background tasks, newest first."""
+        tasks = self._background_tasks.values()
+        if session_id is not None:
+            tasks = [task for task in tasks if task.session_id == session_id]
+        return sorted(
+            (_copy_background_task(task) for task in tasks),
+            key=lambda task: task.created_at,
+            reverse=True,
+        )
+
+    async def collect_background_task(
+        self,
+        session_id: str,
+        task_id: str,
+    ) -> BackgroundTaskState:
+        """Append a finished background task result to the session transcript."""
+        task = self._background_tasks.get(task_id)
+        if task is None or task.session_id != session_id:
+            raise ValueError(f"background task not found: {task_id}")
+        if task.status == "running":
+            raise ValueError(f"background task still running: {task_id}")
+        if not task.collected:
+            await self._session_store.append_messages(
+                session_id,
+                [
+                    SessionMessage(
+                        role="assistant",
+                        content=_render_background_result(task),
+                    )
+                ],
+            )
+            task.collected = True
+            task.updated_at = _now()
+        return _copy_background_task(task)
+
+    async def cancel_background_task(
+        self,
+        session_id: str,
+        task_id: str,
+    ) -> BackgroundTaskState:
+        """Cancel a running process-local background task."""
+        task = self._background_tasks.get(task_id)
+        if task is None or task.session_id != session_id:
+            raise ValueError(f"background task not found: {task_id}")
+        handle = self._background_handles.get(task_id)
+        if task.status == "running" and handle is not None and not handle.done():
+            handle.cancel()
+            task.status = "cancelled"
+            task.error = "cancelled by user"
+            task.updated_at = _now()
+        return _copy_background_task(task)
 
     def available_models(self) -> list[str]:
         """Return model names available for session-scoped switching."""
@@ -1361,6 +1470,41 @@ class PersistentAgent:
                 agent._hitl_resume_hint = resume_hint
 
         return restore
+
+    async def _run_background_subagent(
+        self,
+        task: BackgroundTaskState,
+        agent: BaseAgent,
+    ) -> None:
+        last_done: dict[str, Any] | None = None
+        last_error = ""
+        try:
+            async for event in agent.run_stream(
+                task=task.instruction,
+                run_id=task.task_id,
+            ):
+                if event.type == EventType.TASK_DONE:
+                    last_done = event.payload
+                elif event.type == EventType.ERROR:
+                    last_error = event.error
+        except asyncio.CancelledError:
+            task.status = "cancelled"
+            task.error = "cancelled by user"
+            raise
+        except Exception as exc:  # noqa: BLE001 — store for /tasks
+            task.status = "failed"
+            task.error = f"{type(exc).__name__}: {exc}"
+        else:
+            if last_done is not None:
+                task.status = "done"
+                task.answer = str(last_done.get("answer", ""))
+                task.confidence = float(last_done.get("confidence", 0.0) or 0.0)
+                task.steps = int(last_done.get("steps", 0) or 0)
+            else:
+                task.status = "failed"
+                task.error = last_error or "sub-agent stream ended without TASK_DONE"
+        finally:
+            task.updated_at = _now()
 
     def _make_registered_llm(self, model_name: str) -> Any:
         llm = self._llm_instances.get(model_name)
@@ -1876,6 +2020,30 @@ def _copy_state(state: SessionState) -> SessionState:
         plan_mode_enabled=state.plan_mode_enabled,
         updated_at=state.updated_at,
     )
+
+
+def _copy_background_task(task: BackgroundTaskState) -> BackgroundTaskState:
+    return BackgroundTaskState(
+        task_id=task.task_id,
+        session_id=task.session_id,
+        agent_id=task.agent_id,
+        instruction=task.instruction,
+        status=task.status,
+        answer=task.answer,
+        confidence=task.confidence,
+        steps=task.steps,
+        error=task.error,
+        collected=task.collected,
+        created_at=task.created_at,
+        updated_at=task.updated_at,
+    )
+
+
+def _render_background_result(task: BackgroundTaskState) -> str:
+    header = f"[Background task {task.task_id}] {task.agent_id} {task.status}: {task.instruction}"
+    if task.status == "done":
+        return f"{header}\n\n{task.answer}\n\nconfidence={task.confidence:.2f} steps={task.steps}"
+    return f"{header}\n\nerror: {task.error or task.status}"
 
 
 def _event_to_trace(event: BusEvent) -> dict[str, Any]:
