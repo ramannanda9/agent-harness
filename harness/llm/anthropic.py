@@ -210,9 +210,9 @@ class AnthropicLLM:
             # text_delta events, so text_stream yields nothing. Recover the
             # text from the final message so callers never see an empty stream.
             if not yielded:
-                for block in final.content:
-                    if hasattr(block, "text") and block.text:
-                        yield block.text
+                text = _collect_text(final.content)
+                if text:
+                    yield text
 
             usage = _extract_usage(final.usage, final.model or self._model)
             cost = _compute_cost(usage, self._cost_fn)
