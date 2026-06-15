@@ -498,10 +498,7 @@ class _SubagentPanel:
         if not self._enabled or not self._rows:
             return False
         active = self._active_count()
-        if active >= 2:
-            self._saw_parallel = True
-            return True
-        return self._saw_parallel and active > 0
+        return active >= 2 or (self._saw_parallel and active > 0)
 
     def update(self, event: BusEvent) -> None:
         if not self._enabled:
@@ -526,11 +523,13 @@ class _SubagentPanel:
         if event.type == EventType.THOUGHT:
             row.phase = "thinking"
             row.detail = trunc(str(event.payload.get("thought", "")), 36)
-            row.step = _payload_step(event.payload, row.step)
+            step = _payload_int(event.payload.get("step"))
+            row.step = step if step is not None else row.step
         elif event.type == EventType.ACTION:
             row.phase = "action"
             row.detail = str(event.payload.get("tool") or "tool")
-            row.step = _payload_step(event.payload, row.step)
+            step = _payload_int(event.payload.get("step"))
+            row.step = step if step is not None else row.step
         elif event.type == EventType.CONTEXT:
             row.phase = "context"
             row.detail = f"{int(event.payload.get('tokens') or 0):,} tokens"
@@ -602,14 +601,6 @@ class _SubagentPanel:
             detail = trunc(row.detail or "failed", 36)
             suffix = f"{row.steps} steps" if row.steps is not None else ""
         return f"  {agent:<{self._label_width}}  {status:<8}  {detail:<28}  {suffix}".rstrip()
-
-
-def _payload_step(payload: dict, fallback: int | None) -> int | None:
-    for key in ("step", "steps"):
-        value = _payload_int(payload.get(key))
-        if value is not None:
-            return value
-    return fallback
 
 
 def _payload_int(value: object) -> int | None:
