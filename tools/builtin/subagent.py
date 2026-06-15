@@ -136,7 +136,7 @@ class SubAgentTool:
             type=EventType.SUBAGENT_START,
             agent_id=self.agent_id,
             parent_agent_id=invoking_parent,
-            payload={"task": task[:300]},
+            payload={"task": task[:300], "invocation_id": run_id},
         )
 
         last_done: dict | None = None
@@ -146,7 +146,7 @@ class SubAgentTool:
                 tagged = BusEvent(
                     type=event.type,
                     agent_id=event.agent_id,
-                    payload=dict(event.payload),
+                    payload={**dict(event.payload), "invocation_id": run_id},
                     token=event.token,
                     error=event.error,
                     timestamp=event.timestamp,
@@ -170,6 +170,7 @@ class SubAgentTool:
                 "confidence": (last_done or {}).get("confidence", 0.0),
                 "answer": (last_done or {}).get("answer", "")[:300],
                 "error": last_error or "",
+                "invocation_id": run_id,
             },
         )
 

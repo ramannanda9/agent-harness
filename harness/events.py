@@ -55,7 +55,7 @@ class EventType(str, Enum):
     CONTEXT = "context"
     MEMORY = "memory"
     HUMAN_GUIDANCE = "human_guidance"  # async steering injected at step boundary
-    SUBAGENT_START = "subagent_start"  # SubAgentTool begins; payload: task, parent_agent_id
+    SUBAGENT_START = "subagent_start"  # SubAgentTool begins; payload: task, invocation_id
     SUBAGENT_DONE = "subagent_done"  # SubAgentTool finished; payload: success, steps, confidence
     TASK_DONE = "task_done"
     REPLAN = "replan"

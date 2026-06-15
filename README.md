@@ -625,9 +625,10 @@ main_agent = BaseAgent(
 async for event in main_agent.run_stream(goal):
     # Sub-agent events bubble up tagged with event.parent_agent_id so
     # renderers can indent or group them.
-    # SUBAGENT_START fires before the sub's first event (payload: task).
+    # SUBAGENT_START fires before the sub's first event (payload:
+    # task, invocation_id).
     # SUBAGENT_DONE fires after the sub's TASK_DONE (payload: success,
-    # steps, confidence, answer, error).
+    # steps, confidence, answer, error, invocation_id).
     ...
 ```
 

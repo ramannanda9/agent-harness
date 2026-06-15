@@ -6,6 +6,7 @@ import json
 import sys
 import threading
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from typing import NamedTuple, TextIO
 
 from harness.events import BusEvent, EventType
@@ -75,6 +76,11 @@ class ConsoleRenderer:
             enabled=spinner and is_tty,
             delay=spinner_delay,
         )
+        self._subagent_panel = _SubagentPanel(
+            out=self._out,
+            enabled=is_tty,
+            label_width=agent_label_width,
+        )
 
     # ── public helpers ────────────────────────────────────────────────────────
 
@@ -85,6 +91,7 @@ class ConsoleRenderer:
     def render(self, event: BusEvent) -> None:
         """Print formatted output for one BusEvent."""
         self._spinner.stop()
+        self._subagent_panel.erase()
         if event.type == EventType.TOKEN:
             if self._show_tokens:
                 if not self._in_token_stream:
@@ -287,11 +294,16 @@ class ConsoleRenderer:
         elif t == EventType.ERROR:
             print(f"\n[error]      {event.error}", file=sys.stderr)
 
-        self._schedule_spinner(event)
+        self._subagent_panel.update(event)
+        if self._subagent_panel.should_draw:
+            self._subagent_panel.draw()
+        else:
+            self._schedule_spinner(event)
 
     def close(self) -> None:
         """Stop any background spinner owned by this renderer."""
         self._spinner.stop()
+        self._subagent_panel.erase()
 
     def render_budget(self, budget: dict | None) -> None:
         """Print tokens + per-call-site breakdown from a ``BudgetGuard.snapshot()``
@@ -456,3 +468,154 @@ class _Spinner:
             return
         self._out.write("\r\033[K")
         self._out.flush()
+
+
+@dataclass
+class _AgentRow:
+    agent_id: str
+    parent_agent_id: str
+    phase: str = "starting"
+    detail: str = ""
+    step: int | None = None
+    confidence: float | None = None
+    steps: int | None = None
+    active: bool = True
+
+
+class _SubagentPanel:
+    """TTY-only live table for concurrent sub-agent delegations."""
+
+    def __init__(self, *, out: TextIO, enabled: bool, label_width: int) -> None:
+        self._out = out
+        self._enabled = enabled
+        self._label_width = label_width
+        self._rows: dict[str, _AgentRow] = {}
+        self._drawn = 0
+        self._saw_parallel = False
+
+    @property
+    def should_draw(self) -> bool:
+        if not self._enabled or not self._rows:
+            return False
+        active = self._active_count()
+        return active >= 2 or (self._saw_parallel and active > 0)
+
+    def update(self, event: BusEvent) -> None:
+        if not self._enabled:
+            return
+        if event.type == EventType.SUBAGENT_START:
+            key = self._key(event)
+            self._rows[key] = _AgentRow(
+                agent_id=event.agent_id,
+                parent_agent_id=event.parent_agent_id,
+            )
+            if self._active_count() >= 2:
+                self._saw_parallel = True
+            return
+
+        if not event.parent_agent_id:
+            return
+
+        row = self._row_for(event)
+        if row is None:
+            return
+
+        if event.type == EventType.THOUGHT:
+            row.phase = "thinking"
+            row.detail = trunc(str(event.payload.get("thought", "")), 36)
+            step = _payload_int(event.payload.get("step"))
+            row.step = step if step is not None else row.step
+        elif event.type == EventType.ACTION:
+            row.phase = "action"
+            row.detail = str(event.payload.get("tool") or "tool")
+            step = _payload_int(event.payload.get("step"))
+            row.step = step if step is not None else row.step
+        elif event.type == EventType.CONTEXT:
+            row.phase = "context"
+            row.detail = f"{int(event.payload.get('tokens') or 0):,} tokens"
+        elif event.type == EventType.SUBAGENT_DONE:
+            row.active = False
+            row.phase = "done" if event.payload.get("success") else "failed"
+            row.detail = str(event.payload.get("error") or "")
+            row.confidence = _payload_float(event.payload.get("confidence"))
+            row.steps = _payload_int(event.payload.get("steps"))
+            if self._active_count() == 0:
+                self._rows.clear()
+                self._saw_parallel = False
+
+    def draw(self) -> None:
+        if not self.should_draw:
+            return
+        lines = ["Subagents"]
+        for row in self._rows.values():
+            lines.append(self._format_row(row))
+        self._out.write("\n".join(lines) + "\n")
+        self._out.flush()
+        self._drawn = len(lines)
+
+    def erase(self) -> None:
+        if not self._enabled or self._drawn <= 0:
+            return
+        for _ in range(self._drawn):
+            self._out.write("\033[A\r\033[2K")
+        self._out.flush()
+        self._drawn = 0
+
+    def _active_count(self) -> int:
+        return sum(1 for row in self._rows.values() if row.active)
+
+    def _row_for(self, event: BusEvent) -> _AgentRow | None:
+        key = self._key(event)
+        row = self._rows.get(key)
+        if row is not None:
+            return row
+        candidates = [
+            item
+            for item in self._rows.values()
+            if item.agent_id == event.agent_id
+            and item.parent_agent_id == event.parent_agent_id
+            and item.active
+        ]
+        return candidates[-1] if candidates else None
+
+    def _key(self, event: BusEvent) -> str:
+        invocation_id = ""
+        if isinstance(event.payload, dict):
+            invocation_id = str(event.payload.get("invocation_id") or "")
+        if invocation_id:
+            return invocation_id
+        return f"{event.parent_agent_id}:{event.agent_id}"
+
+    def _format_row(self, row: _AgentRow) -> str:
+        agent = row.agent_id[: self._label_width]
+        status = "running" if row.active else row.phase
+        if row.active:
+            detail = f"{row.phase} {row.detail}".strip()
+            suffix = f"step {row.step}" if row.step is not None else ""
+        elif row.phase == "done":
+            detail = (
+                f"confidence {row.confidence:.2f}" if row.confidence is not None else "complete"
+            )
+            suffix = f"{row.steps} steps" if row.steps is not None else ""
+        else:
+            detail = trunc(row.detail or "failed", 36)
+            suffix = f"{row.steps} steps" if row.steps is not None else ""
+        return f"  {agent:<{self._label_width}}  {status:<8}  {detail:<28}  {suffix}".rstrip()
+
+
+def _payload_int(value: object) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _payload_float(value: object) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None

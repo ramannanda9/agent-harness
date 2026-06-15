@@ -210,3 +210,112 @@ def test_console_renderer_terminal_events_do_not_restart_spinner():
     renderer.close()
 
     assert "thinking..." not in out.getvalue()
+
+
+def test_console_renderer_subagent_panel_is_tty_only():
+    out = StringIO()
+    renderer = ConsoleRenderer(out=out, spinner=False)
+
+    renderer.render(
+        BusEvent(
+            type=EventType.SUBAGENT_START,
+            agent_id="researcher",
+            parent_agent_id="coordinator",
+            payload={"task": "research", "invocation_id": "run-a"},
+        )
+    )
+    renderer.render(
+        BusEvent(
+            type=EventType.SUBAGENT_START,
+            agent_id="analyst",
+            parent_agent_id="coordinator",
+            payload={"task": "analyze", "invocation_id": "run-b"},
+        )
+    )
+
+    text = out.getvalue()
+    assert "→ start" in text
+    assert "Subagents" not in text
+    assert "\033[A" not in text
+
+
+def test_console_renderer_draws_parallel_subagent_panel():
+    out = _TTYStringIO()
+    renderer = ConsoleRenderer(out=out, spinner=False)
+
+    renderer.render(
+        BusEvent(
+            type=EventType.SUBAGENT_START,
+            agent_id="researcher",
+            parent_agent_id="coordinator",
+            payload={"task": "research", "invocation_id": "run-a"},
+        )
+    )
+    renderer.render(
+        BusEvent(
+            type=EventType.SUBAGENT_START,
+            agent_id="analyst",
+            parent_agent_id="coordinator",
+            payload={"task": "analyze", "invocation_id": "run-b"},
+        )
+    )
+    renderer.render(
+        BusEvent(
+            type=EventType.ACTION,
+            agent_id="researcher",
+            parent_agent_id="coordinator",
+            payload={"tool": "browser_snapshot", "step": 4, "invocation_id": "run-a"},
+        )
+    )
+    renderer.close()
+
+    text = out.getvalue()
+    assert "Subagents" in text
+    assert "researcher" in text
+    assert "analyst" in text
+    assert "action browser_snapshot" in text
+    assert "step 4" in text
+    assert "\033[A\r\033[2K" in text
+
+
+def test_console_renderer_subagent_panel_handles_duplicate_agent_ids():
+    out = _TTYStringIO()
+    renderer = ConsoleRenderer(out=out, spinner=False)
+
+    renderer.render(
+        BusEvent(
+            type=EventType.SUBAGENT_START,
+            agent_id="researcher",
+            parent_agent_id="coordinator",
+            payload={"task": "first", "invocation_id": "run-a"},
+        )
+    )
+    renderer.render(
+        BusEvent(
+            type=EventType.SUBAGENT_START,
+            agent_id="researcher",
+            parent_agent_id="coordinator",
+            payload={"task": "second", "invocation_id": "run-b"},
+        )
+    )
+    renderer.render(
+        BusEvent(
+            type=EventType.ACTION,
+            agent_id="researcher",
+            parent_agent_id="coordinator",
+            payload={"tool": "browser_snapshot", "invocation_id": "run-a"},
+        )
+    )
+    renderer.render(
+        BusEvent(
+            type=EventType.ACTION,
+            agent_id="researcher",
+            parent_agent_id="coordinator",
+            payload={"tool": "http_fetch", "invocation_id": "run-b"},
+        )
+    )
+    renderer.close()
+
+    text = out.getvalue()
+    assert "action browser_snapshot" in text
+    assert "action http_fetch" in text

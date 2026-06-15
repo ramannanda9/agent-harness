@@ -483,6 +483,7 @@ async def test_subagent_start_and_done_events_emitted():
     assert d.payload["steps"] > 0
     assert d.payload["confidence"] == pytest.approx(0.9)
     assert "result" in d.payload["answer"]
+    assert d.payload["invocation_id"] == start_events[0].payload["invocation_id"]
 
 
 @pytest.mark.asyncio
@@ -536,6 +537,28 @@ async def test_subagent_lifecycle_events_carry_parent_agent_id():
     assert all(e.parent_agent_id == "parent" for e in starts)
     assert all(e.parent_agent_id == "parent" for e in dones)
     assert all(e.agent_id == "sub" for e in starts + dones)
+    assert starts[0].payload["invocation_id"] == dones[0].payload["invocation_id"]
+
+
+@pytest.mark.asyncio
+async def test_subagent_bubbled_events_carry_invocation_id():
+    sub_llm = _CannedLLM(
+        [{"thought": "ok", "action": "finish", "answer": "done", "confidence": 1.0}]
+    )
+    sub = _build_agent(agent_id="sub", llm=sub_llm)
+    tool = SubAgentTool(sub, name="delegate_sub")
+    tool._invoking_agent_id = "parent"
+
+    events: list[BusEvent] = []
+    async for item in tool.execute_stream(task="work"):
+        if isinstance(item, BusEvent):
+            events.append(item)
+
+    starts = [e for e in events if e.type == EventType.SUBAGENT_START]
+    assert starts
+    invocation_id = starts[0].payload["invocation_id"]
+    assert invocation_id
+    assert all(e.payload.get("invocation_id") == invocation_id for e in events)
 
 
 @pytest.mark.asyncio
