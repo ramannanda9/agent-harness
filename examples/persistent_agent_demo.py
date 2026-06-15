@@ -397,6 +397,7 @@ async def main() -> None:
             app,
             history_path=Path(args.state_dir).expanduser() / "demo_history",
             plan_mode_toggle=_toggle_plan_mode,
+            session_id_provider=lambda: session_id,
         )
 
         print("Persistent agent ready.")

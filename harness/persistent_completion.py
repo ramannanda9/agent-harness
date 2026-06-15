@@ -12,7 +12,7 @@ so the per-keystroke cost stays bounded even with many sessions.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from typing import TYPE_CHECKING, Any
 
 from prompt_toolkit.completion import Completer, Completion
@@ -34,8 +34,14 @@ class SlashCommandCompleter(Completer):
     arguments query the store; ``confirm`` arguments propose the literal.
     """
 
-    def __init__(self, app: PersistentAgent) -> None:
+    def __init__(
+        self,
+        app: PersistentAgent,
+        *,
+        session_id_provider: Callable[[], str | None] | None = None,
+    ) -> None:
         self._app = app
+        self._session_id_provider = session_id_provider
         # Pre-expand aliases for O(1) lookup during arg completion.
         self._spec_by_name: dict[str, SlashCommandSpec] = {}
         for spec in slash_command_specs():
@@ -184,7 +190,8 @@ class SlashCommandCompleter(Completer):
 
     async def _background_task_ids(self) -> list[str]:
         try:
-            tasks = await self._app.list_background_tasks()
+            session_id = self._session_id_provider() if self._session_id_provider else None
+            tasks = await self._app.list_background_tasks(session_id)
         except Exception:  # noqa: BLE001 — completer must never raise into the prompt loop
             return []
         return sorted(task.task_id for task in tasks)

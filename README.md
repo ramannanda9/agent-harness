@@ -761,7 +761,7 @@ from harness.persistent_completion import SlashCommandCompleter
 
 session = PromptSession(
     history=FileHistory("~/.agent-harness/demo_history"),
-    completer=SlashCommandCompleter(app),
+    completer=SlashCommandCompleter(app, session_id_provider=lambda: session_id),
     complete_while_typing=False,  # Tab-triggered; doesn't query the store every keystroke
 )
 message = (await session.prompt_async("> ")).strip()

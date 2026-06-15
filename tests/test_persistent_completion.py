@@ -192,16 +192,20 @@ async def test_completer_offers_subagents_for_background_tasks():
 @pytest.mark.asyncio
 async def test_completer_offers_background_task_actions_and_ids():
     app = _subagent_app()
-    task = await app.start_background_subagent("s", "researcher", "work")
-    completer = SlashCommandCompleter(app)
+    session_id = "s"
+    task = await app.start_background_subagent(session_id, "researcher", "work")
+    other_task = await app.start_background_subagent("other", "researcher", "work")
+    completer = SlashCommandCompleter(app, session_id_provider=lambda: session_id)
 
     actions = await _collect(completer, "/tasks ")
     ids = await _collect(completer, "/tasks collect ")
 
     assert set(actions) == {"collect", "cancel"}
     assert task.task_id in ids
+    assert other_task.task_id not in ids
     assert "all" in ids
     await app.cancel_background_task("s", task.task_id)
+    await app.cancel_background_task("other", other_task.task_id)
 
 
 @pytest.mark.asyncio
