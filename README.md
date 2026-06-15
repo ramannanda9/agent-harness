@@ -792,13 +792,23 @@ The demo uses that utility for:
 - `/new [id]` starts a fresh session id and refuses to collide with an existing id
 - `/clear` clears the current transcript/summary/counters; long-term memory is retained
 - `/delete [id] confirm` deletes a transcript row; long-term memory is retained
+- `/end` exits the demo — no auto-flush; call `/save` first if you want pending facts persisted
 
 Background sub-agent tasks are process-local. They keep running while the
 REPL/server process is alive; completed results become durable only when
 collected into the session transcript with `/tasks collect <id|all>`. Avoid
 launching overlapping work against the same sub-agent instance unless that
 agent's tools and LLM adapter are safe for concurrent use.
-- `/end` exits the demo — no auto-flush; call `/save` first if you want pending facts persisted
+
+When a `PersistentAgent` coordinator is wired with `SubAgentTool`s, it also
+gets LLM-visible background tools automatically:
+
+- `background_delegate_<agent_id>(task)` starts that sub-agent and returns a `task_id`
+- `check_background_task(task_id)` reports status and any available result preview
+- `collect_background_task(task_id)` returns the completed answer to the coordinator and appends it to the transcript
+
+The regular `delegate_<agent_id>` tools remain blocking; background delegation
+uses separate tool names so the model's intent is explicit in traces.
 
 **Plan mode** (`/plan on`, or **Shift-Tab** at the prompt) gates each turn behind an approval step. The
 coordinator's LLM produces a structured plan (`{summary, steps[]}`) before

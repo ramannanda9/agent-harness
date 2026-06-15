@@ -93,6 +93,24 @@ class _DelegatingLLM(_ChatLLM):
         }
 
 
+class _BackgroundDelegatingLLM(_ChatLLM):
+    async def complete(self, system, messages, **kwargs):
+        self.calls.append({"system": system, "messages": messages, "kwargs": kwargs})
+        if len(self.calls) == 1:
+            assert "background_delegate_researcher" in system
+            return {
+                "thought": "start background",
+                "action": "background_delegate_researcher",
+                "args": {"task": "find a fact"},
+            }
+        return {
+            "thought": "task started",
+            "action": "finish",
+            "answer": "Background research is running.",
+            "confidence": 0.8,
+        }
+
+
 class _SpyMemory(MemoryManager):
     def __init__(self, llm: Any) -> None:
         super().__init__(
@@ -379,7 +397,13 @@ def test_persistent_agent_capabilities_lists_subagents_and_mcp_tools():
     caps = app.capabilities()
 
     assert caps["coordinator"]["agent_id"] == "coordinator"
-    assert caps["coordinator"]["tools"] == ["delegate_research", "mcp_query"]
+    assert caps["coordinator"]["tools"] == [
+        "background_delegate_researcher",
+        "check_background_task",
+        "collect_background_task",
+        "delegate_research",
+        "mcp_query",
+    ]
     assert caps["coordinator"]["skills"] == [
         {
             "name": "coordination",
@@ -487,6 +511,99 @@ async def test_persistent_agent_runs_background_subagent_and_collects_result():
     assert state.messages[0].role == "assistant"
     assert started.task_id in state.messages[0].content
     assert "answer: find a fact" in state.messages[0].content
+
+
+@pytest.mark.asyncio
+async def test_collect_background_task_tool_returns_answer_to_llm():
+    llm = _ChatLLM()
+    memory = _SpyMemory(llm)
+    sub = BaseAgent(
+        config=AgentConfig(
+            agent_id="researcher",
+            role="researches",
+            system_prompt="You research.",
+            allowed_tools=[],
+            max_steps=2,
+        ),
+        tools={},
+        memory=memory,
+        tracer=Tracer(),
+        guard=BudgetGuard(GuardrailConfig(max_total_cost_usd=10.0)),
+        llm=llm,
+    )
+    coordinator = _agent(
+        llm=llm,
+        memory=memory,
+        tools={"delegate_researcher": SubAgentTool(sub, name="delegate_researcher")},
+    )
+    app = PersistentAgent(
+        coordinator=coordinator,
+        session_store=InMemorySessionStore(),
+        memory=memory,
+        llm=llm,
+        config=PersistentAgentConfig(),
+    )
+    started = await app.start_background_subagent("s", "researcher", "find a fact")
+    await _wait_background_done(app, "s", started.task_id)
+
+    token = app._active_session_id.set("s")
+    try:
+        result = await coordinator._tools["collect_background_task"].execute(
+            task_id=started.task_id
+        )
+    finally:
+        app._active_session_id.reset(token)
+
+    assert result["status"] == "done"
+    assert "answer: find a fact" in result["answer"]
+    assert result["collected"] is True
+    state = await app.session_state("s")
+    assert started.task_id in state.messages[-1].content
+
+
+@pytest.mark.asyncio
+async def test_persistent_agent_installs_llm_visible_background_delegate_tool():
+    llm = _BackgroundDelegatingLLM()
+    memory = _SpyMemory(llm)
+    sub = BaseAgent(
+        config=AgentConfig(
+            agent_id="researcher",
+            role="researches",
+            system_prompt="You research.",
+            allowed_tools=[],
+            max_steps=2,
+        ),
+        tools={},
+        memory=memory,
+        tracer=Tracer(),
+        guard=BudgetGuard(GuardrailConfig(max_total_cost_usd=10.0)),
+        llm=llm,
+    )
+    coordinator = _agent(
+        llm=llm,
+        memory=memory,
+        tools={"delegate_researcher": SubAgentTool(sub, name="delegate_researcher")},
+    )
+    app = PersistentAgent(
+        coordinator=coordinator,
+        session_store=InMemorySessionStore(),
+        memory=memory,
+        llm=llm,
+        config=PersistentAgentConfig(),
+    )
+
+    events = [event async for event in app.chat("research in the background", session_id="s")]
+
+    observations = [event for event in events if event.type == EventType.OBSERVATION]
+    assert observations
+    assert "background_delegate_researcher" in coordinator._tools
+    assert "check_background_task" in coordinator._tools
+    assert "collect_background_task" in coordinator._tools
+    tasks = await app.list_background_tasks("s")
+    assert len(tasks) == 1
+    assert tasks[0].agent_id == "researcher"
+    assert tasks[0].instruction == "find a fact"
+    await _wait_background_done(app, "s", tasks[0].task_id)
 
 
 @pytest.mark.asyncio
