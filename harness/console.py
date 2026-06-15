@@ -213,6 +213,27 @@ class ConsoleRenderer:
                 file=self._out,
             )
 
+        elif t == EventType.SUBAGENT_START:
+            indent = "  " if event.parent_agent_id else ""
+            print(
+                f"{indent}[{event.agent_id:<{self._label_w}}] → start  {trunc(p.get('task', ''), 90)}",
+                file=self._out,
+            )
+
+        elif t == EventType.SUBAGENT_DONE:
+            indent = "  " if event.parent_agent_id else ""
+            if p.get("success"):
+                status = (
+                    f"✓ done   confidence={p.get('confidence', 0):.2f}  steps={p.get('steps', '?')}"
+                )
+            else:
+                err = trunc(p.get("error", "unknown error"), 80)
+                status = f"✗ failed  {err}"
+            print(
+                f"{indent}[{event.agent_id:<{self._label_w}}] {status}",
+                file=self._out,
+            )
+
         elif t == EventType.TASK_DONE:
             print(
                 f"{self._label(event)} ✓ done  "

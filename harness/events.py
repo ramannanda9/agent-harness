@@ -21,12 +21,14 @@ Event lifecycle within a single goal:
         HUMAN_GUIDANCE?   — async steering drained at top of step
         CONTEXT           — working-memory context budget estimate
         MEMORY            — working-memory compaction/summarization marker
+        SUBAGENT_START?   — SubAgentTool delegation began (before sub's first event)
         THOUGHT           — agent's next-step reasoning
         TOKEN*            — partial LLM output (only when client streams)
         ACTION            — agent chose a tool + args
         OBSERVATION       — tool returned a result
         ... (loop until)
         TASK_DONE         — agent finished a task; carries result payload
+        SUBAGENT_DONE?    — SubAgentTool delegation finished (after sub's TASK_DONE)
     REPLAN?               — replan fired (low confidence or failure)
     SYNTHESIS             — synthesizer merged task results
     DONE                  — orchestrator finished; payload is the final result dict
@@ -53,6 +55,8 @@ class EventType(str, Enum):
     CONTEXT = "context"
     MEMORY = "memory"
     HUMAN_GUIDANCE = "human_guidance"  # async steering injected at step boundary
+    SUBAGENT_START = "subagent_start"  # SubAgentTool begins; payload: task, parent_agent_id
+    SUBAGENT_DONE = "subagent_done"  # SubAgentTool finished; payload: success, steps, confidence
     TASK_DONE = "task_done"
     REPLAN = "replan"
     SYNTHESIS = "synthesis"
