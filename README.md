@@ -455,6 +455,18 @@ agents.register(AgentConfig(
 ))
 ```
 
+### Tool observation budget
+
+Tool results emitted on the event stream stay intact, but the observation
+text appended back into the agent's working memory is capped by
+`AgentConfig.max_observation_chars` (default `20_000`). This prevents a
+single browser snapshot, MCP response, or shell output from dominating the
+next LLM call. When capped, the model sees a structured JSON envelope with
+`truncated`, `original_chars`, `shown_chars`, `omitted_chars`, and `content`.
+
+Set `max_observation_chars=0` to disable this cap for agents that must feed
+full raw tool output back into the next step.
+
 Defaults are in-memory (`InMemorySemanticStore`, `InMemoryEpisodicStore`).
 For durable storage:
 
@@ -1804,6 +1816,7 @@ agents alongside HITL on the shell tool.
 | `memory_context_enabled` | `True` | Prepend relevant long-term memory to the system prompt |
 | `confidence_from_llm` | `True` | Use the `confidence` field from the LLM response; set `False` to always return `1.0` |
 | `working_memory_max_tokens` | `None` (auto-derive from `llm.input_token_budget × 0.8`; pass an int to hard-cap) | Token budget for in-context working memory before rolling summarisation kicks in |
+| `max_observation_chars` | `20_000` | Character cap for model-facing tool observations appended to working memory; event payloads keep the original result. Set `0` to disable |
 | `hitl_tools` | `[]` | Tool names that require human approval before execution |
 | `checkpoint_every` | `0` | Write a crash-resumable checkpoint every N steps; `0` disables periodic checkpoints |
 | `stream_tokens` | `False` | Emit `TOKEN` events as the LLM streams. Disabled by default — enable if you want to render partial output in real time: `AgentConfig(..., stream_tokens=True)` |

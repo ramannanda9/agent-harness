@@ -81,6 +81,11 @@ class AgentConfig:
     # int to hard-cap the WorkingMemory eviction threshold — useful for
     # cost-sensitive workloads or when feeding very small models.
     working_memory_max_tokens: int | None = None
+    # Cap model-facing text appended after tool observations. Event payloads
+    # and traces still carry the original tool result; this only protects the
+    # next LLM prompt from oversized browser/MCP/shell observations. Set to
+    # 0 or a negative value to disable the cap.
+    max_observation_chars: int = 20_000
     hitl_tools: list[str] = None  # tools requiring human approval; None = no HITL
     checkpoint_every: int = 0  # write a resumable checkpoint every N steps; 0 = disabled
     # Cache tool results within a single run, keyed by (tool_name, args).
@@ -704,7 +709,9 @@ class BaseAgent:
                 for i, (act, obs) in enumerate(zip(parallel_actions, observations, strict=False)):
                     tool_name = act.get("tool", "")
                     tool_args = act.get("args", {})
-                    obs_display = "[image]" if _is_image_block(obs) else str(obs)[:500]
+                    is_img = _is_image_block(obs)
+                    obs_raw = "[image]" if is_img else str(obs)
+                    obs_display = obs_raw if is_img else obs_raw[:500]
                     self._tracer.log(
                         "action",
                         self.config.agent_id,
@@ -719,10 +726,10 @@ class BaseAgent:
                         BusEvent(
                             type=EventType.OBSERVATION,
                             agent_id=self.config.agent_id,
-                            payload={"step": step, "tool": tool_name, "observation": obs_display},
+                            payload={"step": step, "tool": tool_name, "observation": obs_raw},
                         )
                     )
-                    combined.append({"tool": tool_name, "result": obs_display})
+                    combined.append({"tool": tool_name, "result": obs_raw})
                     if obs and not isinstance(obs, str) and not _is_image_block(obs):
                         fire(
                             self._memory.write_working_fact(
@@ -778,7 +785,9 @@ class BaseAgent:
                         continue
 
                 await self._record_tool_observation(response, tool_name, observation)
-                obs_display = "[image]" if _is_image_block(observation) else str(observation)[:500]
+                is_img = _is_image_block(observation)
+                obs_raw = "[image]" if is_img else str(observation)
+                obs_display = obs_raw if is_img else obs_raw[:500]
                 self._tracer.log(
                     "action",
                     self.config.agent_id,
@@ -795,7 +804,7 @@ class BaseAgent:
                     payload={
                         "step": step,
                         "tool": tool_name,
-                        "observation": obs_display,
+                        "observation": obs_raw,
                     },
                 )
 
@@ -1026,6 +1035,10 @@ class BaseAgent:
             if not isinstance(observation, str)
             else observation
         )
+        obs_text = _format_model_observation(
+            obs_text,
+            max_chars=self.config.max_observation_chars,
+        )
         await self._working_memory.append("user", f"Observation: {obs_text}")
 
     async def _record_parallel_observations(
@@ -1040,7 +1053,11 @@ class BaseAgent:
             content: list = [
                 {
                     "type": "text",
-                    "text": f"Observations:\n{json.dumps(combined, default=str)}",
+                    "text": "Observations:\n"
+                    + _format_model_observation(
+                        json.dumps(combined, default=str),
+                        max_chars=self.config.max_observation_chars,
+                    ),
                 }
             ]
             for tool_name_img, img_block in image_blocks:
@@ -1050,7 +1067,11 @@ class BaseAgent:
             return
         await self._working_memory.append(
             "user",
-            f"Observations:\n{json.dumps(combined, default=str)}",
+            "Observations:\n"
+            + _format_model_observation(
+                json.dumps(combined, default=str),
+                max_chars=self.config.max_observation_chars,
+            ),
         )
 
     # ── Tool Execution ────────────────────────────────────────────────────────
@@ -1393,6 +1414,32 @@ def _split_system(messages: list[dict]) -> tuple[str | None, list[dict]]:
         rest.append(m)
     system_text = "\n\n".join(system_parts) if system_parts else None
     return system_text, rest
+
+
+# ── Tool observation shaping ─────────────────────────────────────────────────
+
+
+def _format_model_observation(text: str, *, max_chars: int) -> str:
+    """Return the observation text appended to WorkingMemory.
+
+    The raw tool result is still emitted on the event stream before this
+    method is involved. This cap only protects the *next* LLM call from
+    oversized observations.
+    """
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    omitted = len(text) - max_chars
+    return json.dumps(
+        {
+            "truncated": True,
+            "original_chars": len(text),
+            "shown_chars": max_chars,
+            "omitted_chars": omitted,
+            "content": text[:max_chars],
+            "note": "Tool observation was capped before the next LLM call.",
+        },
+        ensure_ascii=False,
+    )
 
 
 # ── Response normalization (module-level for testability) ────────────────────

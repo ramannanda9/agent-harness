@@ -8,6 +8,13 @@ from harness.skills import Skill
 from tests.conftest import EchoTool, FailingTool, ScriptedLLM, SlowTool
 
 
+class LargeTool:
+    name = "large"
+
+    async def execute(self, size: int = 100) -> str:
+        return "x" * size
+
+
 async def test_finish_on_first_step_returns_answer(agent_factory, llm: ScriptedLLM):
     config = AgentConfig(
         agent_id="a1",
@@ -140,6 +147,41 @@ async def test_sequential_tool_calls_keep_llm_messages_trailing_user(
     assert step["n"] == 3
     assert role_sequences[1][-2:] == ["assistant", "user"]
     assert role_sequences[2][-2:] == ["assistant", "user"]
+
+
+async def test_large_tool_observation_is_capped_for_next_llm_call(agent_factory, llm: ScriptedLLM):
+    step = {"n": 0}
+    seen_obs: list[str] = []
+
+    def react(system, messages, kwargs):
+        step["n"] += 1
+        if step["n"] == 1:
+            return {"thought": "call large", "action": "large", "args": {"size": 80}}
+        last_user = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
+        seen_obs.append(last_user)
+        return {"thought": "done", "action": "finish", "answer": "ok", "confidence": 1.0}
+
+    llm.routes = {"react": react}
+    config = AgentConfig(
+        agent_id="obs-cap",
+        role="uses large tool",
+        system_prompt="ReAct.",
+        allowed_tools=["large"],
+        max_steps=3,
+        max_observation_chars=20,
+    )
+    agent = agent_factory(config, tools={"large": LargeTool()})
+
+    events = [event async for event in agent.run_stream("large output")]
+
+    obs_msg = seen_obs[0]
+    assert "Observation:" in obs_msg
+    assert "x" * 20 in obs_msg
+    assert "x" * 21 not in obs_msg
+    assert '"truncated": true' in obs_msg
+    assert '"original_chars": 80' in obs_msg
+    obs_event = next(event for event in events if event.type == EventType.OBSERVATION)
+    assert obs_event.payload["observation"] == "x" * 80
 
 
 async def test_unknown_tool_returns_error_observation(agent_factory, llm: ScriptedLLM):
@@ -407,6 +449,45 @@ async def test_parallel_actions_combined_observations_in_working_memory(
     assert "world" in obs_msg
     # Both results present even though both tools share the same name
     assert obs_msg.count('"echo"') >= 2
+
+
+async def test_parallel_observations_are_capped_for_next_llm_call(agent_factory, llm: ScriptedLLM):
+    step = {"n": 0}
+    seen_obs: list[str] = []
+
+    def react(system, messages, kwargs):
+        step["n"] += 1
+        if step["n"] == 1:
+            return {
+                "thought": "parallel",
+                "actions": [
+                    {"tool": "large", "args": {"size": 60}},
+                    {"tool": "large", "args": {"size": 60}},
+                ],
+            }
+        last_user = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
+        seen_obs.append(last_user)
+        return {"thought": "done", "action": "finish", "answer": "ok", "confidence": 1.0}
+
+    llm.routes = {"react": react}
+    config = AgentConfig(
+        agent_id="par-cap",
+        role="parallel",
+        system_prompt="ReAct.",
+        allowed_tools=["large"],
+        max_steps=3,
+        max_observation_chars=40,
+    )
+    agent = agent_factory(config, tools={"large": LargeTool()})
+    events = [event async for event in agent.run_stream("run both")]
+
+    obs_msg = seen_obs[0]
+    assert obs_msg.startswith("Observations:")
+    assert '"truncated": true' in obs_msg
+    assert '"shown_chars": 40' in obs_msg
+
+    obs_events = [e for e in events if e.type == EventType.OBSERVATION]
+    assert all(e.payload["observation"] == "x" * 60 for e in obs_events)
 
 
 async def test_parallel_actions_unknown_tool_does_not_crash(agent_factory, llm: ScriptedLLM):
