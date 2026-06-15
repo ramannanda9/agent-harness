@@ -438,6 +438,106 @@ async def test_parent_guard_is_shared_with_subagent_on_delegate():
     assert sub._guard is not sub_local_guard
 
 
+# ── Lifecycle events ─────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_subagent_start_and_done_events_emitted():
+    """SUBAGENT_START fires before any sub-agent THOUGHT; SUBAGENT_DONE fires
+    after the sub-agent's TASK_DONE and before the terminal result dict."""
+    sub_llm = _CannedLLM(
+        [{"thought": "go", "action": "finish", "answer": "result", "confidence": 0.9}]
+    )
+    sub = _build_agent(agent_id="worker", llm=sub_llm)
+    tool = SubAgentTool(sub, name="delegate_worker")
+    tool._invoking_agent_id = "coord"
+
+    items: list = []
+    async for item in tool.execute_stream(task="do work"):
+        items.append(item)
+
+    bus_events = [i for i in items if isinstance(i, BusEvent)]
+    result_dicts = [i for i in items if not isinstance(i, BusEvent)]
+
+    start_events = [e for e in bus_events if e.type == EventType.SUBAGENT_START]
+    done_events = [e for e in bus_events if e.type == EventType.SUBAGENT_DONE]
+    thought_events = [e for e in bus_events if e.type == EventType.THOUGHT]
+
+    assert len(start_events) == 1, "exactly one SUBAGENT_START per delegation"
+    assert len(done_events) == 1, "exactly one SUBAGENT_DONE per delegation"
+
+    start_idx = bus_events.index(start_events[0])
+    done_idx = bus_events.index(done_events[0])
+    assert start_idx == 0, "SUBAGENT_START must be the first bus event"
+    if thought_events:
+        thought_idx = bus_events.index(thought_events[0])
+        assert start_idx < thought_idx, "SUBAGENT_START before first THOUGHT"
+    assert done_idx > start_idx, "SUBAGENT_DONE after SUBAGENT_START"
+    assert result_dicts, "terminal result dict still yielded"
+
+    # SUBAGENT_DONE carries success metadata.
+    d = done_events[0]
+    assert d.agent_id == "worker"
+    assert d.parent_agent_id == "coord"
+    assert d.payload["success"] is True
+    assert d.payload["steps"] > 0
+    assert d.payload["confidence"] == pytest.approx(0.9)
+    assert "result" in d.payload["answer"]
+
+
+@pytest.mark.asyncio
+async def test_subagent_done_reports_failure_when_no_task_done():
+    """SUBAGENT_DONE with success=False when the sub-agent exhausts max_steps."""
+
+    class _LoopTool:
+        name = "loop"
+
+        async def execute(self, **_: object) -> str:
+            return "nothing"
+
+    sub_llm = _CannedLLM([{"thought": "loop", "action": "loop", "args": {}}] * 3)
+    sub = _build_agent(agent_id="sub", llm=sub_llm, tools={"loop": _LoopTool()}, max_steps=2)
+    tool = SubAgentTool(sub, name="delegate_sub")
+    tool._invoking_agent_id = "parent"
+
+    bus_events: list[BusEvent] = []
+    async for item in tool.execute_stream(task="fail"):
+        if isinstance(item, BusEvent):
+            bus_events.append(item)
+
+    done_events = [e for e in bus_events if e.type == EventType.SUBAGENT_DONE]
+    assert len(done_events) == 1
+    assert done_events[0].payload["success"] is False
+    assert done_events[0].payload["error"]
+
+
+@pytest.mark.asyncio
+async def test_subagent_lifecycle_events_carry_parent_agent_id():
+    """SUBAGENT_START and SUBAGENT_DONE both carry the invoking parent's id."""
+    sub_llm = _CannedLLM(
+        [{"thought": "ok", "action": "finish", "answer": "done", "confidence": 1.0}]
+    )
+    sub = _build_agent(agent_id="sub", llm=sub_llm)
+    tool = SubAgentTool(sub, name="delegate_sub")
+
+    parent_llm = _CannedLLM(
+        [
+            {"thought": "go", "action": "delegate_sub", "args": {"task": "work"}},
+            {"thought": "done", "action": "finish", "answer": "ok", "confidence": 1.0},
+        ]
+    )
+    parent = _build_agent(agent_id="parent", llm=parent_llm, tools={tool.name: tool})
+
+    events = [e async for e in parent.run_stream("go")]
+    starts = [e for e in events if e.type == EventType.SUBAGENT_START]
+    dones = [e for e in events if e.type == EventType.SUBAGENT_DONE]
+
+    assert starts and dones
+    assert all(e.parent_agent_id == "parent" for e in starts)
+    assert all(e.parent_agent_id == "parent" for e in dones)
+    assert all(e.agent_id == "sub" for e in starts + dones)
+
+
 @pytest.mark.asyncio
 async def test_subagent_tool_uses_custom_task_arg_name():
     sub_llm = _CannedLLM([{"thought": "go", "action": "finish", "answer": "ok", "confidence": 1.0}])
