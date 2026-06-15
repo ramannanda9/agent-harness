@@ -43,6 +43,7 @@ def build_chat_prompt_session(
     complete_while_typing: bool = False,
     extra_key_bindings: KeyBindings | None = None,
     plan_mode_toggle: Callable[[], Awaitable[bool]] | None = None,
+    session_id_provider: Callable[[], str | None] | None = None,
 ) -> PromptSession[str]:
     """Construct a ``PromptSession`` suitable for multi-turn chat input.
 
@@ -68,6 +69,8 @@ def build_chat_prompt_session(
     - ``complete_while_typing=False``: Tab-triggered completion. The
       session-id completer otherwise hits the store on every keystroke.
     - ``completer=SlashCommandCompleter(app)`` when ``app`` is given.
+      Pass ``session_id_provider`` when command completion should be
+      scoped to the live session (for example `/tasks collect` ids).
       Pass ``completer=...`` to override (e.g. a richer completer that
       composes the slash-command one with something else); pass
       ``completer=None`` *and* ``app=None`` to disable completion
@@ -91,7 +94,7 @@ def build_chat_prompt_session(
         merged = bindings
 
     if completer is None and app is not None:
-        completer = SlashCommandCompleter(app)
+        completer = SlashCommandCompleter(app, session_id_provider=session_id_provider)
 
     history = _resolve_history(history_path)
 

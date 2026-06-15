@@ -8,6 +8,8 @@ at a time.
 
 from __future__ import annotations
 
+import asyncio
+import contextvars
 import json
 import sqlite3
 import uuid
@@ -21,6 +23,11 @@ from agents.base import BaseAgent, _parse_action_json
 from harness.events import BusEvent, EventType
 from harness.utils import fire
 from memory.manager import MemoryManager
+from tools.builtin.background import (
+    BackgroundDelegateTool,
+    CheckBackgroundTaskTool,
+    CollectBackgroundTaskTool,
+)
 
 
 def _now() -> str:
@@ -257,6 +264,24 @@ class SessionState:
     # without bleeding between unrelated workspaces. Toggle via the
     # ``/plan`` slash command or ``PersistentAgent.set_plan_mode``.
     plan_mode_enabled: bool = False
+    updated_at: str = field(default_factory=_now)
+
+
+@dataclass
+class BackgroundTaskState:
+    """Process-local background sub-agent task metadata."""
+
+    task_id: str
+    session_id: str
+    agent_id: str
+    instruction: str
+    status: str = "running"
+    answer: str = ""
+    confidence: float = 0.0
+    steps: int = 0
+    error: str = ""
+    collected: bool = False
+    created_at: str = field(default_factory=_now)
     updated_at: str = field(default_factory=_now)
 
 
@@ -859,6 +884,13 @@ class PersistentAgent:
         self._default_model = default_model
         self._llm_instances: dict[str, Any] = {}
         self._default_agent_llms = self._snapshot_agent_llms()
+        self._background_tasks: dict[str, BackgroundTaskState] = {}
+        self._background_handles: dict[str, asyncio.Task[None]] = {}
+        self._active_session_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+            f"agent_harness_session_{id(self)}",
+            default="",
+        )
+        self._install_background_tools()
         # Per-session memory-context cache. Memory retrieval used to fire
         # on every turn (inside ``_build_system_prompt``), which made the
         # system prompt content-dependent on whatever ``build_context``
@@ -895,6 +927,95 @@ class PersistentAgent:
         """Return the current plan-mode setting for ``session_id``."""
         state = await self._session_store.load(session_id)
         return state.plan_mode_enabled
+
+    async def start_background_subagent(
+        self,
+        session_id: str,
+        agent_id: str,
+        instruction: str,
+    ) -> BackgroundTaskState:
+        """Launch ``agent_id`` on ``instruction`` without blocking the caller.
+
+        Background tasks are process-local: completed metadata stays available
+        through this ``PersistentAgent`` instance, and ``collect_background_task``
+        can write the result back into the durable transcript.
+        """
+        instruction = instruction.strip()
+        if not instruction:
+            raise ValueError("background task instruction is required")
+        agent = self._find_agent(agent_id)
+        if agent is None or agent is self._coordinator:
+            raise ValueError(f"unknown sub-agent {agent_id!r}")
+        if self._active_session_id.get() != session_id:
+            state = await self._session_store.load(session_id)
+            self._apply_model_overrides(state)
+        task_id = f"bg_{uuid.uuid4().hex[:12]}"
+        task = BackgroundTaskState(
+            task_id=task_id,
+            session_id=session_id,
+            agent_id=agent_id,
+            instruction=instruction,
+        )
+        self._background_tasks[task_id] = task
+        self._background_handles[task_id] = asyncio.create_task(
+            self._run_background_subagent(task, agent)
+        )
+        return _copy_background_task(task)
+
+    async def list_background_tasks(
+        self, session_id: str | None = None
+    ) -> list[BackgroundTaskState]:
+        """Return process-local background tasks, newest first."""
+        tasks = self._background_tasks.values()
+        if session_id is not None:
+            tasks = [task for task in tasks if task.session_id == session_id]
+        return sorted(
+            (_copy_background_task(task) for task in tasks),
+            key=lambda task: task.created_at,
+            reverse=True,
+        )
+
+    async def collect_background_task(
+        self,
+        session_id: str,
+        task_id: str,
+    ) -> BackgroundTaskState:
+        """Append a finished background task result to the session transcript."""
+        task = self._background_tasks.get(task_id)
+        if task is None or task.session_id != session_id:
+            raise ValueError(f"background task not found: {task_id}")
+        if task.status == "running":
+            raise ValueError(f"background task still running: {task_id}")
+        if not task.collected:
+            await self._session_store.append_messages(
+                session_id,
+                [
+                    SessionMessage(
+                        role="assistant",
+                        content=_render_background_result(task),
+                    )
+                ],
+            )
+            task.collected = True
+            task.updated_at = _now()
+        return _copy_background_task(task)
+
+    async def cancel_background_task(
+        self,
+        session_id: str,
+        task_id: str,
+    ) -> BackgroundTaskState:
+        """Cancel a running process-local background task."""
+        task = self._background_tasks.get(task_id)
+        if task is None or task.session_id != session_id:
+            raise ValueError(f"background task not found: {task_id}")
+        handle = self._background_handles.get(task_id)
+        if task.status == "running" and handle is not None and not handle.done():
+            handle.cancel()
+            task.status = "cancelled"
+            task.error = "cancelled by user"
+            task.updated_at = _now()
+        return _copy_background_task(task)
 
     def available_models(self) -> list[str]:
         """Return model names available for session-scoped switching."""
@@ -954,180 +1075,186 @@ class PersistentAgent:
         """
         state = await self._session_store.load(session_id)
         self._apply_model_overrides(state)
+        active_session_token = self._active_session_id.set(session_id)
         run_id = run_id or str(uuid.uuid4())
-        memory_context_text = await self._get_session_memory_context(session_id, message=message)
-        prior_messages, pinned_priors = self._build_prior_messages(
-            state, memory_context_text=memory_context_text
-        )
-        turn_guard = None
-        if self._guard_factory is not None:
-            turn_guard = self._guard_factory()
-            self._assign_guard(turn_guard)
-        else:
-            turn_guard = getattr(self._coordinator, "_guard", None)
-        usage_before = _guard_token_totals(turn_guard)
+        try:
+            memory_context_text = await self._get_session_memory_context(
+                session_id, message=message
+            )
+            prior_messages, pinned_priors = self._build_prior_messages(
+                state, memory_context_text=memory_context_text
+            )
+            turn_guard = None
+            if self._guard_factory is not None:
+                turn_guard = self._guard_factory()
+                self._assign_guard(turn_guard)
+            else:
+                turn_guard = getattr(self._coordinator, "_guard", None)
+            usage_before = _guard_token_totals(turn_guard)
 
-        # Plan-mode gate. Inserts a pinned plan prior into the priors list
-        # before the ReAct loop runs; or yields ERROR and returns if the
-        # user rejected the plan. Plan generation + HITL approval both
-        # propagate ``asyncio.CancelledError`` (Esc-cancel) cleanly without
-        # writing to the session store.
-        if state.plan_mode_enabled:
-            # Inline the plan-and-approve loop so PLAN_PROPOSED events
-            # yield to the consumer (renderer) BEFORE the approval
-            # banner blocks on stdin. Yielding directly preserves the
-            # order: plan first, then banner, then user input.
-            #
-            # Uses ``request_plan_approval`` (sibling of the per-tool
-            # ``request_approval``) — same input plumbing, but no
-            # ``a`` / ``A`` options. Session-allow / persistent-allow
-            # make sense when the "tool" is something like
-            # ``shell/grep`` that fires repeatedly; they're actively
-            # wrong when the gate is the plan itself (``a`` would
-            # silently turn plan mode off for the session).
-            from harness.hitl import request_plan_approval  # noqa: PLC0415
+            # Plan-mode gate. Inserts a pinned plan prior into the priors list
+            # before the ReAct loop runs; or yields ERROR and returns if the
+            # user rejected the plan. Plan generation + HITL approval both
+            # propagate ``asyncio.CancelledError`` (Esc-cancel) cleanly without
+            # writing to the session store.
+            if state.plan_mode_enabled:
+                # Inline the plan-and-approve loop so PLAN_PROPOSED events
+                # yield to the consumer (renderer) BEFORE the approval
+                # banner blocks on stdin. Yielding directly preserves the
+                # order: plan first, then banner, then user input.
+                #
+                # Uses ``request_plan_approval`` (sibling of the per-tool
+                # ``request_approval``) — same input plumbing, but no
+                # ``a`` / ``A`` options. Session-allow / persistent-allow
+                # make sense when the "tool" is something like
+                # ``shell/grep`` that fires repeatedly; they're actively
+                # wrong when the gate is the plan itself (``a`` would
+                # silently turn plan mode off for the session).
+                from harness.hitl import request_plan_approval  # noqa: PLC0415
 
-            approved_plan: dict[str, Any] | None = None
-            plan_rejected = False
-            correction: str | None = None
+                approved_plan: dict[str, Any] | None = None
+                plan_rejected = False
+                correction: str | None = None
 
-            for revision in range(_PLAN_REVISION_LIMIT + 1):
-                try:
-                    candidate_plan = await self._generate_plan(
-                        message=message,
-                        session_id=session_id,
-                        correction=correction,
+                for revision in range(_PLAN_REVISION_LIMIT + 1):
+                    try:
+                        candidate_plan = await self._generate_plan(
+                            message=message,
+                            session_id=session_id,
+                            correction=correction,
+                        )
+                    except Exception as exc:  # noqa: BLE001 — surface as ERROR
+                        yield BusEvent(
+                            type=EventType.ERROR,
+                            agent_id=self._coordinator.config.agent_id,
+                            error=f"plan generation failed: {exc}",
+                        )
+                        plan_rejected = True
+                        break
+
+                    # Yield FIRST so the renderer prints the plan, then
+                    # block for approval so the user is responding to a
+                    # plan they've actually seen.
+                    yield BusEvent(
+                        type=EventType.PLAN_PROPOSED,
+                        agent_id=self._coordinator.config.agent_id,
+                        payload={"plan": candidate_plan, "revision": revision},
                     )
-                except Exception as exc:  # noqa: BLE001 — surface as ERROR
+
+                    response = await request_plan_approval(
+                        summary=candidate_plan.get("summary", ""),
+                        step_count=len(candidate_plan.get("steps", [])),
+                        dynamic_step_count=_dynamic_step_count(candidate_plan),
+                        agent_id=self._coordinator.config.agent_id,
+                        guard=turn_guard,
+                    )
+                    if response.approved:
+                        approved_plan = candidate_plan
+                        break
+                    if response.correction:
+                        # Free-text revision — re-plan with this feedback.
+                        correction = response.correction
+                        continue
+                    # Plain rejection (no correction text).
                     yield BusEvent(
                         type=EventType.ERROR,
                         agent_id=self._coordinator.config.agent_id,
-                        error=f"plan generation failed: {exc}",
+                        error="plan rejected by user",
                     )
                     plan_rejected = True
                     break
-
-                # Yield FIRST so the renderer prints the plan, then
-                # block for approval so the user is responding to a
-                # plan they've actually seen.
-                yield BusEvent(
-                    type=EventType.PLAN_PROPOSED,
-                    agent_id=self._coordinator.config.agent_id,
-                    payload={"plan": candidate_plan, "revision": revision},
-                )
-
-                response = await request_plan_approval(
-                    summary=candidate_plan.get("summary", ""),
-                    step_count=len(candidate_plan.get("steps", [])),
-                    dynamic_step_count=_dynamic_step_count(candidate_plan),
-                    agent_id=self._coordinator.config.agent_id,
-                    guard=turn_guard,
-                )
-                if response.approved:
-                    approved_plan = candidate_plan
-                    break
-                if response.correction:
-                    # Free-text revision — re-plan with this feedback.
-                    correction = response.correction
-                    continue
-                # Plain rejection (no correction text).
-                yield BusEvent(
-                    type=EventType.ERROR,
-                    agent_id=self._coordinator.config.agent_id,
-                    error="plan rejected by user",
-                )
-                plan_rejected = True
-                break
-            else:
-                # Revision budget exhausted — give the user a clean
-                # rejection rather than silently executing the last plan.
-                yield BusEvent(
-                    type=EventType.ERROR,
-                    agent_id=self._coordinator.config.agent_id,
-                    error=(
-                        f"plan revision limit ({_PLAN_REVISION_LIMIT}) reached; "
-                        "send 'y' to approve, 'n' to reject, or shorten the feedback"
-                    ),
-                )
-                plan_rejected = True
-
-            if plan_rejected:
-                return
-            if approved_plan is not None:
-                # Inject as a pinned prior so the ReAct loop's system
-                # prompt + memory prior stays byte-identical across the
-                # turn, and the plan rides as a user/assistant pair the
-                # coordinator clearly sees as "approved guidance."
-                plan_priors = [
-                    ("user", _render_plan_for_priors(approved_plan)),
-                    ("assistant", "Acknowledged. Executing the approved plan."),
-                ]
-                prior_messages = list(prior_messages) + plan_priors
-                pinned_priors += len(plan_priors)
-
-        final_result: dict | None = None
-        trace: list[dict[str, Any]] = []
-        tools_used: set[str] = set()
-        subagents_used: set[str] = set()
-        errors: list[str] = []
-        finalized = False
-
-        restore_hitl_context = self._disable_checkpoint_resume_for_persistent_hitl()
-        try:
-            async for event in self._coordinator.run_stream(
-                message,
-                run_id=run_id,
-                prior_messages=prior_messages,
-                pinned_priors=pinned_priors,
-                # Skip the live ``build_context`` inside ``_build_system_prompt``
-                # — memory is in a pinned prior instead, cached per session and
-                # refreshed only at compaction. Keeps the system prompt
-                # byte-identical across turns so the prefix cache holds.
-                precomputed_memory_context="_skip_",
-            ):
-                trace.append(_event_to_trace(event))
-                if event.type == EventType.ACTION:
-                    tool = event.payload.get("tool")
-                    if tool:
-                        tools_used.add(str(tool))
-                elif event.type == EventType.TASK_DONE and not event.parent_agent_id:
-                    final_result = event.payload
-                elif event.type == EventType.ERROR:
-                    errors.append(event.error)
-                if event.parent_agent_id:
-                    subagents_used.add(event.agent_id)
-                if not event.parent_agent_id and event.type in (
-                    EventType.TASK_DONE,
-                    EventType.ERROR,
-                ):
-                    await self._finalize_turn(
-                        session_id=session_id,
-                        message=message,
-                        final_result=final_result,
-                        trace=trace,
-                        tools_used=tools_used,
-                        subagents_used=subagents_used,
-                        errors=errors,
-                        usage_guard=turn_guard,
-                        usage_before=usage_before,
+                else:
+                    # Revision budget exhausted — give the user a clean
+                    # rejection rather than silently executing the last plan.
+                    yield BusEvent(
+                        type=EventType.ERROR,
+                        agent_id=self._coordinator.config.agent_id,
+                        error=(
+                            f"plan revision limit ({_PLAN_REVISION_LIMIT}) reached; "
+                            "send 'y' to approve, 'n' to reject, or shorten the feedback"
+                        ),
                     )
-                    finalized = True
-                yield event
-        finally:
-            restore_hitl_context()
+                    plan_rejected = True
 
-        if not finalized:
-            await self._finalize_turn(
-                session_id=session_id,
-                message=message,
-                final_result=final_result,
-                trace=trace,
-                tools_used=tools_used,
-                subagents_used=subagents_used,
-                errors=errors,
-                usage_guard=turn_guard,
-                usage_before=usage_before,
-            )
+                if plan_rejected:
+                    return
+                if approved_plan is not None:
+                    # Inject as a pinned prior so the ReAct loop's system
+                    # prompt + memory prior stays byte-identical across the
+                    # turn, and the plan rides as a user/assistant pair the
+                    # coordinator clearly sees as "approved guidance."
+                    plan_priors = [
+                        ("user", _render_plan_for_priors(approved_plan)),
+                        ("assistant", "Acknowledged. Executing the approved plan."),
+                    ]
+                    prior_messages = list(prior_messages) + plan_priors
+                    pinned_priors += len(plan_priors)
+
+            final_result: dict | None = None
+            trace: list[dict[str, Any]] = []
+            tools_used: set[str] = set()
+            subagents_used: set[str] = set()
+            errors: list[str] = []
+            finalized = False
+
+            restore_hitl_context = self._disable_checkpoint_resume_for_persistent_hitl()
+            try:
+                async for event in self._coordinator.run_stream(
+                    message,
+                    run_id=run_id,
+                    prior_messages=prior_messages,
+                    pinned_priors=pinned_priors,
+                    # Skip the live ``build_context`` inside ``_build_system_prompt``
+                    # — memory is in a pinned prior instead, cached per session and
+                    # refreshed only at compaction. Keeps the system prompt
+                    # byte-identical across turns so the prefix cache holds.
+                    precomputed_memory_context="_skip_",
+                ):
+                    trace.append(_event_to_trace(event))
+                    if event.type == EventType.ACTION:
+                        tool = event.payload.get("tool")
+                        if tool:
+                            tools_used.add(str(tool))
+                    elif event.type == EventType.TASK_DONE and not event.parent_agent_id:
+                        final_result = event.payload
+                    elif event.type == EventType.ERROR:
+                        errors.append(event.error)
+                    if event.parent_agent_id:
+                        subagents_used.add(event.agent_id)
+                    if not event.parent_agent_id and event.type in (
+                        EventType.TASK_DONE,
+                        EventType.ERROR,
+                    ):
+                        await self._finalize_turn(
+                            session_id=session_id,
+                            message=message,
+                            final_result=final_result,
+                            trace=trace,
+                            tools_used=tools_used,
+                            subagents_used=subagents_used,
+                            errors=errors,
+                            usage_guard=turn_guard,
+                            usage_before=usage_before,
+                        )
+                        finalized = True
+                    yield event
+            finally:
+                restore_hitl_context()
+
+            if not finalized:
+                await self._finalize_turn(
+                    session_id=session_id,
+                    message=message,
+                    final_result=final_result,
+                    trace=trace,
+                    tools_used=tools_used,
+                    subagents_used=subagents_used,
+                    errors=errors,
+                    usage_guard=turn_guard,
+                    usage_before=usage_before,
+                )
+        finally:
+            self._active_session_id.reset(active_session_token)
 
     async def _generate_plan(
         self,
@@ -1334,6 +1461,42 @@ class PersistentAgent:
         visit(self._coordinator)
         return agents
 
+    def _install_background_tools(self) -> None:
+        tools = getattr(self._coordinator, "_tools", {})
+        if not isinstance(tools, dict):
+            return
+        session_id_provider = self._active_session_id.get
+        background_tools: dict[str, Any] = {}
+        for tool in list(tools.values()):
+            sub = _subagent_tool_agent(tool)
+            if sub is None:
+                continue
+            background = BackgroundDelegateTool(
+                agent_id=sub.config.agent_id,
+                start_task=self.start_background_subagent,
+                session_id_provider=session_id_provider,
+            )
+            background_tools.setdefault(background.name, background)
+        if background_tools:
+            background_tools.setdefault(
+                CheckBackgroundTaskTool.name,
+                CheckBackgroundTaskTool(
+                    list_tasks=self.list_background_tasks,
+                    session_id_provider=session_id_provider,
+                ),
+            )
+            background_tools.setdefault(
+                CollectBackgroundTaskTool.name,
+                CollectBackgroundTaskTool(
+                    collect_task=self.collect_background_task,
+                    session_id_provider=session_id_provider,
+                ),
+            )
+        for name, tool in background_tools.items():
+            tools.setdefault(name, tool)
+            if name not in self._coordinator.config.allowed_tools:
+                self._coordinator.config.allowed_tools.append(name)
+
     def _find_agent(self, agent_id: str) -> BaseAgent | None:
         for agent in self._iter_agents():
             if agent.config.agent_id == agent_id:
@@ -1361,6 +1524,41 @@ class PersistentAgent:
                 agent._hitl_resume_hint = resume_hint
 
         return restore
+
+    async def _run_background_subagent(
+        self,
+        task: BackgroundTaskState,
+        agent: BaseAgent,
+    ) -> None:
+        last_done: dict[str, Any] | None = None
+        last_error = ""
+        try:
+            async for event in agent.run_stream(
+                task=task.instruction,
+                run_id=task.task_id,
+            ):
+                if event.type == EventType.TASK_DONE:
+                    last_done = event.payload
+                elif event.type == EventType.ERROR:
+                    last_error = event.error
+        except asyncio.CancelledError:
+            task.status = "cancelled"
+            task.error = "cancelled by user"
+            raise
+        except Exception as exc:  # noqa: BLE001 — store for /tasks
+            task.status = "failed"
+            task.error = f"{type(exc).__name__}: {exc}"
+        else:
+            if last_done is not None:
+                task.status = "done"
+                task.answer = str(last_done.get("answer", ""))
+                task.confidence = float(last_done.get("confidence", 0.0) or 0.0)
+                task.steps = int(last_done.get("steps", 0) or 0)
+            else:
+                task.status = "failed"
+                task.error = last_error or "sub-agent stream ended without TASK_DONE"
+        finally:
+            task.updated_at = _now()
 
     def _make_registered_llm(self, model_name: str) -> Any:
         llm = self._llm_instances.get(model_name)
@@ -1876,6 +2074,30 @@ def _copy_state(state: SessionState) -> SessionState:
         plan_mode_enabled=state.plan_mode_enabled,
         updated_at=state.updated_at,
     )
+
+
+def _copy_background_task(task: BackgroundTaskState) -> BackgroundTaskState:
+    return BackgroundTaskState(
+        task_id=task.task_id,
+        session_id=task.session_id,
+        agent_id=task.agent_id,
+        instruction=task.instruction,
+        status=task.status,
+        answer=task.answer,
+        confidence=task.confidence,
+        steps=task.steps,
+        error=task.error,
+        collected=task.collected,
+        created_at=task.created_at,
+        updated_at=task.updated_at,
+    )
+
+
+def _render_background_result(task: BackgroundTaskState) -> str:
+    header = f"[Background task {task.task_id}] {task.agent_id} {task.status}: {task.instruction}"
+    if task.status == "done":
+        return f"{header}\n\n{task.answer}\n\nconfidence={task.confidence:.2f} steps={task.steps}"
+    return f"{header}\n\nerror: {task.error or task.status}"
 
 
 def _event_to_trace(event: BusEvent) -> dict[str, Any]:

@@ -40,6 +40,8 @@ class SlashCommandSpec:
     - ``"query"`` — one optional free-text token (e.g. ``/sessions [query]``)
     - ``"plan_toggle"`` — one optional ``on`` / ``off`` literal (e.g. ``/plan``)
     - ``"model_switch"`` — agent id plus model name/default (e.g. ``/model researcher gpt-5``)
+    - ``"background_task"`` — agent id plus free-text task (e.g. ``/background researcher find news``)
+    - ``"task_control"`` — optional collect/cancel action (e.g. ``/tasks collect all``)
     """
 
     name: str
@@ -76,6 +78,13 @@ SLASH_COMMAND_SPECS: tuple[SlashCommandSpec, ...] = (
     ),
     SlashCommandSpec("/models", "List switchable models", category="Inspect"),
     SlashCommandSpec(
+        "/tasks",
+        "List or collect background sub-agent tasks",
+        category="Inspect",
+        arg_hint="[collect|cancel] [id|all]",
+        arg_kind="task_control",
+    ),
+    SlashCommandSpec(
         "/model",
         "Show or switch a session-scoped agent model",
         category="Session",
@@ -110,6 +119,14 @@ SLASH_COMMAND_SPECS: tuple[SlashCommandSpec, ...] = (
         category="Memory",
         arg_hint="[on|off]",
         arg_kind="plan_toggle",
+    ),
+    SlashCommandSpec(
+        "/background",
+        "Launch a sub-agent task without blocking the session",
+        category="Session",
+        arg_hint="<agent_id> <task>",
+        arg_kind="background_task",
+        aliases=("/bg",),
     ),
     SlashCommandSpec(
         "/switch",
@@ -184,12 +201,14 @@ class PersistentCommandHandler:
             "/memory": self._cmd_memory,
             "/usage": self._cmd_usage,
             "/models": self._cmd_models,
+            "/tasks": self._cmd_tasks,
             "/model": self._cmd_model,
             "/sessions": self._cmd_sessions,
             "/save": self._cmd_save,
             "/compact": self._cmd_compact,
             "/forget": self._cmd_forget,
             "/plan": self._cmd_plan,
+            "/background": self._cmd_background,
             "/switch": self._cmd_switch,
             "/new": self._cmd_new,
             "/clear": self._cmd_clear,
@@ -257,6 +276,61 @@ class PersistentCommandHandler:
         self, *, message: str, command: str, session_id: str
     ) -> PersistentCommandResult:
         return self._result(session_id, _format_models(self._app))
+
+    async def _cmd_tasks(
+        self, *, message: str, command: str, session_id: str
+    ) -> PersistentCommandResult:
+        parts = message[len(command) :].strip().split()
+        if not parts:
+            return self._result(session_id, await _format_background_tasks(self._app, session_id))
+        if len(parts) != 2 or parts[0] not in {"collect", "cancel"}:
+            return self._result(session_id, "usage: /tasks [collect|cancel] [task_id|all]")
+        action, target = parts
+        try:
+            if target == "all":
+                tasks = await self._app.list_background_tasks(session_id)
+                if action == "collect":
+                    selected = [
+                        task for task in tasks if task.status != "running" and not task.collected
+                    ]
+                    for task in selected:
+                        await self._app.collect_background_task(session_id, task.task_id)
+                    return self._result(
+                        session_id,
+                        f"collected {len(selected)} background task result(s)",
+                    )
+                selected = [task for task in tasks if task.status == "running"]
+                for task in selected:
+                    await self._app.cancel_background_task(session_id, task.task_id)
+                return self._result(session_id, f"cancelled {len(selected)} background task(s)")
+            if action == "collect":
+                task = await self._app.collect_background_task(session_id, target)
+                return self._result(session_id, f"collected background task {task.task_id}")
+            task = await self._app.cancel_background_task(session_id, target)
+            return self._result(session_id, f"cancelled background task {task.task_id}")
+        except ValueError as exc:
+            return self._result(session_id, f"cannot {action} background task: {exc}")
+
+    async def _cmd_background(
+        self, *, message: str, command: str, session_id: str
+    ) -> PersistentCommandResult:
+        raw = message[len(command) :].strip()
+        parts = raw.split(maxsplit=1)
+        if len(parts) != 2:
+            return self._result(session_id, "usage: /background <agent_id> <task>")
+        agent_id, instruction = parts
+        try:
+            task = await self._app.start_background_subagent(
+                session_id,
+                agent_id,
+                instruction,
+            )
+        except ValueError as exc:
+            return self._result(session_id, f"cannot start background task: {exc}")
+        return self._result(
+            session_id,
+            f"started background task {task.task_id}: {task.agent_id}",
+        )
 
     async def _cmd_model(
         self, *, message: str, command: str, session_id: str
@@ -456,6 +530,11 @@ class PersistentCommandHandler:
             if state.model_overrides
             else "(none)"
         )
+        background_tasks = await self._app.list_background_tasks(session_id)
+        running_background = sum(1 for task in background_tasks if task.status == "running")
+        pending_background = sum(
+            1 for task in background_tasks if task.status != "running" and not task.collected
+        )
         return "\n".join(
             [
                 f"session_id: {state.session_id}",
@@ -464,6 +543,7 @@ class PersistentCommandHandler:
                 f"usage total: in={state.tokens_in_total:,} out={state.tokens_out_total:,}",
                 f"last run: in={state.last_run_tokens_in:,} out={state.last_run_tokens_out:,}",
                 f"model overrides: {model_line}",
+                f"background tasks: running={running_background} pending={pending_background}",
                 f"last reconcile turn: {state.last_reconcile_turn or 'never'}",
                 f"next async reconcile: {reconcile}",
                 f"last compaction turn: {state.last_compact_turn or 'never'}",
@@ -651,6 +731,28 @@ async def _format_sessions(
             f"{marker} {state.session_id}  turns={state.turn_count}  updated={state.updated_at}"
         )
         lines.append(f"    {summary}")
+    return "\n".join(lines)
+
+
+async def _format_background_tasks(app: PersistentAgent, session_id: str) -> str:
+    tasks = await app.list_background_tasks(session_id)
+    if not tasks:
+        return "no background tasks for this session"
+    lines = ["background tasks:"]
+    for task in tasks:
+        marker = "*" if task.status == "running" else " "
+        collected = " collected" if task.collected else ""
+        if task.status == "done":
+            detail = f"confidence={task.confidence:.2f} steps={task.steps}"
+        elif task.status == "running":
+            detail = "running"
+        else:
+            detail = task.error or task.status
+        lines.append(
+            f"{marker} {task.task_id}  {task.agent_id:<16} {task.status:<9} {detail}{collected}"
+        )
+        lines.append(f"    {task.instruction}")
+    lines.append("use /tasks collect <task_id|all> to append completed results")
     return "\n".join(lines)
 
 

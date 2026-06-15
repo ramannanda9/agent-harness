@@ -761,7 +761,7 @@ from harness.persistent_completion import SlashCommandCompleter
 
 session = PromptSession(
     history=FileHistory("~/.agent-harness/demo_history"),
-    completer=SlashCommandCompleter(app),
+    completer=SlashCommandCompleter(app, session_id_provider=lambda: session_id),
     complete_while_typing=False,  # Tab-triggered; doesn't query the store every keystroke
 )
 message = (await session.prompt_async("> ")).strip()
@@ -780,6 +780,8 @@ The demo uses that utility for:
 - `/usage` shows persisted total and last-run provider-reported token usage
 - `/models` lists switchable model names when an LLM registry is configured
 - `/model [agent_id] [model|default]` shows or changes a session-scoped model override
+- `/background <agent_id> <task>` launches a sub-agent task in the background for the current process
+- `/tasks [collect|cancel] [id|all]` lists background tasks, appends completed results to the transcript, or cancels running work
 - `/sessions [query]` lists known session ids, optionally filtered by id text
 - `/memory` shows the cached per-session memory context
 - `/save` flushes turns after the last reconcile checkpoint into long-term memory **without** evicting the cached prior (foreground prefix stays warm)
@@ -791,6 +793,22 @@ The demo uses that utility for:
 - `/clear` clears the current transcript/summary/counters; long-term memory is retained
 - `/delete [id] confirm` deletes a transcript row; long-term memory is retained
 - `/end` exits the demo — no auto-flush; call `/save` first if you want pending facts persisted
+
+Background sub-agent tasks are process-local. They keep running while the
+REPL/server process is alive; completed results become durable only when
+collected into the session transcript with `/tasks collect <id|all>`. Avoid
+launching overlapping work against the same sub-agent instance unless that
+agent's tools and LLM adapter are safe for concurrent use.
+
+When a `PersistentAgent` coordinator is wired with `SubAgentTool`s, it also
+gets LLM-visible background tools automatically:
+
+- `background_delegate_<agent_id>(task)` starts that sub-agent and returns a `task_id`
+- `check_background_task(task_id)` reports status and any available result preview
+- `collect_background_task(task_id)` returns the completed answer to the coordinator and appends it to the transcript
+
+The regular `delegate_<agent_id>` tools remain blocking; background delegation
+uses separate tool names so the model's intent is explicit in traces.
 
 **Plan mode** (`/plan on`, or **Shift-Tab** at the prompt) gates each turn behind an approval step. The
 coordinator's LLM produces a structured plan (`{summary, steps[]}`) before
