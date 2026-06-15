@@ -199,10 +199,21 @@ class AnthropicLLM:
             request["system"] = sys_blocks
 
         async with self._client.messages.stream(**request) as stream:
+            yielded = False
             async for text in stream.text_stream:
+                yielded = True
                 yield text
 
             final = await stream.get_final_message()
+            # Bedrock (AnthropicBedrock client) sometimes delivers the full
+            # response as a single content_block_start rather than incremental
+            # text_delta events, so text_stream yields nothing. Recover the
+            # text from the final message so callers never see an empty stream.
+            if not yielded:
+                for block in final.content:
+                    if hasattr(block, "text") and block.text:
+                        yield block.text
+
             usage = _extract_usage(final.usage, final.model or self._model)
             cost = _compute_cost(usage, self._cost_fn)
             if cost is not None:

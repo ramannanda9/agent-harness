@@ -386,6 +386,26 @@ async def test_cost_fn_exception_swallowed(monkeypatch):
     assert out["text"] == "ok"
 
 
+async def test_stream_complete_falls_back_to_final_message_when_text_stream_empty(monkeypatch):
+    """Bedrock compatibility: text_stream yields nothing but final message has content."""
+    llm, messages = _build(monkeypatch)
+    messages.next_stream_tokens = []  # simulate Bedrock empty text_stream
+    messages.next_stream_final = _FakeMessage(
+        [_FakeContentBlock('{"thought": "ok", "action": "finish"}')],
+        usage=_FakeUsage(input_tokens=10, output_tokens=5),
+    )
+
+    tokens = [
+        t
+        async for t in llm.stream_complete(
+            system=None, messages=[{"role": "user", "content": "hi"}]
+        )
+    ]
+
+    assert tokens == ['{"thought": "ok", "action": "finish"}']
+    assert llm.last_usage["tokens_in"] == 10
+
+
 async def test_set_budget_routes_cost_to_guard(monkeypatch):
     from harness.runtime import BudgetGuard, GuardrailConfig
 
