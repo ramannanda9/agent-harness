@@ -355,6 +355,64 @@ async def test_stream_complete_caching_disabled(monkeypatch):
     assert "cache_control" not in call["system"][0]
 
 
+async def test_json_prefill_prepended_on_stream_complete(monkeypatch):
+    """response_format=json_object injects assistant prefill and prepends { to output."""
+    llm, messages = _build(monkeypatch)
+    messages.next_stream_tokens = ['"thought": "ok"}']
+    messages.next_stream_final = _FakeMessage([], usage=_FakeUsage())
+
+    tokens = [
+        t
+        async for t in llm.stream_complete(
+            system=None,
+            messages=[{"role": "user", "content": "hi"}],
+            response_format={"type": "json_object"},
+        )
+    ]
+
+    assert tokens[0] == "{"
+    assert "".join(tokens) == '{"thought": "ok"}'
+    call = messages.calls[0]
+    assert call["messages"][-1] == {"role": "assistant", "content": [{"type": "text", "text": "{"}]}
+
+
+async def test_json_prefill_prepended_on_complete(monkeypatch):
+    """response_format=json_object injects assistant prefill and prepends { to text."""
+    llm, messages = _build(monkeypatch)
+    messages.next_response = _FakeMessage(
+        [_FakeContentBlock('"thought": "ok"}')],
+        usage=_FakeUsage(),
+    )
+
+    out = await llm.complete(
+        system=None,
+        messages=[{"role": "user", "content": "hi"}],
+        response_format={"type": "json_object"},
+    )
+
+    assert out["text"] == '{"thought": "ok"}'
+    call = messages.calls[0]
+    assert call["messages"][-1] == {"role": "assistant", "content": [{"type": "text", "text": "{"}]}
+
+
+async def test_no_prefill_without_json_mode(monkeypatch):
+    """Without response_format, no assistant prefill is injected."""
+    llm, messages = _build(monkeypatch)
+    messages.next_stream_tokens = ["hello"]
+    messages.next_stream_final = _FakeMessage([], usage=_FakeUsage())
+
+    tokens = [
+        t
+        async for t in llm.stream_complete(
+            system=None, messages=[{"role": "user", "content": "hi"}]
+        )
+    ]
+
+    assert tokens == ["hello"]
+    call = messages.calls[0]
+    assert call["messages"][-1]["role"] == "user"
+
+
 # ── cost_fn and BudgetGuard ───────────────────────────────────────────────────
 
 

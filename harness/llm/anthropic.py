@@ -90,6 +90,13 @@ def _lookup_anthropic_context_window(model: str) -> int:
     return _ANTHROPIC_CONTEXT_WINDOW_FALLBACK
 
 
+# Anthropic doesn't support response_format="json_object". The native equivalent
+# is an assistant prefill: the model continues from the supplied partial assistant
+# turn, guaranteeing the response starts with `{`. The caller prepends `{` back
+# onto the collected text before parsing.
+_JSON_PREFILL_MSG: dict = {"role": "assistant", "content": [{"type": "text", "text": "{"}]}
+
+
 class AnthropicLLM:
     def __init__(
         self,
@@ -151,8 +158,11 @@ class AnthropicLLM:
         **kwargs: Any,
     ) -> dict:
         max_tokens = int(kwargs.pop("max_tokens", self._max_tokens))
+        json_mode = kwargs.get("response_format", {}).get("type") == "json_object"
         sys_blocks = _system_blocks(system, prompt_caching=self._prompt_caching)
         built_messages = _build_messages(messages, prompt_caching=self._prompt_caching)
+        if json_mode:
+            built_messages = [*built_messages, _JSON_PREFILL_MSG]
 
         request: dict[str, Any] = {
             "model": self._model,
@@ -171,6 +181,8 @@ class AnthropicLLM:
         self.last_usage = usage
 
         text = _collect_text(resp.content)
+        if json_mode:
+            text = "{" + text
         return {"text": text, "usage": usage}
 
     # ── Streaming ──────────────────────────────────────────────────────────────
@@ -181,14 +193,13 @@ class AnthropicLLM:
         messages: list[dict],
         *,
         source: str | None = None,
-        **_kwargs: Any,
+        **kwargs: Any,
     ) -> AsyncGenerator[str, None]:
-        # ``_kwargs`` swallows OpenAI-style hints like ``response_format`` —
-        # Anthropic doesn't expose an equivalent (structure is enforced via
-        # prefill or system prompt). Accept and ignore so a caller wiring
-        # the same ReAct prompt at both adapters doesn't crash here.
+        json_mode = kwargs.get("response_format", {}).get("type") == "json_object"
         sys_blocks = _system_blocks(system, prompt_caching=self._prompt_caching)
         built_messages = _build_messages(messages, prompt_caching=self._prompt_caching)
+        if json_mode:
+            built_messages = [*built_messages, _JSON_PREFILL_MSG]
 
         request: dict[str, Any] = {
             "model": self._model,
@@ -199,6 +210,8 @@ class AnthropicLLM:
             request["system"] = sys_blocks
 
         async with self._client.messages.stream(**request) as stream:
+            if json_mode:
+                yield "{"
             yielded = False
             async for text in stream.text_stream:
                 yielded = True
