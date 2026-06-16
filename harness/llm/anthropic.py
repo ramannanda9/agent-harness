@@ -90,11 +90,30 @@ def _lookup_anthropic_context_window(model: str) -> int:
     return _ANTHROPIC_CONTEXT_WINDOW_FALLBACK
 
 
-# Anthropic doesn't support response_format="json_object". The native equivalent
-# is an assistant prefill: the model continues from the supplied partial assistant
-# turn, guaranteeing the response starts with `{`. The caller prepends `{` back
-# onto the collected text before parsing.
-_JSON_PREFILL_MSG: dict = {"role": "assistant", "content": [{"type": "text", "text": "{"}]}
+_JSON_REMINDER = "Respond with a JSON object only."
+
+
+def _append_json_reminder(messages: list[dict]) -> list[dict]:
+    """Append a JSON reminder to the last user message's text content.
+
+    Anthropic has no response_format='json_object' equivalent. Appending a
+    brief instruction to the last user message re-anchors the model to JSON
+    output after markdown-rich observations, without assistant prefill (which
+    Bedrock rejects).
+    """
+    for i in range(len(messages) - 1, -1, -1):
+        msg = messages[i]
+        if msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        if isinstance(content, list) and content and content[-1].get("type") == "text":
+            updated = [
+                *content[:-1],
+                {**content[-1], "text": content[-1]["text"] + f"\n{_JSON_REMINDER}"},
+            ]
+            return [*messages[:i], {**msg, "content": updated}, *messages[i + 1 :]]
+        break
+    return messages
 
 
 class AnthropicLLM:
@@ -162,7 +181,7 @@ class AnthropicLLM:
         sys_blocks = _system_blocks(system, prompt_caching=self._prompt_caching)
         built_messages = _build_messages(messages, prompt_caching=self._prompt_caching)
         if json_mode:
-            built_messages = [*built_messages, _JSON_PREFILL_MSG]
+            built_messages = _append_json_reminder(built_messages)
 
         request: dict[str, Any] = {
             "model": self._model,
@@ -181,8 +200,6 @@ class AnthropicLLM:
         self.last_usage = usage
 
         text = _collect_text(resp.content)
-        if json_mode:
-            text = "{" + text
         return {"text": text, "usage": usage}
 
     # ── Streaming ──────────────────────────────────────────────────────────────
@@ -199,7 +216,7 @@ class AnthropicLLM:
         sys_blocks = _system_blocks(system, prompt_caching=self._prompt_caching)
         built_messages = _build_messages(messages, prompt_caching=self._prompt_caching)
         if json_mode:
-            built_messages = [*built_messages, _JSON_PREFILL_MSG]
+            built_messages = _append_json_reminder(built_messages)
 
         request: dict[str, Any] = {
             "model": self._model,
@@ -210,8 +227,6 @@ class AnthropicLLM:
             request["system"] = sys_blocks
 
         async with self._client.messages.stream(**request) as stream:
-            if json_mode:
-                yield "{"
             yielded = False
             async for text in stream.text_stream:
                 yielded = True

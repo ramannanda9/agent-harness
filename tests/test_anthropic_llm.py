@@ -355,10 +355,10 @@ async def test_stream_complete_caching_disabled(monkeypatch):
     assert "cache_control" not in call["system"][0]
 
 
-async def test_json_prefill_prepended_on_stream_complete(monkeypatch):
-    """response_format=json_object injects assistant prefill and prepends { to output."""
+async def test_json_reminder_appended_on_stream_complete(monkeypatch):
+    """response_format=json_object appends JSON reminder to last user message."""
     llm, messages = _build(monkeypatch)
-    messages.next_stream_tokens = ['"thought": "ok"}']
+    messages.next_stream_tokens = ['{"thought": "ok"}']
     messages.next_stream_final = _FakeMessage([], usage=_FakeUsage())
 
     tokens = [
@@ -370,17 +370,18 @@ async def test_json_prefill_prepended_on_stream_complete(monkeypatch):
         )
     ]
 
-    assert tokens[0] == "{"
     assert "".join(tokens) == '{"thought": "ok"}'
     call = messages.calls[0]
-    assert call["messages"][-1] == {"role": "assistant", "content": [{"type": "text", "text": "{"}]}
+    last_msg = call["messages"][-1]
+    assert last_msg["role"] == "user"
+    assert "Respond with a JSON object only." in last_msg["content"][-1]["text"]
 
 
-async def test_json_prefill_prepended_on_complete(monkeypatch):
-    """response_format=json_object injects assistant prefill and prepends { to text."""
+async def test_json_reminder_appended_on_complete(monkeypatch):
+    """response_format=json_object appends JSON reminder to last user message."""
     llm, messages = _build(monkeypatch)
     messages.next_response = _FakeMessage(
-        [_FakeContentBlock('"thought": "ok"}')],
+        [_FakeContentBlock('{"thought": "ok"}')],
         usage=_FakeUsage(),
     )
 
@@ -392,11 +393,13 @@ async def test_json_prefill_prepended_on_complete(monkeypatch):
 
     assert out["text"] == '{"thought": "ok"}'
     call = messages.calls[0]
-    assert call["messages"][-1] == {"role": "assistant", "content": [{"type": "text", "text": "{"}]}
+    last_msg = call["messages"][-1]
+    assert last_msg["role"] == "user"
+    assert "Respond with a JSON object only." in last_msg["content"][-1]["text"]
 
 
-async def test_no_prefill_without_json_mode(monkeypatch):
-    """Without response_format, no assistant prefill is injected."""
+async def test_no_reminder_without_json_mode(monkeypatch):
+    """Without response_format, no JSON reminder is injected."""
     llm, messages = _build(monkeypatch)
     messages.next_stream_tokens = ["hello"]
     messages.next_stream_final = _FakeMessage([], usage=_FakeUsage())
@@ -410,7 +413,7 @@ async def test_no_prefill_without_json_mode(monkeypatch):
 
     assert tokens == ["hello"]
     call = messages.calls[0]
-    assert call["messages"][-1]["role"] == "user"
+    assert "Respond with a JSON object only." not in call["messages"][-1]["content"][-1]["text"]
 
 
 # ── cost_fn and BudgetGuard ───────────────────────────────────────────────────
