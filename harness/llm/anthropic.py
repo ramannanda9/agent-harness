@@ -90,6 +90,32 @@ def _lookup_anthropic_context_window(model: str) -> int:
     return _ANTHROPIC_CONTEXT_WINDOW_FALLBACK
 
 
+_JSON_REMINDER = "Respond with a JSON object only."
+
+
+def _append_json_reminder(messages: list[dict]) -> list[dict]:
+    """Append a JSON reminder to the last user message's text content.
+
+    Anthropic has no response_format='json_object' equivalent. Appending a
+    brief instruction to the last user message re-anchors the model to JSON
+    output after markdown-rich observations, without assistant prefill (which
+    Bedrock rejects).
+    """
+    for i in range(len(messages) - 1, -1, -1):
+        msg = messages[i]
+        if msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        if isinstance(content, list) and content and content[-1].get("type") == "text":
+            updated = [
+                *content[:-1],
+                {**content[-1], "text": content[-1]["text"] + f"\n{_JSON_REMINDER}"},
+            ]
+            return [*messages[:i], {**msg, "content": updated}, *messages[i + 1 :]]
+        break
+    return messages
+
+
 class AnthropicLLM:
     def __init__(
         self,
@@ -151,8 +177,11 @@ class AnthropicLLM:
         **kwargs: Any,
     ) -> dict:
         max_tokens = int(kwargs.pop("max_tokens", self._max_tokens))
+        json_mode = kwargs.get("response_format", {}).get("type") == "json_object"
         sys_blocks = _system_blocks(system, prompt_caching=self._prompt_caching)
         built_messages = _build_messages(messages, prompt_caching=self._prompt_caching)
+        if json_mode:
+            built_messages = _append_json_reminder(built_messages)
 
         request: dict[str, Any] = {
             "model": self._model,
@@ -181,14 +210,13 @@ class AnthropicLLM:
         messages: list[dict],
         *,
         source: str | None = None,
-        **_kwargs: Any,
+        **kwargs: Any,
     ) -> AsyncGenerator[str, None]:
-        # ``_kwargs`` swallows OpenAI-style hints like ``response_format`` —
-        # Anthropic doesn't expose an equivalent (structure is enforced via
-        # prefill or system prompt). Accept and ignore so a caller wiring
-        # the same ReAct prompt at both adapters doesn't crash here.
+        json_mode = kwargs.get("response_format", {}).get("type") == "json_object"
         sys_blocks = _system_blocks(system, prompt_caching=self._prompt_caching)
         built_messages = _build_messages(messages, prompt_caching=self._prompt_caching)
+        if json_mode:
+            built_messages = _append_json_reminder(built_messages)
 
         request: dict[str, Any] = {
             "model": self._model,
@@ -199,10 +227,21 @@ class AnthropicLLM:
             request["system"] = sys_blocks
 
         async with self._client.messages.stream(**request) as stream:
+            yielded = False
             async for text in stream.text_stream:
+                yielded = True
                 yield text
 
             final = await stream.get_final_message()
+            # Bedrock (AnthropicBedrock client) sometimes delivers the full
+            # response as a single content_block_start rather than incremental
+            # text_delta events, so text_stream yields nothing. Recover the
+            # text from the final message so callers never see an empty stream.
+            if not yielded:
+                text = _collect_text(final.content)
+                if text:
+                    yield text
+
             usage = _extract_usage(final.usage, final.model or self._model)
             cost = _compute_cost(usage, self._cost_fn)
             if cost is not None:

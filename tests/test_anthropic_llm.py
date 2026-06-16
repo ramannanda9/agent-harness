@@ -355,6 +355,67 @@ async def test_stream_complete_caching_disabled(monkeypatch):
     assert "cache_control" not in call["system"][0]
 
 
+async def test_json_reminder_appended_on_stream_complete(monkeypatch):
+    """response_format=json_object appends JSON reminder to last user message."""
+    llm, messages = _build(monkeypatch)
+    messages.next_stream_tokens = ['{"thought": "ok"}']
+    messages.next_stream_final = _FakeMessage([], usage=_FakeUsage())
+
+    tokens = [
+        t
+        async for t in llm.stream_complete(
+            system=None,
+            messages=[{"role": "user", "content": "hi"}],
+            response_format={"type": "json_object"},
+        )
+    ]
+
+    assert "".join(tokens) == '{"thought": "ok"}'
+    call = messages.calls[0]
+    last_msg = call["messages"][-1]
+    assert last_msg["role"] == "user"
+    assert "Respond with a JSON object only." in last_msg["content"][-1]["text"]
+
+
+async def test_json_reminder_appended_on_complete(monkeypatch):
+    """response_format=json_object appends JSON reminder to last user message."""
+    llm, messages = _build(monkeypatch)
+    messages.next_response = _FakeMessage(
+        [_FakeContentBlock('{"thought": "ok"}')],
+        usage=_FakeUsage(),
+    )
+
+    out = await llm.complete(
+        system=None,
+        messages=[{"role": "user", "content": "hi"}],
+        response_format={"type": "json_object"},
+    )
+
+    assert out["text"] == '{"thought": "ok"}'
+    call = messages.calls[0]
+    last_msg = call["messages"][-1]
+    assert last_msg["role"] == "user"
+    assert "Respond with a JSON object only." in last_msg["content"][-1]["text"]
+
+
+async def test_no_reminder_without_json_mode(monkeypatch):
+    """Without response_format, no JSON reminder is injected."""
+    llm, messages = _build(monkeypatch)
+    messages.next_stream_tokens = ["hello"]
+    messages.next_stream_final = _FakeMessage([], usage=_FakeUsage())
+
+    tokens = [
+        t
+        async for t in llm.stream_complete(
+            system=None, messages=[{"role": "user", "content": "hi"}]
+        )
+    ]
+
+    assert tokens == ["hello"]
+    call = messages.calls[0]
+    assert "Respond with a JSON object only." not in call["messages"][-1]["content"][-1]["text"]
+
+
 # ── cost_fn and BudgetGuard ───────────────────────────────────────────────────
 
 
@@ -384,6 +445,26 @@ async def test_cost_fn_exception_swallowed(monkeypatch):
     out = await llm.complete(system=None, messages=[{"role": "user", "content": "hi"}])
     assert "cost_usd" not in out["usage"]
     assert out["text"] == "ok"
+
+
+async def test_stream_complete_falls_back_to_final_message_when_text_stream_empty(monkeypatch):
+    """Bedrock compatibility: text_stream yields nothing but final message has content."""
+    llm, messages = _build(monkeypatch)
+    messages.next_stream_tokens = []  # simulate Bedrock empty text_stream
+    messages.next_stream_final = _FakeMessage(
+        [_FakeContentBlock('{"thought": "ok", "action": "finish"}')],
+        usage=_FakeUsage(input_tokens=10, output_tokens=5),
+    )
+
+    tokens = [
+        t
+        async for t in llm.stream_complete(
+            system=None, messages=[{"role": "user", "content": "hi"}]
+        )
+    ]
+
+    assert tokens == ['{"thought": "ok", "action": "finish"}']
+    assert llm.last_usage["tokens_in"] == 10
 
 
 async def test_set_budget_routes_cost_to_guard(monkeypatch):
