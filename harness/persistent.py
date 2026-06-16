@@ -830,12 +830,11 @@ class PersistentAgentConfig:
     async_reconcile_every_turns: int = 10
     durable_signal_terms: tuple[str, ...] = (
         "remember",
-        "always",
-        "never",
-        "prefer",
-        "don't do",
-        "do not",
-        "instead",
+        "don't forget",
+        "keep in mind",
+        "from now on",
+        "going forward",
+        "make note",
     )
 
 
