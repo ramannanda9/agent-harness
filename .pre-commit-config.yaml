@@ -5,3 +5,11 @@ repos:
       - id: ruff
         args: [--fix]
       - id: ruff-format
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.10.0
+    hooks:
+      # Scoped to the event schema module only — its typed payload factories
+      # are the authoritative producer contract. Extending mypy to the rest of
+      # the codebase is a separate effort (pre-existing untyped-error noise).
+      - id: mypy
+        files: ^harness/events\.py$

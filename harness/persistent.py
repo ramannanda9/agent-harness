@@ -1123,9 +1123,8 @@ class PersistentAgent:
                             correction=correction,
                         )
                     except Exception as exc:  # noqa: BLE001 — surface as ERROR
-                        yield BusEvent(
-                            type=EventType.ERROR,
-                            agent_id=self._coordinator.config.agent_id,
+                        yield BusEvent.error_event(
+                            self._coordinator.config.agent_id,
                             error=f"plan generation failed: {exc}",
                         )
                         plan_rejected = True
@@ -1134,10 +1133,10 @@ class PersistentAgent:
                     # Yield FIRST so the renderer prints the plan, then
                     # block for approval so the user is responding to a
                     # plan they've actually seen.
-                    yield BusEvent(
-                        type=EventType.PLAN_PROPOSED,
-                        agent_id=self._coordinator.config.agent_id,
-                        payload={"plan": candidate_plan, "revision": revision},
+                    yield BusEvent.plan_proposed(
+                        self._coordinator.config.agent_id,
+                        plan=candidate_plan,
+                        revision=revision,
                     )
 
                     response = await request_plan_approval(
@@ -1155,19 +1154,16 @@ class PersistentAgent:
                         correction = response.correction
                         continue
                     # Plain rejection (no correction text).
-                    yield BusEvent(
-                        type=EventType.ERROR,
-                        agent_id=self._coordinator.config.agent_id,
-                        error="plan rejected by user",
+                    yield BusEvent.error_event(
+                        self._coordinator.config.agent_id, error="plan rejected by user"
                     )
                     plan_rejected = True
                     break
                 else:
                     # Revision budget exhausted — give the user a clean
                     # rejection rather than silently executing the last plan.
-                    yield BusEvent(
-                        type=EventType.ERROR,
-                        agent_id=self._coordinator.config.agent_id,
+                    yield BusEvent.error_event(
+                        self._coordinator.config.agent_id,
                         error=(
                             f"plan revision limit ({_PLAN_REVISION_LIMIT}) reached; "
                             "send 'y' to approve, 'n' to reject, or shorten the feedback"

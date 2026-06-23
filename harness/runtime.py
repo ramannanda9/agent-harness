@@ -800,7 +800,7 @@ class AgentRuntime:
         StdinRouter), this method wraps the entire dispatch in that
         lifecycle so callers don't manage the shared resource themselves.
         """
-        from harness.events import BusEvent, EventType
+        from harness.events import BusEvent
 
         async with self._steering_lifecycle():
             if self._checkpoint_store is not None:
@@ -821,11 +821,7 @@ class AgentRuntime:
 
             complexity = await self._classify(goal)
             path = "routed" if complexity == "simple" else "orchestrated"
-            yield BusEvent(
-                type=EventType.DISPATCH,
-                agent_id="orchestrator",
-                payload={"complexity": complexity, "path": path},
-            )
+            yield BusEvent.dispatch("orchestrator", complexity=complexity, path=path)
 
             if complexity == "simple":
                 # Own the full OTEL lifecycle for the simple path so dispatch + route
@@ -838,11 +834,7 @@ class AgentRuntime:
                     agent_id, rationale = await self.route(goal)
                     logger.info("Router → %s (%s)", agent_id, rationale)
                     tracer.log("route", agent_id, {"agent_id": agent_id, "rationale": rationale})
-                    yield BusEvent(
-                        type=EventType.ROUTE,
-                        agent_id=agent_id,
-                        payload={"agent_id": agent_id, "rationale": rationale},
-                    )
+                    yield BusEvent.route(agent_id, rationale=rationale)
                     async for event in self._run_agent_with_tracer(
                         agent_id, goal, tracer, run_id, guard=guard
                     ):
@@ -914,7 +906,7 @@ class AgentRuntime:
         Use this instead of run_stream when you have a single-turn goal
         that one agent can handle end-to-end — no task decomposition.
         """
-        from harness.events import BusEvent, EventType
+        from harness.events import BusEvent
 
         async with self._steering_lifecycle():
             tracer = self._make_tracer()
@@ -929,11 +921,7 @@ class AgentRuntime:
                 agent_id, rationale = await self.route(goal)
                 logger.info("Router → %s (%s)", agent_id, rationale)
                 tracer.log("route", agent_id, {"agent_id": agent_id, "rationale": rationale})
-                yield BusEvent(
-                    type=EventType.ROUTE,
-                    agent_id=agent_id,
-                    payload={"agent_id": agent_id, "rationale": rationale},
-                )
+                yield BusEvent.route(agent_id, rationale=rationale)
                 async for event in self._run_agent_with_tracer(
                     agent_id, goal, tracer, run_id, guard=guard
                 ):
