@@ -255,11 +255,7 @@ class BaseAgent:
                 self.config.agent_id,
                 {"step": step, "text": text},
             )
-            yield BusEvent(
-                type=EventType.HUMAN_GUIDANCE,
-                agent_id=self.config.agent_id,
-                payload={"step": step, "text": text},
-            )
+            yield BusEvent.human_guidance(self.config.agent_id, step=step, text=text)
 
     # ── Streaming entry point (canonical) ─────────────────────────────────────
 
@@ -403,11 +399,7 @@ class BaseAgent:
                 yield event
         except Exception as e:
             logger.exception("Agent %s stream crashed", self.config.agent_id)
-            yield BusEvent(
-                type=EventType.ERROR,
-                agent_id=self.config.agent_id,
-                error=str(e),
-            )
+            yield BusEvent.error_event(self.config.agent_id, error=str(e))
         finally:
             if self._working_memory is not None:
                 self._tracer.log(
@@ -533,11 +525,7 @@ class BaseAgent:
                     self.config.agent_id,
                     {"answer": "", "confidence": 0.0, "steps": step, "error": reason},
                 )
-                yield BusEvent(
-                    type=EventType.ERROR,
-                    agent_id=self.config.agent_id,
-                    error=reason,
-                )
+                yield BusEvent.error_event(self.config.agent_id, error=reason)
                 return
 
             self._tracer.log(
@@ -587,11 +575,7 @@ class BaseAgent:
                         "error": "",
                     },
                 )
-                yield BusEvent(
-                    type=EventType.TASK_DONE,
-                    agent_id=self.config.agent_id,
-                    payload=result,
-                )
+                yield BusEvent.task_done_agent(self.config.agent_id, result=result)
                 return
 
             # Act — parallel or single
@@ -622,14 +606,11 @@ class BaseAgent:
 
                 # Emit ACTION events first so callers see what's being launched.
                 for act in parallel_actions:
-                    yield BusEvent(
-                        type=EventType.ACTION,
-                        agent_id=self.config.agent_id,
-                        payload={
-                            "step": step,
-                            "tool": act.get("tool", ""),
-                            "args": act.get("args", {}),
-                        },
+                    yield BusEvent.action(
+                        self.config.agent_id,
+                        step=step,
+                        tool=act.get("tool", ""),
+                        args=act.get("args", {}),
                     )
 
                 # Fan out all approved tool calls concurrently. Mixed
@@ -723,10 +704,11 @@ class BaseAgent:
                         },
                     )
                     observation_events.append(
-                        BusEvent(
-                            type=EventType.OBSERVATION,
-                            agent_id=self.config.agent_id,
-                            payload={"step": step, "tool": tool_name, "observation": obs_raw},
+                        BusEvent.observation(
+                            self.config.agent_id,
+                            step=step,
+                            tool=tool_name,
+                            observation=obs_raw,
                         )
                     )
                     combined.append({"tool": tool_name, "result": obs_raw})
@@ -753,10 +735,8 @@ class BaseAgent:
                 # Single action path.
                 tool_name = response.get("action", "")
                 tool_args = response.get("args", {})
-                yield BusEvent(
-                    type=EventType.ACTION,
-                    agent_id=self.config.agent_id,
-                    payload={"step": step, "tool": tool_name, "args": tool_args},
+                yield BusEvent.action(
+                    self.config.agent_id, step=step, tool=tool_name, args=tool_args
                 )
 
                 tool_obj = self._tools.get(tool_name)
@@ -798,14 +778,8 @@ class BaseAgent:
                         "observation": obs_display,
                     },
                 )
-                yield BusEvent(
-                    type=EventType.OBSERVATION,
-                    agent_id=self.config.agent_id,
-                    payload={
-                        "step": step,
-                        "tool": tool_name,
-                        "observation": obs_raw,
-                    },
+                yield BusEvent.observation(
+                    self.config.agent_id, step=step, tool=tool_name, observation=obs_raw
                 )
 
                 if (
@@ -833,11 +807,10 @@ class BaseAgent:
                 "error": f"Max steps ({self.config.max_steps}) reached",
             },
         )
-        yield BusEvent(
-            type=EventType.ERROR,
-            agent_id=self.config.agent_id,
+        yield BusEvent.error_event(
+            self.config.agent_id,
             error=f"Max steps ({self.config.max_steps}) reached",
-            payload={"steps": self.config.max_steps},
+            steps=self.config.max_steps,
         )
 
     # ── Think ─────────────────────────────────────────────────────────────────
@@ -900,11 +873,7 @@ class BaseAgent:
                 ):
                     accumulated += token
                     if self.config.stream_tokens:
-                        yield BusEvent(
-                            type=EventType.TOKEN,
-                            agent_id=self.config.agent_id,
-                            token=token,
-                        )
+                        yield BusEvent.token_event(self.config.agent_id, token=token)
                 response = _normalize_response(accumulated)
                 if response is None:
                     response = await self._retry_complete_after_bad_stream(
@@ -938,39 +907,24 @@ class BaseAgent:
 
         after_usage = self._working_memory.context_usage()
         if self._working_memory.summarization_count > before_summarizations:
-            yield BusEvent(
-                type=EventType.MEMORY,
-                agent_id=self.config.agent_id,
-                payload={
-                    "event": "summarized",
-                    "before": before_usage,
-                    "after": after_usage,
-                    "summarizations": self._working_memory.summarization_count,
-                },
+            yield BusEvent.memory(
+                self.config.agent_id,
+                before=before_usage,
+                after=after_usage,
+                summarizations=self._working_memory.summarization_count,
             )
         llm_usage = getattr(self._llm, "last_usage", None) or {}
         if llm_usage or after_usage != before_usage:
-            yield BusEvent(
-                type=EventType.CONTEXT,
-                agent_id=self.config.agent_id,
-                payload={
-                    **after_usage,
-                    "tokens_in": llm_usage.get("tokens_in"),
-                    "tokens_out": llm_usage.get("tokens_out"),
-                    "cache_read_tokens": llm_usage.get("cache_read_tokens"),
-                    "cache_creation_tokens": llm_usage.get("cache_creation_tokens"),
-                },
+            yield BusEvent.context_usage(
+                self.config.agent_id,
+                usage=after_usage,
+                tokens_in=llm_usage.get("tokens_in"),
+                tokens_out=llm_usage.get("tokens_out"),
+                cache_read_tokens=llm_usage.get("cache_read_tokens"),
+                cache_creation_tokens=llm_usage.get("cache_creation_tokens"),
             )
 
-        yield BusEvent(
-            type=EventType.THOUGHT,
-            agent_id=self.config.agent_id,
-            payload={
-                "response": response,
-                "thought": response.get("thought", "") if response else "",
-                "action": response.get("action") if response else None,
-            },
-        )
+        yield BusEvent.thought(self.config.agent_id, response=response)
 
     async def _retry_complete_after_bad_stream(
         self,
@@ -1363,10 +1317,8 @@ class BaseAgent:
         )
         await self._record_tool_observation(llm_response, tool_name, observation)
         obs_display = "[image]" if _is_image_block(observation) else str(observation)[:500]
-        yield BusEvent(
-            type=EventType.OBSERVATION,
-            agent_id=self.config.agent_id,
-            payload={"step": step, "tool": tool_name, "observation": obs_display},
+        yield BusEvent.observation(
+            self.config.agent_id, step=step, tool=tool_name, observation=obs_display
         )
         await self._commit_checkpoint(run_id, step)
 

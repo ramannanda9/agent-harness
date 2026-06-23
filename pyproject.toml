@@ -67,6 +67,16 @@ exclude = ["examples*", "executor*", "tests*"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 
+[tool.mypy]
+# Scoped intentionally: only the event schema module is type-checked today.
+# harness/events.py is small and fully typed, so it runs clean in strict mode;
+# its typed payload factories are the authoritative producer contract. The rest
+# of the codebase carries pre-existing untyped-error noise and is out of scope.
+python_version = "3.10"
+files = ["harness/events.py"]
+ignore_missing_imports = true
+strict = true
+
 [tool.ruff]
 line-length = 100
 target-version = "py310"

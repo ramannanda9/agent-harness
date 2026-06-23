@@ -132,11 +132,11 @@ class SubAgentTool:
         # walk one level up by reading ``parent_agent_id``.
         invoking_parent = self._invoking_agent_id
 
-        yield BusEvent(
-            type=EventType.SUBAGENT_START,
-            agent_id=self.agent_id,
+        yield BusEvent.subagent_start(
+            self.agent_id,
+            task=task[:300],
+            invocation_id=run_id,
             parent_agent_id=invoking_parent,
-            payload={"task": task[:300], "invocation_id": run_id},
         )
 
         last_done: dict | None = None
@@ -160,18 +160,15 @@ class SubAgentTool:
         except Exception as exc:  # noqa: BLE001 — surface to parent
             last_error = f"{type(exc).__name__}: {exc}"
 
-        yield BusEvent(
-            type=EventType.SUBAGENT_DONE,
-            agent_id=self.agent_id,
+        yield BusEvent.subagent_done(
+            self.agent_id,
+            success=last_done is not None,
+            steps=(last_done or {}).get("steps", 0),
+            confidence=(last_done or {}).get("confidence", 0.0),
+            answer=(last_done or {}).get("answer", "")[:300],
+            error=last_error or "",
+            invocation_id=run_id,
             parent_agent_id=invoking_parent,
-            payload={
-                "success": last_done is not None,
-                "steps": (last_done or {}).get("steps", 0),
-                "confidence": (last_done or {}).get("confidence", 0.0),
-                "answer": (last_done or {}).get("answer", "")[:300],
-                "error": last_error or "",
-                "invocation_id": run_id,
-            },
         )
 
         if last_done is not None:

@@ -228,7 +228,7 @@ class Orchestrator:
             plan = await self._plan(goal)
         except PlanValidationError as exc:
             logger.error("Plan validation failed: %s", exc)
-            yield BusEvent(type=EventType.ERROR, agent_id="orchestrator", error=str(exc))
+            yield BusEvent.error_event("orchestrator", error=str(exc))
             return
         plan_dict = _plan_to_dict(plan)
         self._tracer.log("plan", "orchestrator", {"plan": plan_dict})
@@ -238,11 +238,7 @@ class Orchestrator:
                 "orchestrator:last_plan_agents", [t.agent_id for t in plan.tasks]
             )
         )
-        yield BusEvent(
-            type=EventType.PLAN,
-            agent_id="orchestrator",
-            payload={"plan": plan_dict},
-        )
+        yield BusEvent.plan("orchestrator", plan=plan_dict)
 
         # ── 2. Execute ─────────────────────────────────────────────────────────
         self._set_agent_resume_keys()
@@ -264,11 +260,7 @@ class Orchestrator:
         logger.info("Orchestrator resume run_id=%s completed=%s", self._run_id, list(completed))
         self._tracer.start_run(self._run_id, goal)
 
-        yield BusEvent(
-            type=EventType.PLAN,
-            agent_id="orchestrator",
-            payload={"plan": _plan_to_dict(plan), "resumed": True},
-        )
+        yield BusEvent.plan("orchestrator", plan=_plan_to_dict(plan), resumed=True)
 
         self._set_agent_resume_keys()
         async with _ResumeHint(self._run_id, self._checkpoint_store, "Orchestration") as hint:
@@ -289,18 +281,14 @@ class Orchestrator:
             validate_plan(plan, set(self._agents.keys()))
         except PlanValidationError as exc:
             logger.error("Pre-built plan validation failed: %s", exc)
-            yield BusEvent(type=EventType.ERROR, agent_id="orchestrator", error=str(exc))
+            yield BusEvent.error_event("orchestrator", error=str(exc))
             return
 
         logger.info(
             "Orchestrator run_id=%s pre-built plan (%d tasks)", self._run_id, len(plan.tasks)
         )
         self._tracer.start_run(self._run_id, goal)
-        yield BusEvent(
-            type=EventType.PLAN,
-            agent_id="orchestrator",
-            payload={"plan": _plan_to_dict(plan), "pre_built": True},
-        )
+        yield BusEvent.plan("orchestrator", plan=_plan_to_dict(plan), pre_built=True)
 
         self._set_agent_resume_keys()
         await self._write_orch_checkpoint(goal, plan, {}, 0)
@@ -363,16 +351,13 @@ class Orchestrator:
                         "confidence": result.confidence,
                     },
                 )
-                yield BusEvent(
-                    type=EventType.TASK_DONE,
-                    agent_id=task.agent_id,
-                    payload={
-                        "task_id": task.id,
-                        "success": result.success,
-                        "confidence": result.confidence,
-                        "answer": result.answer,
-                        "error": result.error,
-                    },
+                yield BusEvent.task_done_task(
+                    task.agent_id,
+                    task_id=task.id,
+                    success=result.success,
+                    confidence=result.confidence,
+                    answer=result.answer,
+                    error=result.error,
                 )
 
                 if not should_replan(result, self._eval):
@@ -436,14 +421,11 @@ class Orchestrator:
                         "orchestrator:last_replan_agents", [t.agent_id for t in new_plan.tasks]
                     )
                 )
-                yield BusEvent(
-                    type=EventType.REPLAN,
-                    agent_id="orchestrator",
-                    payload={
-                        "replan_count": replan_count,
-                        "trigger_task": task.id,
-                        "new_task_count": len(pending),
-                    },
+                yield BusEvent.replan(
+                    "orchestrator",
+                    replan_count=replan_count,
+                    trigger_task=task.id,
+                    new_task_count=len(pending),
                 )
 
         all_results = list(completed.values())
@@ -475,9 +457,8 @@ class Orchestrator:
         # ── Final DONE — delete orchestrator checkpoint ────────────────────────
         await self._delete_orch_checkpoint()
         self._tracer.end_run()
-        yield BusEvent(
-            type=EventType.DONE,
-            agent_id="orchestrator",
+        yield BusEvent.done(
+            "orchestrator",
             payload={
                 "run_id": self._run_id,
                 "goal": goal,
