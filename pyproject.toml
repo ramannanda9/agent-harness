@@ -68,13 +68,15 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 
 [tool.mypy]
-# Scoped intentionally: only the event schema module is type-checked today.
-# harness/events.py is small and fully typed, so it runs clean in strict mode;
-# its typed payload factories are the authoritative producer contract. The rest
-# of the codebase carries pre-existing untyped-error noise and is out of scope.
+# Scoped intentionally to the modules built under the typed-refactor effort.
+# These are small and fully typed, so they run clean in strict mode. The rest
+# of the codebase carries pre-existing untyped-error noise and is out of scope —
+# ``follow_imports = silent`` lets mypy resolve imported types for checking
+# without reporting errors in those un-migrated modules.
 python_version = "3.10"
-files = ["harness/events.py"]
+files = ["harness/events.py", "harness/session_memory.py"]
 ignore_missing_imports = true
+follow_imports = "silent"
 strict = true
 
 [tool.ruff]

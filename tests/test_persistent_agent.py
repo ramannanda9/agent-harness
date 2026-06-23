@@ -634,7 +634,7 @@ def test_persistent_agent_forget_memory_cache_evicts_session_context():
         memory=memory,
         llm=llm,
     )
-    app._session_memory_context["s"] = "cached"
+    app._mem._cache["s"] = "cached"
 
     assert app.cached_memory_context("s") == "cached"
     app.forget_memory_cache("s")
@@ -654,7 +654,7 @@ async def test_persistent_agent_lists_clears_and_deletes_sessions():
         memory=memory,
         llm=llm,
     )
-    app._session_memory_context["s"] = "cached"
+    app._mem._cache["s"] = "cached"
 
     assert await app.session_exists("s") is True
     assert await app.session_exists("missing") is False
@@ -666,7 +666,7 @@ async def test_persistent_agent_lists_clears_and_deletes_sessions():
     assert cleared.turn_count == 0
     assert app.cached_memory_context("s") is None
 
-    app._session_memory_context["s"] = "cached"
+    app._mem._cache["s"] = "cached"
     assert await app.delete_session("s") is True
     assert await app.delete_session("s") is False
     assert app.cached_memory_context("s") is None
@@ -695,7 +695,7 @@ async def test_persistent_agent_force_compact_summarizes_and_trims():
         llm=llm,
         config=PersistentAgentConfig(retain_context_fraction=0.15),
     )
-    app._session_memory_context["s"] = "cached"
+    app._mem._cache["s"] = "cached"
 
     state = await app.force_compact("s")
 
@@ -730,7 +730,7 @@ async def test_persistent_agent_save_to_memory_reconciles_without_evicting_cache
         llm=llm,
         config=PersistentAgentConfig(async_reconcile_every_turns=5),
     )
-    app._session_memory_context["s"] = "cached"
+    app._mem._cache["s"] = "cached"
 
     count = await app.save_to_memory("s")
 
@@ -1262,7 +1262,7 @@ async def test_async_reconcile_fires_at_interval_without_evicting_cache():
 
     # Prime the per-session memory context cache by running one turn.
     [event async for event in app.chat("first turn", session_id="async")]
-    cached_before = app._session_memory_context.get("async")
+    cached_before = app.cached_memory_context("async")
 
     # Turn 2: not an interval boundary → no async fire.
     [event async for event in app.chat("second turn", session_id="async")]
@@ -1278,8 +1278,8 @@ async def test_async_reconcile_fires_at_interval_without_evicting_cache():
     assert state.last_reconcile_turn == 3
     # Crucially: the memory context cache was NOT evicted. Identity matters
     # — if it had been refetched, ``cached_before`` would no longer be
-    # the value at ``self._session_memory_context["async"]``.
-    cached_after = app._session_memory_context.get("async")
+    # the value held by the SessionMemoryController for "async".
+    cached_after = app.cached_memory_context("async")
     assert cached_after == cached_before, (
         "async reconcile must NOT evict the per-session memory context cache"
     )
