@@ -22,6 +22,7 @@ from typing import Any, Protocol
 from agents.base import BaseAgent, _parse_action_json
 from harness.agent_tree import find_agent, iter_agents, subagent_tool_agent
 from harness.events import BusEvent, EventType
+from harness.model_switching import ModelSwitcher
 from harness.session_memory import SessionMemoryController
 from memory.manager import MemoryManager
 from tools.builtin.background import (
@@ -857,33 +858,18 @@ class PersistentAgent:
         self._coordinator = coordinator
         self._session_store = session_store
         self._memory = memory
-        self._explicit_llm = llm is not None
-        self._llm = llm or coordinator._llm
+        # Explicit summarizer/control LLM, if the caller supplied one. When
+        # absent, ``llm`` tracks the coordinator's current LLM (which model
+        # switching may swap), so it stays correct without re-pointing.
+        self._explicit_llm = llm
         self._guard_factory = guard_factory
         self._config = config or PersistentAgentConfig()
-        self._llm_registry = dict(llm_registry or {})
-        reserved_models = {"default", "reset", "clear"}
-        collisions = sorted(
-            model for model in self._llm_registry if model.lower() in reserved_models
+        self._models = ModelSwitcher(
+            coordinator=coordinator,
+            session_store=session_store,
+            llm_registry=llm_registry,
+            default_model=default_model,
         )
-        if collisions:
-            joined = ", ".join(repr(model) for model in collisions)
-            raise ValueError(f"model names are reserved for clearing overrides: {joined}")
-        non_factories = sorted(
-            model for model, factory in self._llm_registry.items() if not callable(factory)
-        )
-        if non_factories:
-            joined = ", ".join(repr(model) for model in non_factories)
-            raise TypeError(f"llm_registry entries must be zero-argument factories: {joined}")
-        if (
-            default_model is not None
-            and self._llm_registry
-            and default_model not in self._llm_registry
-        ):
-            raise ValueError(f"default_model {default_model!r} is not present in llm_registry")
-        self._default_model = default_model
-        self._llm_instances: dict[str, Any] = {}
-        self._default_agent_llms = self._snapshot_agent_llms()
         self._background_tasks: dict[str, BackgroundTaskState] = {}
         self._background_handles: dict[str, asyncio.Task[None]] = {}
         self._active_session_id: contextvars.ContextVar[str] = contextvars.ContextVar(
@@ -901,7 +887,7 @@ class PersistentAgent:
             config=self._config,
             coordinator_agent_id=self._coordinator.config.agent_id,
             token_budget=self._coordinator_input_token_budget,
-            summarizer_llm=lambda: self._llm,
+            summarizer_llm=lambda: self.llm,
         )
 
     @property
@@ -911,8 +897,12 @@ class PersistentAgent:
 
     @property
     def llm(self) -> Any:
-        """LLM used for session summarization/control introspection."""
-        return self._llm
+        """LLM used for session summarization/control introspection.
+
+        Defaults to the coordinator's current LLM (so model switching is
+        reflected automatically) unless an explicit LLM was supplied.
+        """
+        return self._explicit_llm or self._coordinator._llm
 
     # ── Plan mode public surface ──────────────────────────────────────────
 
@@ -951,7 +941,7 @@ class PersistentAgent:
             raise ValueError(f"unknown sub-agent {agent_id!r}")
         if self._active_session_id.get() != session_id:
             state = await self._session_store.load(session_id)
-            self._apply_model_overrides(state)
+            self._models.apply(state)
         task_id = f"bg_{uuid.uuid4().hex[:12]}"
         task = BackgroundTaskState(
             task_id=task_id,
@@ -1022,15 +1012,15 @@ class PersistentAgent:
 
     def available_models(self) -> list[str]:
         """Return model names available for session-scoped switching."""
-        return sorted(self._llm_registry)
+        return self._models.available_models()
 
     def default_model(self) -> str | None:
         """Return the label for the construction-time/default model, if supplied."""
-        return self._default_model
+        return self._models.default_model()
 
     def model_switching_enabled(self) -> bool:
         """True when an LLM registry was supplied at construction time."""
-        return bool(self._llm_registry)
+        return self._models.enabled()
 
     def context_token_budget(self) -> int | None:
         """Return the live coordinator input budget used for compaction."""
@@ -1038,8 +1028,7 @@ class PersistentAgent:
 
     async def model_overrides(self, session_id: str) -> dict[str, str]:
         """Return session-scoped agent_id -> model_name overrides."""
-        state = await self._session_store.load(session_id)
-        return dict(state.model_overrides)
+        return await self._models.overrides(session_id)
 
     async def switch_model(
         self,
@@ -1048,19 +1037,11 @@ class PersistentAgent:
         model_name: str,
     ) -> SessionState:
         """Persist and apply a session-scoped model override for one agent."""
-        if model_name not in self._llm_registry:
-            raise ValueError(f"unknown model {model_name!r}")
-        if self._find_agent(agent_id) is None:
-            raise ValueError(f"unknown agent {agent_id!r}")
-        state = await self._session_store.set_model_override(session_id, agent_id, model_name)
-        self._apply_model_overrides(state)
-        return state
+        return await self._models.switch(session_id, agent_id, model_name)
 
     async def clear_model_override(self, session_id: str, agent_id: str) -> SessionState:
         """Remove and apply a session-scoped model override for one agent."""
-        state = await self._session_store.set_model_override(session_id, agent_id, None)
-        self._apply_model_overrides(state)
-        return state
+        return await self._models.clear(session_id, agent_id)
 
     async def chat(
         self,
@@ -1077,7 +1058,7 @@ class PersistentAgent:
         ``ERROR`` and returns without writing to the session store.
         """
         state = await self._session_store.load(session_id)
-        self._apply_model_overrides(state)
+        self._models.apply(state)
         active_session_token = self._active_session_id.set(session_id)
         run_id = run_id or str(uuid.uuid4())
         try:
@@ -1271,7 +1252,7 @@ class PersistentAgent:
         if correction:
             system = system + _PLAN_CORRECTION_HINT.replace("{correction}", correction)
 
-        raw = await self._llm.complete(
+        raw = await self.llm.complete(
             system=system,
             messages=[{"role": "user", "content": message}],
             response_format={"type": "json_object"},
@@ -1396,11 +1377,6 @@ class PersistentAgent:
         self._mem.evict(session_id)
         return deleted
 
-    def _snapshot_agent_llms(self) -> dict[str, Any]:
-        return {
-            agent.config.agent_id: getattr(agent, "_llm", None) for agent in self._iter_agents()
-        }
-
     def _iter_agents(self) -> list[BaseAgent]:
         return iter_agents(self._coordinator)
 
@@ -1499,32 +1475,6 @@ class PersistentAgent:
                 task.error = last_error or "sub-agent stream ended without TASK_DONE"
         finally:
             task.updated_at = _now()
-
-    def _make_registered_llm(self, model_name: str) -> Any:
-        llm = self._llm_instances.get(model_name)
-        if llm is None:
-            llm = self._llm_registry[model_name]()
-            self._llm_instances[model_name] = llm
-        return llm
-
-    def _apply_model_overrides(self, state: SessionState) -> None:
-        # Reset first so switching sessions cannot leak a previous
-        # session's model choice into this one.
-        for agent in self._iter_agents():
-            self._default_agent_llms.setdefault(agent.config.agent_id, getattr(agent, "_llm", None))
-            agent._llm = self._default_agent_llms[agent.config.agent_id]
-
-        for agent_id, model_name in state.model_overrides.items():
-            agent = self._find_agent(agent_id)
-            if agent is None or model_name not in self._llm_registry:
-                continue
-            agent._llm = self._make_registered_llm(model_name)
-            guard = getattr(agent, "_guard", None)
-            if guard is not None and hasattr(agent._llm, "set_budget"):
-                agent._llm.set_budget(guard)
-
-        if not self._explicit_llm:
-            self._llm = self._coordinator._llm
 
     def _assign_guard(self, guard: Any) -> None:
         seen_agents: set[int] = set()
@@ -1666,7 +1616,7 @@ class PersistentAgent:
     def _coordinator_input_token_budget(self) -> int | None:
         """Read the coordinator LLM's input budget. Falls back to ``None``
         when the adapter doesn't advertise one."""
-        llm = getattr(self._coordinator, "_llm", None) or self._llm
+        llm = getattr(self._coordinator, "_llm", None) or self.llm
         budget = getattr(llm, "input_token_budget", None)
         return int(budget) if isinstance(budget, int) and budget > 0 else None
 
