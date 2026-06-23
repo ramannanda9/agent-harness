@@ -8,8 +8,10 @@ repos:
   - repo: https://github.com/pre-commit/mirrors-mypy
     rev: v1.10.0
     hooks:
-      # Scoped to the event schema module only — its typed payload factories
-      # are the authoritative producer contract. Extending mypy to the rest of
-      # the codebase is a separate effort (pre-existing untyped-error noise).
+      # Scoped to the modules built under the typed-refactor effort. Extending
+      # mypy to the rest of the codebase is a separate effort (pre-existing
+      # untyped-error noise). args=[] so mypy uses the [tool.mypy] config
+      # (files + follow_imports=silent) rather than only the changed paths.
       - id: mypy
-        files: ^harness/events\.py$
+        files: ^harness/(events|session_memory)\.py$
+        args: []
