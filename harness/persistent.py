@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from agents.base import BaseAgent, _parse_action_json
+from harness.agent_tree import find_agent, iter_agents, subagent_tool_agent
 from harness.events import BusEvent, EventType
 from harness.session_memory import SessionMemoryController
 from memory.manager import MemoryManager
@@ -1313,7 +1314,7 @@ class PersistentAgent:
             for tool_name, tool in getattr(agent, "_tools", {}).items():
                 if _is_mcp_tool(tool):
                     mcp_tools.append(_describe_mcp_tool(tool, owner_agent_id=parent_agent_id))
-                sub = _subagent_tool_agent(tool)
+                sub = subagent_tool_agent(tool)
                 if sub is None:
                     continue
                 sub_info = {
@@ -1401,21 +1402,7 @@ class PersistentAgent:
         }
 
     def _iter_agents(self) -> list[BaseAgent]:
-        agents: list[BaseAgent] = []
-        seen: set[int] = set()
-
-        def visit(agent: BaseAgent) -> None:
-            if id(agent) in seen:
-                return
-            seen.add(id(agent))
-            agents.append(agent)
-            for tool in getattr(agent, "_tools", {}).values():
-                sub = _subagent_tool_agent(tool)
-                if sub is not None:
-                    visit(sub)
-
-        visit(self._coordinator)
-        return agents
+        return iter_agents(self._coordinator)
 
     def _install_background_tools(self) -> None:
         tools = getattr(self._coordinator, "_tools", {})
@@ -1424,7 +1411,7 @@ class PersistentAgent:
         session_id_provider = self._active_session_id.get
         background_tools: dict[str, Any] = {}
         for tool in list(tools.values()):
-            sub = _subagent_tool_agent(tool)
+            sub = subagent_tool_agent(tool)
             if sub is None:
                 continue
             background = BackgroundDelegateTool(
@@ -1454,10 +1441,7 @@ class PersistentAgent:
                 self._coordinator.config.allowed_tools.append(name)
 
     def _find_agent(self, agent_id: str) -> BaseAgent | None:
-        for agent in self._iter_agents():
-            if agent.config.agent_id == agent_id:
-                return agent
-        return None
+        return find_agent(self._coordinator, agent_id)
 
     def _disable_checkpoint_resume_for_persistent_hitl(self) -> Callable[[], None]:
         agents = self._iter_agents()
@@ -1554,7 +1538,7 @@ class PersistentAgent:
             if hasattr(llm, "set_budget"):
                 llm.set_budget(guard)
             for tool in getattr(agent, "_tools", {}).values():
-                sub = _subagent_tool_agent(tool)
+                sub = subagent_tool_agent(tool)
                 if sub is not None:
                     visit(sub)
 
@@ -1771,13 +1755,6 @@ def _describe_agent(agent: BaseAgent) -> dict[str, Any]:
 
 def _describe_skills(agent: BaseAgent) -> list[dict[str, Any]]:
     return [skill.summary() for skill in getattr(agent.config, "skills", [])]
-
-
-def _subagent_tool_agent(tool: Any) -> BaseAgent | None:
-    if tool.__class__.__name__ != "SubAgentTool":
-        return None
-    agent = getattr(tool, "_agent", None)
-    return agent if isinstance(agent, BaseAgent) else None
 
 
 def _is_mcp_tool(tool: Any) -> bool:
