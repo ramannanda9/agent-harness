@@ -18,217 +18,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
 
-from agents.base import BaseAgent, _parse_action_json
+from agents.base import BaseAgent
 from harness.agent_tree import iter_agents, subagent_tool_agent
 from harness.background_tasks import BackgroundTaskManager, BackgroundTaskState
 from harness.events import BusEvent, EventType
 from harness.model_switching import ModelSwitcher
+from harness.plan_mode import PlanDecision, PlanModeController, _render_plan_for_priors
 from harness.session_memory import SessionMemoryController
 from memory.manager import MemoryManager
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
-
-
-# ── Plan mode ────────────────────────────────────────────────────────────────
-#
-# When ``SessionState.plan_mode_enabled`` is True, ``PersistentAgent.chat``
-# asks the coordinator's LLM for a structured plan before any tools run,
-# yields a ``PLAN_PROPOSED`` event so renderers can display it, and gates
-# execution on ``harness.hitl.request_plan_approval``. Plan approval handles
-# Enter / y / n / correction only; there is no session-allow or persistent-
-# allow shortcut because plan mode is intentionally per-turn.
-
-_PLAN_SYSTEM_PROMPT = """You are in plan mode for an autonomous agent.
-
-Output rules — read carefully, these are strict:
-- Output ONE JSON object. Nothing else.
-- No markdown code fences (no triple-backticks).
-- No prose before or after the object.
-- No ``<thinking>`` tags or other XML wrappers.
-- The first character of your response MUST be ``{``.
-- The last character of your response MUST be ``}``.
-
-Do NOT execute any tools. Do NOT plan to execute tools yourself — the
-plan is a description for a separate executor to follow.
-
-The plan is the user's chance to approve INTENT, not arguments. Many
-real tasks have args that can only be known at runtime — a URL
-discovered by a search, a file path extracted from a directory listing,
-a row id returned by a query. Be honest about which step args you can
-fill in upfront and which depend on the previous step's observation.
-
-Output schema:
-{
-  "summary": "<one-line summary of what the plan will accomplish>",
-  "steps": [
-    {
-      "step": 1,
-      "intent": "<what this step achieves>",
-      "tool": "<tool name from the available list, or null if no tool>",
-      "args": {<concrete arguments, OR null when args depend on prior observation>},
-      "why": "<one-line justification>"
-    },
-    ...
-  ]
-}
-
-Available tools: {tools}
-
-Argument rules:
-- Use concrete ``args`` only when the value was supplied by the user
-  (e.g. they said "fetch https://x.com/y") or is otherwise knowable
-  without running any tool first.
-- Use ``null`` (or omit the field) when the value depends on an earlier
-  step's tool output — e.g. "navigate to the most-cited paper's URL"
-  after a search. Fabricating placeholder URLs / paths the agent will
-  ignore is misleading.
-
-If the user's request is conversational and needs no tool calls, return
-a plan with a single step whose ``tool`` is null."""
-
-
-_PLAN_CORRECTION_HINT = (
-    "\n\nThe user reviewed your previous plan and asked for this revision:\n"
-    "\n{correction}\n\n"
-    "Output a revised JSON plan."
-)
-
-
-# Hard cap on revision loops to protect against pathological re-planning
-# cycles. Each revision is one LLM call + one HITL prompt; users with
-# stronger feedback can always reject (n) and start fresh.
-_PLAN_REVISION_LIMIT = 3
-
-
-def _coerce_plan(raw: Any) -> dict[str, Any] | None:
-    """Best-effort plan extraction from whatever the LLM returned.
-
-    Why this isn't a simple ``json.loads``: ``response_format={"type":
-    "json_object"}`` is passed on every planner call, but **only the
-    OpenAI adapter honours it** (``harness/llm/openai.py:178``). The
-    Anthropic and Claude Code adapters silently drop the kwarg, so the
-    model is free to wrap its JSON in markdown code fences or sandwich
-    it inside prose — and routinely does.
-
-    Recovery rides the existing extractor: ``_parse_action_json`` (in
-    ``agents/base.py``) is the same helper the ReAct loop uses to pull
-    JSON out of Anthropic / Claude Code responses every turn. It walks
-    each ``{`` in the text and lets Python's ``JSONDecoder.raw_decode``
-    handle bracket balancing, so fence-wrapped, prose-wrapped, and
-    plain-JSON inputs all parse without bespoke logic here.
-    """
-    # Peel adapter wrapping. Every harness LLM adapter returns
-    # ``{"text": <content>, "usage": <dict>}``; v0.9.x checked
-    # ``len(raw) == 1`` and wrongly rejected the two-key shape.
-    if isinstance(raw, dict) and isinstance(raw.get("text"), str):
-        raw = raw["text"]
-
-    if isinstance(raw, str):
-        raw = _parse_action_json(raw)
-        if raw is None:
-            return None
-
-    if not isinstance(raw, dict):
-        return None
-    steps = raw.get("steps")
-    if not isinstance(steps, list):
-        return None
-    summary = raw.get("summary")
-    return {
-        "summary": str(summary) if summary is not None else "",
-        "steps": [s for s in steps if isinstance(s, dict)],
-    }
-
-
-def _step_args_deferred(step: dict[str, Any]) -> bool:
-    """Whether a step's args are deferred to runtime.
-
-    A step is "deferred" when the planner could not commit to concrete
-    args upfront — usually because the value depends on what an earlier
-    step's tool observes (URL discovered by a search, file path from a
-    directory listing, row id from a query, etc.).
-
-    Convention:
-    - ``"args"`` key missing → deferred
-    - ``args is None`` → deferred (explicit null in the planner JSON)
-    - ``args == {}`` → NOT deferred ("tool takes no arguments")
-    - ``args == {...}`` → NOT deferred (concrete)
-
-    Drives the "(resolved at runtime)" banner line and the
-    ``dynamic_steps`` count in the HITL approval args.
-    """
-    if "args" not in step:
-        return True
-    return step["args"] is None
-
-
-def _dynamic_step_count(plan: dict[str, Any]) -> int:
-    """Number of plan steps whose args will be resolved at runtime."""
-    steps = plan.get("steps") or []
-    return sum(
-        1
-        for step in steps
-        if isinstance(step, dict) and step.get("tool") and _step_args_deferred(step)
-    )
-
-
-def _render_plan_for_banner(plan: dict[str, Any]) -> str:
-    """Multi-line text used as the HITL banner ``command`` field. Compact
-    enough to read quickly but structured enough that a reviewer can spot
-    a wrong tool / wrong URL before approving.
-
-    Steps whose args are deferred to runtime render as
-    ``args: (resolved at runtime)`` rather than fabricating placeholder
-    JSON — the planner can't know e.g. a URL that a prior search step
-    will return, and showing ``{}`` would imply otherwise.
-    """
-    lines: list[str] = []
-    summary = plan.get("summary") or "(no summary)"
-    lines.append(f"Plan: {summary}")
-    steps = plan.get("steps") or []
-    for step in steps:
-        idx = step.get("step")
-        intent = step.get("intent") or "(no intent)"
-        tool = step.get("tool")
-        why = step.get("why")
-        prefix = f"  {idx}." if idx is not None else "  -"
-        lines.append(f"{prefix} {intent}")
-        if tool:
-            if _step_args_deferred(step):
-                lines.append(f"      tool: {tool}  args: (resolved at runtime)")
-            else:
-                args = step.get("args") or {}
-                args_repr = json.dumps(args, ensure_ascii=False) if args else "{}"
-                lines.append(f"      tool: {tool}  args: {args_repr}")
-        if why:
-            lines.append(f"      why:  {why}")
-    return "\n".join(lines)
-
-
-def _render_plan_for_priors(plan: dict[str, Any]) -> str:
-    """Prior-message body shown to the coordinator after approval.
-
-    Kept distinct from the banner format so the wording can drift
-    independently (the LLM sees prose; the human sees a structured
-    inspector view) and so we can mark the prior with an unambiguous
-    ``[Approved plan]`` header the planner / executor system prompts can
-    pattern-match against if needed.
-    """
-    body = _render_plan_for_banner(plan)
-    return (
-        "[Approved plan]\n"
-        f"{body}\n\n"
-        "The plan above is the agreed INTENT for this turn. Args shown "
-        "are concrete only where the user supplied them or where they're "
-        "knowable without running any tool first; everywhere else the "
-        "value '(resolved at runtime)' means: derive the argument from "
-        "your observations of the prior step, NOT from any placeholder "
-        "in this prior. You may skip or merge steps when an observation "
-        "makes them unnecessary; report any such deviation in your next "
-        "thought."
-    )
 
 
 @dataclass
@@ -862,6 +663,11 @@ class PersistentAgent:
             ),
         )
         self._background.install_tools()
+        self._plan_mode = PlanModeController(
+            coordinator=coordinator,
+            llm=lambda: self.llm,
+            tool_names=self._available_tool_names,
+        )
         # All memory retrieval, reconciliation, and compaction policy lives in
         # the controller. It receives the coordinator token-budget accessor and
         # the session summarizer LLM as callables so model switching is picked
@@ -1012,89 +818,26 @@ class PersistentAgent:
             # propagate ``asyncio.CancelledError`` (Esc-cancel) cleanly without
             # writing to the session store.
             if state.plan_mode_enabled:
-                # Inline the plan-and-approve loop so PLAN_PROPOSED events
-                # yield to the consumer (renderer) BEFORE the approval
-                # banner blocks on stdin. Yielding directly preserves the
-                # order: plan first, then banner, then user input.
-                #
-                # Uses ``request_plan_approval`` (sibling of the per-tool
-                # ``request_approval``) — same input plumbing, but no
-                # ``a`` / ``A`` options. Session-allow / persistent-allow
-                # make sense when the "tool" is something like
-                # ``shell/grep`` that fires repeatedly; they're actively
-                # wrong when the gate is the plan itself (``a`` would
-                # silently turn plan mode off for the session).
-                from harness.hitl import request_plan_approval  # noqa: PLC0415
+                decision: PlanDecision | None = None
+                async for item in self._plan_mode.run(
+                    message=message,
+                    session_id=session_id,
+                    guard=turn_guard,
+                ):
+                    if isinstance(item, PlanDecision):
+                        decision = item
+                    else:
+                        yield item
 
-                approved_plan: dict[str, Any] | None = None
-                plan_rejected = False
-                correction: str | None = None
-
-                for revision in range(_PLAN_REVISION_LIMIT + 1):
-                    try:
-                        candidate_plan = await self._generate_plan(
-                            message=message,
-                            session_id=session_id,
-                            correction=correction,
-                        )
-                    except Exception as exc:  # noqa: BLE001 — surface as ERROR
-                        yield BusEvent.error_event(
-                            self._coordinator.config.agent_id,
-                            error=f"plan generation failed: {exc}",
-                        )
-                        plan_rejected = True
-                        break
-
-                    # Yield FIRST so the renderer prints the plan, then
-                    # block for approval so the user is responding to a
-                    # plan they've actually seen.
-                    yield BusEvent.plan_proposed(
-                        self._coordinator.config.agent_id,
-                        plan=candidate_plan,
-                        revision=revision,
-                    )
-
-                    response = await request_plan_approval(
-                        summary=candidate_plan.get("summary", ""),
-                        step_count=len(candidate_plan.get("steps", [])),
-                        dynamic_step_count=_dynamic_step_count(candidate_plan),
-                        agent_id=self._coordinator.config.agent_id,
-                        guard=turn_guard,
-                    )
-                    if response.approved:
-                        approved_plan = candidate_plan
-                        break
-                    if response.correction:
-                        # Free-text revision — re-plan with this feedback.
-                        correction = response.correction
-                        continue
-                    # Plain rejection (no correction text).
-                    yield BusEvent.error_event(
-                        self._coordinator.config.agent_id, error="plan rejected by user"
-                    )
-                    plan_rejected = True
-                    break
-                else:
-                    # Revision budget exhausted — give the user a clean
-                    # rejection rather than silently executing the last plan.
-                    yield BusEvent.error_event(
-                        self._coordinator.config.agent_id,
-                        error=(
-                            f"plan revision limit ({_PLAN_REVISION_LIMIT}) reached; "
-                            "send 'y' to approve, 'n' to reject, or shorten the feedback"
-                        ),
-                    )
-                    plan_rejected = True
-
-                if plan_rejected:
+                if decision is None or decision.rejected:
                     return
-                if approved_plan is not None:
+                if decision.approved_plan is not None:
                     # Inject as a pinned prior so the ReAct loop's system
                     # prompt + memory prior stays byte-identical across the
                     # turn, and the plan rides as a user/assistant pair the
                     # coordinator clearly sees as "approved guidance."
                     plan_priors = [
-                        ("user", _render_plan_for_priors(approved_plan)),
+                        ("user", _render_plan_for_priors(decision.approved_plan)),
                         ("assistant", "Acknowledged. Executing the approved plan."),
                     ]
                     prior_messages = list(prior_messages) + plan_priors
@@ -1165,38 +908,6 @@ class PersistentAgent:
                 )
         finally:
             self._active_session_id.reset(active_session_token)
-
-    async def _generate_plan(
-        self,
-        *,
-        message: str,
-        session_id: str,  # noqa: ARG002 — reserved for future per-session context
-        correction: str | None,
-    ) -> dict[str, Any]:
-        """Call the coordinator's LLM with the planner system prompt.
-
-        Returns the parsed plan dict. Raises ``ValueError`` if the LLM
-        response can't be coerced into the expected ``{summary, steps}``
-        shape.
-        """
-        tools = self._available_tool_names()
-        system = _PLAN_SYSTEM_PROMPT.replace("{tools}", ", ".join(tools) or "(none)")
-        if correction:
-            system = system + _PLAN_CORRECTION_HINT.replace("{correction}", correction)
-
-        raw = await self.llm.complete(
-            system=system,
-            messages=[{"role": "user", "content": message}],
-            response_format={"type": "json_object"},
-            source="planner",
-        )
-        plan = _coerce_plan(raw)
-        if plan is None:
-            raise ValueError(
-                "planner returned a response that could not be parsed as "
-                "a {summary, steps} JSON object"
-            )
-        return plan
 
     def _available_tool_names(self) -> list[str]:
         """Tools the coordinator (and any wired sub-agents at first level)

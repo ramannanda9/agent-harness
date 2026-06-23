@@ -33,6 +33,9 @@ from harness.persistent import (
     PersistentAgent,
     PersistentAgentConfig,
     SessionState,
+)
+from harness.plan_mode import (
+    _PLAN_REVISION_LIMIT,
     _coerce_plan,
     _dynamic_step_count,
     _render_plan_for_banner,
@@ -656,8 +659,6 @@ async def test_plan_revision_budget_exhausted_yields_clean_error(
 ):
     """If the user keeps correcting, we cap at ``_PLAN_REVISION_LIMIT``
     revisions, then yield ERROR rather than silently approving."""
-    from harness.persistent import _PLAN_REVISION_LIMIT
-
     plans = [
         {"summary": f"take {i}", "steps": [{"step": 1, "intent": "x"}]}
         for i in range(_PLAN_REVISION_LIMIT + 1)
