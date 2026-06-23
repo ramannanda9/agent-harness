@@ -8,7 +8,6 @@ at a time.
 
 from __future__ import annotations
 
-import asyncio
 import contextvars
 import json
 import sqlite3
@@ -19,219 +18,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
 
-from agents.base import BaseAgent, _parse_action_json
+from agents.base import BaseAgent
+from harness.agent_tree import iter_agents, subagent_tool_agent
+from harness.background_tasks import BackgroundTaskManager, BackgroundTaskState
 from harness.events import BusEvent, EventType
+from harness.model_switching import ModelSwitcher
+from harness.plan_mode import PlanDecision, PlanModeController, _render_plan_for_priors
 from harness.session_memory import SessionMemoryController
 from memory.manager import MemoryManager
-from tools.builtin.background import (
-    BackgroundDelegateTool,
-    CheckBackgroundTaskTool,
-    CollectBackgroundTaskTool,
-)
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
-
-
-# ── Plan mode ────────────────────────────────────────────────────────────────
-#
-# When ``SessionState.plan_mode_enabled`` is True, ``PersistentAgent.chat``
-# asks the coordinator's LLM for a structured plan before any tools run,
-# yields a ``PLAN_PROPOSED`` event so renderers can display it, and gates
-# execution on ``harness.hitl.request_plan_approval``. Plan approval handles
-# Enter / y / n / correction only; there is no session-allow or persistent-
-# allow shortcut because plan mode is intentionally per-turn.
-
-_PLAN_SYSTEM_PROMPT = """You are in plan mode for an autonomous agent.
-
-Output rules — read carefully, these are strict:
-- Output ONE JSON object. Nothing else.
-- No markdown code fences (no triple-backticks).
-- No prose before or after the object.
-- No ``<thinking>`` tags or other XML wrappers.
-- The first character of your response MUST be ``{``.
-- The last character of your response MUST be ``}``.
-
-Do NOT execute any tools. Do NOT plan to execute tools yourself — the
-plan is a description for a separate executor to follow.
-
-The plan is the user's chance to approve INTENT, not arguments. Many
-real tasks have args that can only be known at runtime — a URL
-discovered by a search, a file path extracted from a directory listing,
-a row id returned by a query. Be honest about which step args you can
-fill in upfront and which depend on the previous step's observation.
-
-Output schema:
-{
-  "summary": "<one-line summary of what the plan will accomplish>",
-  "steps": [
-    {
-      "step": 1,
-      "intent": "<what this step achieves>",
-      "tool": "<tool name from the available list, or null if no tool>",
-      "args": {<concrete arguments, OR null when args depend on prior observation>},
-      "why": "<one-line justification>"
-    },
-    ...
-  ]
-}
-
-Available tools: {tools}
-
-Argument rules:
-- Use concrete ``args`` only when the value was supplied by the user
-  (e.g. they said "fetch https://x.com/y") or is otherwise knowable
-  without running any tool first.
-- Use ``null`` (or omit the field) when the value depends on an earlier
-  step's tool output — e.g. "navigate to the most-cited paper's URL"
-  after a search. Fabricating placeholder URLs / paths the agent will
-  ignore is misleading.
-
-If the user's request is conversational and needs no tool calls, return
-a plan with a single step whose ``tool`` is null."""
-
-
-_PLAN_CORRECTION_HINT = (
-    "\n\nThe user reviewed your previous plan and asked for this revision:\n"
-    "\n{correction}\n\n"
-    "Output a revised JSON plan."
-)
-
-
-# Hard cap on revision loops to protect against pathological re-planning
-# cycles. Each revision is one LLM call + one HITL prompt; users with
-# stronger feedback can always reject (n) and start fresh.
-_PLAN_REVISION_LIMIT = 3
-
-
-def _coerce_plan(raw: Any) -> dict[str, Any] | None:
-    """Best-effort plan extraction from whatever the LLM returned.
-
-    Why this isn't a simple ``json.loads``: ``response_format={"type":
-    "json_object"}`` is passed on every planner call, but **only the
-    OpenAI adapter honours it** (``harness/llm/openai.py:178``). The
-    Anthropic and Claude Code adapters silently drop the kwarg, so the
-    model is free to wrap its JSON in markdown code fences or sandwich
-    it inside prose — and routinely does.
-
-    Recovery rides the existing extractor: ``_parse_action_json`` (in
-    ``agents/base.py``) is the same helper the ReAct loop uses to pull
-    JSON out of Anthropic / Claude Code responses every turn. It walks
-    each ``{`` in the text and lets Python's ``JSONDecoder.raw_decode``
-    handle bracket balancing, so fence-wrapped, prose-wrapped, and
-    plain-JSON inputs all parse without bespoke logic here.
-    """
-    # Peel adapter wrapping. Every harness LLM adapter returns
-    # ``{"text": <content>, "usage": <dict>}``; v0.9.x checked
-    # ``len(raw) == 1`` and wrongly rejected the two-key shape.
-    if isinstance(raw, dict) and isinstance(raw.get("text"), str):
-        raw = raw["text"]
-
-    if isinstance(raw, str):
-        raw = _parse_action_json(raw)
-        if raw is None:
-            return None
-
-    if not isinstance(raw, dict):
-        return None
-    steps = raw.get("steps")
-    if not isinstance(steps, list):
-        return None
-    summary = raw.get("summary")
-    return {
-        "summary": str(summary) if summary is not None else "",
-        "steps": [s for s in steps if isinstance(s, dict)],
-    }
-
-
-def _step_args_deferred(step: dict[str, Any]) -> bool:
-    """Whether a step's args are deferred to runtime.
-
-    A step is "deferred" when the planner could not commit to concrete
-    args upfront — usually because the value depends on what an earlier
-    step's tool observes (URL discovered by a search, file path from a
-    directory listing, row id from a query, etc.).
-
-    Convention:
-    - ``"args"`` key missing → deferred
-    - ``args is None`` → deferred (explicit null in the planner JSON)
-    - ``args == {}`` → NOT deferred ("tool takes no arguments")
-    - ``args == {...}`` → NOT deferred (concrete)
-
-    Drives the "(resolved at runtime)" banner line and the
-    ``dynamic_steps`` count in the HITL approval args.
-    """
-    if "args" not in step:
-        return True
-    return step["args"] is None
-
-
-def _dynamic_step_count(plan: dict[str, Any]) -> int:
-    """Number of plan steps whose args will be resolved at runtime."""
-    steps = plan.get("steps") or []
-    return sum(
-        1
-        for step in steps
-        if isinstance(step, dict) and step.get("tool") and _step_args_deferred(step)
-    )
-
-
-def _render_plan_for_banner(plan: dict[str, Any]) -> str:
-    """Multi-line text used as the HITL banner ``command`` field. Compact
-    enough to read quickly but structured enough that a reviewer can spot
-    a wrong tool / wrong URL before approving.
-
-    Steps whose args are deferred to runtime render as
-    ``args: (resolved at runtime)`` rather than fabricating placeholder
-    JSON — the planner can't know e.g. a URL that a prior search step
-    will return, and showing ``{}`` would imply otherwise.
-    """
-    lines: list[str] = []
-    summary = plan.get("summary") or "(no summary)"
-    lines.append(f"Plan: {summary}")
-    steps = plan.get("steps") or []
-    for step in steps:
-        idx = step.get("step")
-        intent = step.get("intent") or "(no intent)"
-        tool = step.get("tool")
-        why = step.get("why")
-        prefix = f"  {idx}." if idx is not None else "  -"
-        lines.append(f"{prefix} {intent}")
-        if tool:
-            if _step_args_deferred(step):
-                lines.append(f"      tool: {tool}  args: (resolved at runtime)")
-            else:
-                args = step.get("args") or {}
-                args_repr = json.dumps(args, ensure_ascii=False) if args else "{}"
-                lines.append(f"      tool: {tool}  args: {args_repr}")
-        if why:
-            lines.append(f"      why:  {why}")
-    return "\n".join(lines)
-
-
-def _render_plan_for_priors(plan: dict[str, Any]) -> str:
-    """Prior-message body shown to the coordinator after approval.
-
-    Kept distinct from the banner format so the wording can drift
-    independently (the LLM sees prose; the human sees a structured
-    inspector view) and so we can mark the prior with an unambiguous
-    ``[Approved plan]`` header the planner / executor system prompts can
-    pattern-match against if needed.
-    """
-    body = _render_plan_for_banner(plan)
-    return (
-        "[Approved plan]\n"
-        f"{body}\n\n"
-        "The plan above is the agreed INTENT for this turn. Args shown "
-        "are concrete only where the user supplied them or where they're "
-        "knowable without running any tool first; everywhere else the "
-        "value '(resolved at runtime)' means: derive the argument from "
-        "your observations of the prior step, NOT from any placeholder "
-        "in this prior. You may skip or merge steps when an observation "
-        "makes them unnecessary; report any such deviation in your next "
-        "thought."
-    )
 
 
 @dataclass
@@ -264,24 +62,6 @@ class SessionState:
     # without bleeding between unrelated workspaces. Toggle via the
     # ``/plan`` slash command or ``PersistentAgent.set_plan_mode``.
     plan_mode_enabled: bool = False
-    updated_at: str = field(default_factory=_now)
-
-
-@dataclass
-class BackgroundTaskState:
-    """Process-local background sub-agent task metadata."""
-
-    task_id: str
-    session_id: str
-    agent_id: str
-    instruction: str
-    status: str = "running"
-    answer: str = ""
-    confidence: float = 0.0
-    steps: int = 0
-    error: str = ""
-    collected: bool = False
-    created_at: str = field(default_factory=_now)
     updated_at: str = field(default_factory=_now)
 
 
@@ -856,40 +636,38 @@ class PersistentAgent:
         self._coordinator = coordinator
         self._session_store = session_store
         self._memory = memory
-        self._explicit_llm = llm is not None
-        self._llm = llm or coordinator._llm
+        # Explicit summarizer/control LLM, if the caller supplied one. When
+        # absent, ``llm`` tracks the coordinator's current LLM (which model
+        # switching may swap), so it stays correct without re-pointing.
+        self._explicit_llm = llm
         self._guard_factory = guard_factory
         self._config = config or PersistentAgentConfig()
-        self._llm_registry = dict(llm_registry or {})
-        reserved_models = {"default", "reset", "clear"}
-        collisions = sorted(
-            model for model in self._llm_registry if model.lower() in reserved_models
+        self._models = ModelSwitcher(
+            coordinator=coordinator,
+            session_store=session_store,
+            llm_registry=llm_registry,
+            default_model=default_model,
         )
-        if collisions:
-            joined = ", ".join(repr(model) for model in collisions)
-            raise ValueError(f"model names are reserved for clearing overrides: {joined}")
-        non_factories = sorted(
-            model for model, factory in self._llm_registry.items() if not callable(factory)
-        )
-        if non_factories:
-            joined = ", ".join(repr(model) for model in non_factories)
-            raise TypeError(f"llm_registry entries must be zero-argument factories: {joined}")
-        if (
-            default_model is not None
-            and self._llm_registry
-            and default_model not in self._llm_registry
-        ):
-            raise ValueError(f"default_model {default_model!r} is not present in llm_registry")
-        self._default_model = default_model
-        self._llm_instances: dict[str, Any] = {}
-        self._default_agent_llms = self._snapshot_agent_llms()
-        self._background_tasks: dict[str, BackgroundTaskState] = {}
-        self._background_handles: dict[str, asyncio.Task[None]] = {}
         self._active_session_id: contextvars.ContextVar[str] = contextvars.ContextVar(
             f"agent_harness_session_{id(self)}",
             default="",
         )
-        self._install_background_tools()
+        self._background = BackgroundTaskManager(
+            coordinator=coordinator,
+            session_store=session_store,
+            session_id_provider=self._active_session_id.get,
+            apply_overrides=self._models.apply,
+            session_message_factory=lambda content: SessionMessage(
+                role="assistant",
+                content=content,
+            ),
+        )
+        self._background.install_tools()
+        self._plan_mode = PlanModeController(
+            coordinator=coordinator,
+            llm=lambda: self.llm,
+            tool_names=self._available_tool_names,
+        )
         # All memory retrieval, reconciliation, and compaction policy lives in
         # the controller. It receives the coordinator token-budget accessor and
         # the session summarizer LLM as callables so model switching is picked
@@ -900,7 +678,7 @@ class PersistentAgent:
             config=self._config,
             coordinator_agent_id=self._coordinator.config.agent_id,
             token_budget=self._coordinator_input_token_budget,
-            summarizer_llm=lambda: self._llm,
+            summarizer_llm=lambda: self.llm,
         )
 
     @property
@@ -910,8 +688,12 @@ class PersistentAgent:
 
     @property
     def llm(self) -> Any:
-        """LLM used for session summarization/control introspection."""
-        return self._llm
+        """LLM used for session summarization/control introspection.
+
+        Defaults to the coordinator's current LLM (so model switching is
+        reflected automatically) unless an explicit LLM was supplied.
+        """
+        return self._explicit_llm or self._coordinator._llm
 
     # ── Plan mode public surface ──────────────────────────────────────────
 
@@ -942,40 +724,13 @@ class PersistentAgent:
         through this ``PersistentAgent`` instance, and ``collect_background_task``
         can write the result back into the durable transcript.
         """
-        instruction = instruction.strip()
-        if not instruction:
-            raise ValueError("background task instruction is required")
-        agent = self._find_agent(agent_id)
-        if agent is None or agent is self._coordinator:
-            raise ValueError(f"unknown sub-agent {agent_id!r}")
-        if self._active_session_id.get() != session_id:
-            state = await self._session_store.load(session_id)
-            self._apply_model_overrides(state)
-        task_id = f"bg_{uuid.uuid4().hex[:12]}"
-        task = BackgroundTaskState(
-            task_id=task_id,
-            session_id=session_id,
-            agent_id=agent_id,
-            instruction=instruction,
-        )
-        self._background_tasks[task_id] = task
-        self._background_handles[task_id] = asyncio.create_task(
-            self._run_background_subagent(task, agent)
-        )
-        return _copy_background_task(task)
+        return await self._background.start(session_id, agent_id, instruction)
 
     async def list_background_tasks(
         self, session_id: str | None = None
     ) -> list[BackgroundTaskState]:
         """Return process-local background tasks, newest first."""
-        tasks = self._background_tasks.values()
-        if session_id is not None:
-            tasks = [task for task in tasks if task.session_id == session_id]
-        return sorted(
-            (_copy_background_task(task) for task in tasks),
-            key=lambda task: task.created_at,
-            reverse=True,
-        )
+        return await self._background.list(session_id)
 
     async def collect_background_task(
         self,
@@ -983,24 +738,7 @@ class PersistentAgent:
         task_id: str,
     ) -> BackgroundTaskState:
         """Append a finished background task result to the session transcript."""
-        task = self._background_tasks.get(task_id)
-        if task is None or task.session_id != session_id:
-            raise ValueError(f"background task not found: {task_id}")
-        if task.status == "running":
-            raise ValueError(f"background task still running: {task_id}")
-        if not task.collected:
-            await self._session_store.append_messages(
-                session_id,
-                [
-                    SessionMessage(
-                        role="assistant",
-                        content=_render_background_result(task),
-                    )
-                ],
-            )
-            task.collected = True
-            task.updated_at = _now()
-        return _copy_background_task(task)
+        return await self._background.collect(session_id, task_id)
 
     async def cancel_background_task(
         self,
@@ -1008,28 +746,19 @@ class PersistentAgent:
         task_id: str,
     ) -> BackgroundTaskState:
         """Cancel a running process-local background task."""
-        task = self._background_tasks.get(task_id)
-        if task is None or task.session_id != session_id:
-            raise ValueError(f"background task not found: {task_id}")
-        handle = self._background_handles.get(task_id)
-        if task.status == "running" and handle is not None and not handle.done():
-            handle.cancel()
-            task.status = "cancelled"
-            task.error = "cancelled by user"
-            task.updated_at = _now()
-        return _copy_background_task(task)
+        return await self._background.cancel(session_id, task_id)
 
     def available_models(self) -> list[str]:
         """Return model names available for session-scoped switching."""
-        return sorted(self._llm_registry)
+        return self._models.available_models()
 
     def default_model(self) -> str | None:
         """Return the label for the construction-time/default model, if supplied."""
-        return self._default_model
+        return self._models.default_model()
 
     def model_switching_enabled(self) -> bool:
         """True when an LLM registry was supplied at construction time."""
-        return bool(self._llm_registry)
+        return self._models.enabled()
 
     def context_token_budget(self) -> int | None:
         """Return the live coordinator input budget used for compaction."""
@@ -1037,8 +766,7 @@ class PersistentAgent:
 
     async def model_overrides(self, session_id: str) -> dict[str, str]:
         """Return session-scoped agent_id -> model_name overrides."""
-        state = await self._session_store.load(session_id)
-        return dict(state.model_overrides)
+        return await self._models.overrides(session_id)
 
     async def switch_model(
         self,
@@ -1047,19 +775,11 @@ class PersistentAgent:
         model_name: str,
     ) -> SessionState:
         """Persist and apply a session-scoped model override for one agent."""
-        if model_name not in self._llm_registry:
-            raise ValueError(f"unknown model {model_name!r}")
-        if self._find_agent(agent_id) is None:
-            raise ValueError(f"unknown agent {agent_id!r}")
-        state = await self._session_store.set_model_override(session_id, agent_id, model_name)
-        self._apply_model_overrides(state)
-        return state
+        return await self._models.switch(session_id, agent_id, model_name)
 
     async def clear_model_override(self, session_id: str, agent_id: str) -> SessionState:
         """Remove and apply a session-scoped model override for one agent."""
-        state = await self._session_store.set_model_override(session_id, agent_id, None)
-        self._apply_model_overrides(state)
-        return state
+        return await self._models.clear(session_id, agent_id)
 
     async def chat(
         self,
@@ -1076,7 +796,7 @@ class PersistentAgent:
         ``ERROR`` and returns without writing to the session store.
         """
         state = await self._session_store.load(session_id)
-        self._apply_model_overrides(state)
+        self._models.apply(state)
         active_session_token = self._active_session_id.set(session_id)
         run_id = run_id or str(uuid.uuid4())
         try:
@@ -1098,89 +818,26 @@ class PersistentAgent:
             # propagate ``asyncio.CancelledError`` (Esc-cancel) cleanly without
             # writing to the session store.
             if state.plan_mode_enabled:
-                # Inline the plan-and-approve loop so PLAN_PROPOSED events
-                # yield to the consumer (renderer) BEFORE the approval
-                # banner blocks on stdin. Yielding directly preserves the
-                # order: plan first, then banner, then user input.
-                #
-                # Uses ``request_plan_approval`` (sibling of the per-tool
-                # ``request_approval``) — same input plumbing, but no
-                # ``a`` / ``A`` options. Session-allow / persistent-allow
-                # make sense when the "tool" is something like
-                # ``shell/grep`` that fires repeatedly; they're actively
-                # wrong when the gate is the plan itself (``a`` would
-                # silently turn plan mode off for the session).
-                from harness.hitl import request_plan_approval  # noqa: PLC0415
+                decision: PlanDecision | None = None
+                async for item in self._plan_mode.run(
+                    message=message,
+                    session_id=session_id,
+                    guard=turn_guard,
+                ):
+                    if isinstance(item, PlanDecision):
+                        decision = item
+                    else:
+                        yield item
 
-                approved_plan: dict[str, Any] | None = None
-                plan_rejected = False
-                correction: str | None = None
-
-                for revision in range(_PLAN_REVISION_LIMIT + 1):
-                    try:
-                        candidate_plan = await self._generate_plan(
-                            message=message,
-                            session_id=session_id,
-                            correction=correction,
-                        )
-                    except Exception as exc:  # noqa: BLE001 — surface as ERROR
-                        yield BusEvent.error_event(
-                            self._coordinator.config.agent_id,
-                            error=f"plan generation failed: {exc}",
-                        )
-                        plan_rejected = True
-                        break
-
-                    # Yield FIRST so the renderer prints the plan, then
-                    # block for approval so the user is responding to a
-                    # plan they've actually seen.
-                    yield BusEvent.plan_proposed(
-                        self._coordinator.config.agent_id,
-                        plan=candidate_plan,
-                        revision=revision,
-                    )
-
-                    response = await request_plan_approval(
-                        summary=candidate_plan.get("summary", ""),
-                        step_count=len(candidate_plan.get("steps", [])),
-                        dynamic_step_count=_dynamic_step_count(candidate_plan),
-                        agent_id=self._coordinator.config.agent_id,
-                        guard=turn_guard,
-                    )
-                    if response.approved:
-                        approved_plan = candidate_plan
-                        break
-                    if response.correction:
-                        # Free-text revision — re-plan with this feedback.
-                        correction = response.correction
-                        continue
-                    # Plain rejection (no correction text).
-                    yield BusEvent.error_event(
-                        self._coordinator.config.agent_id, error="plan rejected by user"
-                    )
-                    plan_rejected = True
-                    break
-                else:
-                    # Revision budget exhausted — give the user a clean
-                    # rejection rather than silently executing the last plan.
-                    yield BusEvent.error_event(
-                        self._coordinator.config.agent_id,
-                        error=(
-                            f"plan revision limit ({_PLAN_REVISION_LIMIT}) reached; "
-                            "send 'y' to approve, 'n' to reject, or shorten the feedback"
-                        ),
-                    )
-                    plan_rejected = True
-
-                if plan_rejected:
+                if decision is None or decision.rejected:
                     return
-                if approved_plan is not None:
+                if decision.approved_plan is not None:
                     # Inject as a pinned prior so the ReAct loop's system
                     # prompt + memory prior stays byte-identical across the
                     # turn, and the plan rides as a user/assistant pair the
                     # coordinator clearly sees as "approved guidance."
                     plan_priors = [
-                        ("user", _render_plan_for_priors(approved_plan)),
+                        ("user", _render_plan_for_priors(decision.approved_plan)),
                         ("assistant", "Acknowledged. Executing the approved plan."),
                     ]
                     prior_messages = list(prior_messages) + plan_priors
@@ -1252,38 +909,6 @@ class PersistentAgent:
         finally:
             self._active_session_id.reset(active_session_token)
 
-    async def _generate_plan(
-        self,
-        *,
-        message: str,
-        session_id: str,  # noqa: ARG002 — reserved for future per-session context
-        correction: str | None,
-    ) -> dict[str, Any]:
-        """Call the coordinator's LLM with the planner system prompt.
-
-        Returns the parsed plan dict. Raises ``ValueError`` if the LLM
-        response can't be coerced into the expected ``{summary, steps}``
-        shape.
-        """
-        tools = self._available_tool_names()
-        system = _PLAN_SYSTEM_PROMPT.replace("{tools}", ", ".join(tools) or "(none)")
-        if correction:
-            system = system + _PLAN_CORRECTION_HINT.replace("{correction}", correction)
-
-        raw = await self._llm.complete(
-            system=system,
-            messages=[{"role": "user", "content": message}],
-            response_format={"type": "json_object"},
-            source="planner",
-        )
-        plan = _coerce_plan(raw)
-        if plan is None:
-            raise ValueError(
-                "planner returned a response that could not be parsed as "
-                "a {summary, steps} JSON object"
-            )
-        return plan
-
     def _available_tool_names(self) -> list[str]:
         """Tools the coordinator (and any wired sub-agents at first level)
         can call. Surfaces this to the planner so it doesn't propose tools
@@ -1313,7 +938,7 @@ class PersistentAgent:
             for tool_name, tool in getattr(agent, "_tools", {}).items():
                 if _is_mcp_tool(tool):
                     mcp_tools.append(_describe_mcp_tool(tool, owner_agent_id=parent_agent_id))
-                sub = _subagent_tool_agent(tool)
+                sub = subagent_tool_agent(tool)
                 if sub is None:
                     continue
                 sub_info = {
@@ -1395,69 +1020,8 @@ class PersistentAgent:
         self._mem.evict(session_id)
         return deleted
 
-    def _snapshot_agent_llms(self) -> dict[str, Any]:
-        return {
-            agent.config.agent_id: getattr(agent, "_llm", None) for agent in self._iter_agents()
-        }
-
     def _iter_agents(self) -> list[BaseAgent]:
-        agents: list[BaseAgent] = []
-        seen: set[int] = set()
-
-        def visit(agent: BaseAgent) -> None:
-            if id(agent) in seen:
-                return
-            seen.add(id(agent))
-            agents.append(agent)
-            for tool in getattr(agent, "_tools", {}).values():
-                sub = _subagent_tool_agent(tool)
-                if sub is not None:
-                    visit(sub)
-
-        visit(self._coordinator)
-        return agents
-
-    def _install_background_tools(self) -> None:
-        tools = getattr(self._coordinator, "_tools", {})
-        if not isinstance(tools, dict):
-            return
-        session_id_provider = self._active_session_id.get
-        background_tools: dict[str, Any] = {}
-        for tool in list(tools.values()):
-            sub = _subagent_tool_agent(tool)
-            if sub is None:
-                continue
-            background = BackgroundDelegateTool(
-                agent_id=sub.config.agent_id,
-                start_task=self.start_background_subagent,
-                session_id_provider=session_id_provider,
-            )
-            background_tools.setdefault(background.name, background)
-        if background_tools:
-            background_tools.setdefault(
-                CheckBackgroundTaskTool.name,
-                CheckBackgroundTaskTool(
-                    list_tasks=self.list_background_tasks,
-                    session_id_provider=session_id_provider,
-                ),
-            )
-            background_tools.setdefault(
-                CollectBackgroundTaskTool.name,
-                CollectBackgroundTaskTool(
-                    collect_task=self.collect_background_task,
-                    session_id_provider=session_id_provider,
-                ),
-            )
-        for name, tool in background_tools.items():
-            tools.setdefault(name, tool)
-            if name not in self._coordinator.config.allowed_tools:
-                self._coordinator.config.allowed_tools.append(name)
-
-    def _find_agent(self, agent_id: str) -> BaseAgent | None:
-        for agent in self._iter_agents():
-            if agent.config.agent_id == agent_id:
-                return agent
-        return None
+        return iter_agents(self._coordinator)
 
     def _disable_checkpoint_resume_for_persistent_hitl(self) -> Callable[[], None]:
         agents = self._iter_agents()
@@ -1481,67 +1045,6 @@ class PersistentAgent:
 
         return restore
 
-    async def _run_background_subagent(
-        self,
-        task: BackgroundTaskState,
-        agent: BaseAgent,
-    ) -> None:
-        last_done: dict[str, Any] | None = None
-        last_error = ""
-        try:
-            async for event in agent.run_stream(
-                task=task.instruction,
-                run_id=task.task_id,
-            ):
-                if event.type == EventType.TASK_DONE:
-                    last_done = event.payload
-                elif event.type == EventType.ERROR:
-                    last_error = event.error
-        except asyncio.CancelledError:
-            task.status = "cancelled"
-            task.error = "cancelled by user"
-            raise
-        except Exception as exc:  # noqa: BLE001 — store for /tasks
-            task.status = "failed"
-            task.error = f"{type(exc).__name__}: {exc}"
-        else:
-            if last_done is not None:
-                task.status = "done"
-                task.answer = str(last_done.get("answer", ""))
-                task.confidence = float(last_done.get("confidence", 0.0) or 0.0)
-                task.steps = int(last_done.get("steps", 0) or 0)
-            else:
-                task.status = "failed"
-                task.error = last_error or "sub-agent stream ended without TASK_DONE"
-        finally:
-            task.updated_at = _now()
-
-    def _make_registered_llm(self, model_name: str) -> Any:
-        llm = self._llm_instances.get(model_name)
-        if llm is None:
-            llm = self._llm_registry[model_name]()
-            self._llm_instances[model_name] = llm
-        return llm
-
-    def _apply_model_overrides(self, state: SessionState) -> None:
-        # Reset first so switching sessions cannot leak a previous
-        # session's model choice into this one.
-        for agent in self._iter_agents():
-            self._default_agent_llms.setdefault(agent.config.agent_id, getattr(agent, "_llm", None))
-            agent._llm = self._default_agent_llms[agent.config.agent_id]
-
-        for agent_id, model_name in state.model_overrides.items():
-            agent = self._find_agent(agent_id)
-            if agent is None or model_name not in self._llm_registry:
-                continue
-            agent._llm = self._make_registered_llm(model_name)
-            guard = getattr(agent, "_guard", None)
-            if guard is not None and hasattr(agent._llm, "set_budget"):
-                agent._llm.set_budget(guard)
-
-        if not self._explicit_llm:
-            self._llm = self._coordinator._llm
-
     def _assign_guard(self, guard: Any) -> None:
         seen_agents: set[int] = set()
 
@@ -1554,7 +1057,7 @@ class PersistentAgent:
             if hasattr(llm, "set_budget"):
                 llm.set_budget(guard)
             for tool in getattr(agent, "_tools", {}).values():
-                sub = _subagent_tool_agent(tool)
+                sub = subagent_tool_agent(tool)
                 if sub is not None:
                     visit(sub)
 
@@ -1682,7 +1185,7 @@ class PersistentAgent:
     def _coordinator_input_token_budget(self) -> int | None:
         """Read the coordinator LLM's input budget. Falls back to ``None``
         when the adapter doesn't advertise one."""
-        llm = getattr(self._coordinator, "_llm", None) or self._llm
+        llm = getattr(self._coordinator, "_llm", None) or self.llm
         budget = getattr(llm, "input_token_budget", None)
         return int(budget) if isinstance(budget, int) and budget > 0 else None
 
@@ -1707,30 +1210,6 @@ def _copy_state(state: SessionState) -> SessionState:
         plan_mode_enabled=state.plan_mode_enabled,
         updated_at=state.updated_at,
     )
-
-
-def _copy_background_task(task: BackgroundTaskState) -> BackgroundTaskState:
-    return BackgroundTaskState(
-        task_id=task.task_id,
-        session_id=task.session_id,
-        agent_id=task.agent_id,
-        instruction=task.instruction,
-        status=task.status,
-        answer=task.answer,
-        confidence=task.confidence,
-        steps=task.steps,
-        error=task.error,
-        collected=task.collected,
-        created_at=task.created_at,
-        updated_at=task.updated_at,
-    )
-
-
-def _render_background_result(task: BackgroundTaskState) -> str:
-    header = f"[Background task {task.task_id}] {task.agent_id} {task.status}: {task.instruction}"
-    if task.status == "done":
-        return f"{header}\n\n{task.answer}\n\nconfidence={task.confidence:.2f} steps={task.steps}"
-    return f"{header}\n\nerror: {task.error or task.status}"
 
 
 def _event_to_trace(event: BusEvent) -> dict[str, Any]:
@@ -1771,13 +1250,6 @@ def _describe_agent(agent: BaseAgent) -> dict[str, Any]:
 
 def _describe_skills(agent: BaseAgent) -> list[dict[str, Any]]:
     return [skill.summary() for skill in getattr(agent.config, "skills", [])]
-
-
-def _subagent_tool_agent(tool: Any) -> BaseAgent | None:
-    if tool.__class__.__name__ != "SubAgentTool":
-        return None
-    agent = getattr(tool, "_agent", None)
-    return agent if isinstance(agent, BaseAgent) else None
 
 
 def _is_mcp_tool(tool: Any) -> bool:

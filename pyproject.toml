@@ -74,7 +74,12 @@ testpaths = ["tests"]
 # ``follow_imports = silent`` lets mypy resolve imported types for checking
 # without reporting errors in those un-migrated modules.
 python_version = "3.10"
-files = ["harness/events.py", "harness/session_memory.py"]
+files = [
+    "harness/agent_tree.py",
+    "harness/events.py",
+    "harness/plan_mode.py",
+    "harness/session_memory.py",
+]
 ignore_missing_imports = true
 follow_imports = "silent"
 strict = true
