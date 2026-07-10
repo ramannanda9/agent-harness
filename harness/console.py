@@ -34,6 +34,47 @@ def trunc(s: str, n: int) -> str:
     return s if len(s) <= n else s[:n] + "…"
 
 
+class _TextTail:
+    """Bounded tail buffer for text that may arrive in chunks."""
+
+    def __init__(self, *, max_chars: int, max_lines: int) -> None:
+        self._max_chars = max(0, max_chars)
+        self._max_lines = max(0, max_lines)
+        self._tail = ""
+        self.total_chars = 0
+        self.total_lines = 0
+        self.omitted = False
+
+    def append(self, chunk: str) -> None:
+        if not chunk:
+            return
+        self.total_chars += len(chunk)
+        self.total_lines += len(chunk.splitlines())
+        if self._max_chars <= 0 or self._max_lines <= 0:
+            self.omitted = True
+            self._tail = ""
+            return
+
+        self._tail += chunk
+        self._trim()
+
+    @property
+    def text(self) -> str:
+        return self._tail
+
+    def _trim(self) -> None:
+        lines = self._tail.splitlines()
+        if len(lines) > self._max_lines:
+            self.omitted = True
+            self._tail = "\n".join(lines[-self._max_lines :])
+        if len(self._tail) > self._max_chars:
+            self.omitted = True
+            self._tail = self._tail[-self._max_chars :]
+            if "\n" in self._tail:
+                # Avoid starting mid-line when a newline still exists inside the slice.
+                self._tail = self._tail[self._tail.find("\n") + 1 :]
+
+
 class ConsoleRenderer:
     """Renders BusEvent objects to a text stream.
 
@@ -48,6 +89,10 @@ class ConsoleRenderer:
         show_tokens:        If True, TOKEN events are printed inline.
         spinner:            If True, show a TTY-only busy spinner between events.
         spinner_delay:      Seconds to wait before drawing the spinner.
+        tail_large_outputs: Render large observations as a bounded tail block
+                            instead of first-N-character truncation.
+        tail_lines:         Maximum lines to show in an observation tail.
+        tail_chars:         Maximum characters to show in an observation tail.
         out:                Output stream (defaults to ``sys.stdout``).
     """
 
@@ -61,6 +106,9 @@ class ConsoleRenderer:
         show_tokens: bool = False,
         spinner: bool = True,
         spinner_delay: float = 0.4,
+        tail_large_outputs: bool = True,
+        tail_lines: int = 5,
+        tail_chars: int = 4_000,
         out: TextIO | None = None,
     ) -> None:
         self._truncate = truncate
@@ -68,6 +116,9 @@ class ConsoleRenderer:
         self._sep_width = sep_width
         self._label_w = agent_label_width
         self._show_tokens = show_tokens
+        self._tail_large_outputs = tail_large_outputs
+        self._tail_lines = tail_lines
+        self._tail_chars = tail_chars
         self._out = out or sys.stdout
         self._in_token_stream = False
         is_tty = bool(getattr(self._out, "isatty", lambda: False)())
@@ -190,10 +241,7 @@ class ConsoleRenderer:
 
         elif t == EventType.OBSERVATION:
             obs = p.get("observation", "")
-            print(
-                f"{self._label(event)} obs     {trunc(obs, 110)}",
-                file=self._out,
-            )
+            self._render_observation(event, str(obs))
 
         elif t == EventType.CONTEXT:
             tokens = int(p.get("tokens") or 0)
@@ -390,6 +438,40 @@ class ConsoleRenderer:
         if event.agent_id:
             return f"[{event.agent_id:<{self._label_w}}]"
         return f"[{event.type.value:<{self._label_w}}]"
+
+    def _render_observation(self, event: BusEvent, obs: str) -> None:
+        label = self._label(event)
+        should_tail = self._tail_large_outputs and (len(obs) > self._truncate or "\n" in obs)
+        if not should_tail:
+            print(f"{label} obs     {trunc(obs, self._truncate)}", file=self._out)
+            return
+
+        tail = _TextTail(
+            max_chars=self._tail_chars,
+            max_lines=self._tail_lines,
+        )
+        tail.append(obs)
+        self._print_observation_tail(label, tail)
+
+    def _print_observation_tail(self, label: str, tail: _TextTail) -> None:
+        self._write_observation_tail(label, tail)
+
+    def _write_observation_tail(self, label: str, tail: _TextTail) -> int:
+        if tail.omitted:
+            self._out.write(
+                f"{label} obs     [tail: last {self._tail_lines} lines / "
+                f"{len(tail.text):,} of {tail.total_chars:,} chars]\n"
+            )
+        else:
+            self._out.write(
+                f"{label} obs     [tail: {tail.total_lines} lines / {tail.total_chars:,} chars]\n"
+            )
+        drawn = 1
+        if tail.text:
+            for line in tail.text.splitlines():
+                self._out.write(f"{'':<{self._label_w + 11}}{line}\n")
+                drawn += 1
+        return drawn
 
     def _schedule_spinner(self, event: BusEvent) -> None:
         label = self._spinner_label(event)
