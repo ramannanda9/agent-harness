@@ -291,6 +291,20 @@ def test_browser_oauth_httpx_auth_constructs_lazily():
     assert auth.httpx_auth is provider
 
 
+def test_browser_oauth_provider_is_an_httpx2_auth():
+    """The transport hands this to httpx2.AsyncClient(auth=...), which rejects
+    anything that isn't an httpx2.Auth. mcp>=2 moved off httpx, so this pins
+    the provider to the client library the transport actually uses."""
+    import httpx2
+
+    auth = BrowserOAuthMCPAuth(
+        server_url="https://mcp.example.com/",
+        provider_name="mcp:example",
+    )
+
+    assert isinstance(auth.httpx_auth, httpx2.Auth)
+
+
 async def test_browser_oauth_static_client_id_seeds_storage(tmp_path):
     """Pre-registered client_id should be written to storage so the SDK skips
     dynamic registration (which would fail against providers that don't

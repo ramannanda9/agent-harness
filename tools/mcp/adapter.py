@@ -158,7 +158,7 @@ class MCPServerConnection:
         await self._exit_stack.__aenter__()
 
         try:
-            # OAuth (httpx.Auth) providers bypass the static-headers path —
+            # OAuth (httpx2.Auth) providers bypass the static-headers path —
             # the transport client drives the OAuth dance itself.
             httpx_auth = getattr(self._auth_provider, "httpx_auth", None)
             auth = (
@@ -169,17 +169,27 @@ class MCPServerConnection:
             auth_headers = dict(auth.headers) if auth else {}
 
             if isinstance(self._params, StreamableHttpServerParams):
-                from mcp.client.streamable_http import streamablehttp_client
+                import httpx2
+                from mcp.client.streamable_http import streamable_http_client
 
+                # mcp>=2 configures the streamable-HTTP transport through a
+                # caller-supplied client rather than per-call kwargs, so headers,
+                # timeouts and auth are folded into the AsyncClient here. We
+                # create it, so we own closing it.
                 headers = {**self._params.headers, **auth_headers}
-                read, write, _ = await self._exit_stack.enter_async_context(
-                    streamablehttp_client(
-                        self._params.url,
+                http_client = await self._exit_stack.enter_async_context(
+                    httpx2.AsyncClient(
                         headers=headers or None,
-                        timeout=self._params.timeout,
-                        sse_read_timeout=self._params.sse_read_timeout,
+                        timeout=httpx2.Timeout(
+                            self._params.timeout,
+                            read=self._params.sse_read_timeout,
+                        ),
                         auth=httpx_auth,
+                        follow_redirects=True,
                     )
+                )
+                read, write = await self._exit_stack.enter_async_context(
+                    streamable_http_client(self._params.url, http_client=http_client)
                 )
             elif isinstance(self._params, StdioServerParameters):
                 params = merge_mcp_auth(self._params, auth)
