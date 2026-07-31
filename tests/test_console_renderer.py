@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from io import StringIO
 
-from harness.console import ConsoleRenderer, _TextTail
+from harness.console import ConsoleRenderer, excerpt
 from harness.events import BusEvent, EventType
 
 
@@ -209,18 +209,32 @@ def test_console_renderer_small_observation_stays_single_line():
 
     text = out.getvalue()
     assert "[agent           ] obs     done" in text
-    assert "[tail:" not in text
+    assert "lines /" not in text
 
 
-def test_console_renderer_large_observation_displays_tail_not_prefix():
+def test_excerpt_splits_head_and_tail_with_elided_middle():
+    view = excerpt("\n".join(f"line {i}" for i in range(1, 11)), head_lines=2, tail_lines=3)
+
+    assert view.head == ["line 1", "line 2"]
+    assert view.tail == ["line 8", "line 9", "line 10"]
+    assert view.elided == 5
+    assert view.total_lines == 10
+    assert view.truncated is True
+
+
+def test_excerpt_keeps_everything_when_text_fits():
+    view = excerpt("a\nb\nc", head_lines=2, tail_lines=3)
+
+    assert view.head == ["a", "b", "c"]
+    assert view.tail == []
+    assert view.elided == 0
+    assert view.truncated is False
+
+
+def test_console_renderer_large_observation_keeps_head_and_tail():
     out = StringIO()
-    renderer = ConsoleRenderer(
-        out=out,
-        truncate=20,
-        tail_lines=5,
-        tail_chars=30,
-    )
-    observation = "prefix-" + ("x" * 80) + "-tail"
+    renderer = ConsoleRenderer(out=out, truncate=20, width=200)
+    observation = "\n".join(f"line {idx}" for idx in range(1, 21))
 
     renderer.render(
         BusEvent(
@@ -231,87 +245,75 @@ def test_console_renderer_large_observation_displays_tail_not_prefix():
     )
 
     text = out.getvalue()
-    assert "[tail: last 5 lines" in text
-    assert "-tail" in text
-    assert "prefix-" not in text
-
-
-def test_text_tail_accepts_streamed_chunks():
-    tail = _TextTail(max_chars=50, max_lines=3)
-
-    tail.append("line 1\nline 2\n")
-    tail.append("line 3\n")
-    tail.append("line 4")
-
-    assert tail.omitted is True
-    assert tail.total_chars == len("line 1\nline 2\nline 3\nline 4")
-    assert tail.text == "line 2\nline 3\nline 4"
-
-
-def test_console_renderer_multiline_observation_displays_last_lines():
-    out = StringIO()
-    renderer = ConsoleRenderer(out=out, truncate=20, tail_lines=2, tail_chars=200)
-    observation = "\n".join(["line 1", "line 2", "line 3", "line 4"])
-
-    renderer.render(
-        BusEvent(
-            type=EventType.OBSERVATION,
-            agent_id="agent",
-            payload={"observation": observation},
-        )
-    )
-
-    text = out.getvalue()
-    assert "line 3" in text
-    assert "line 4" in text
-    assert "line 1" not in text
-    assert "line 2" not in text
-
-
-def test_console_renderer_default_observation_tail_is_compact():
-    out = StringIO()
-    renderer = ConsoleRenderer(out=out, truncate=20)
-    observation = "\n".join(f"line {idx}" for idx in range(1, 9))
-
-    renderer.render(
-        BusEvent(
-            type=EventType.OBSERVATION,
-            agent_id="agent",
-            payload={"observation": observation},
-        )
-    )
-
-    text = out.getvalue()
-    assert "[tail: last 5 lines" in text
-    assert "line 4" in text
-    assert "line 8" in text
-    assert "line 3" not in text
-
-
-def test_console_renderer_tty_observation_tail_renders_once_for_completed_event():
-    out = _TTYStringIO()
-    renderer = ConsoleRenderer(out=out, truncate=20, tail_lines=2, tail_chars=200)
-    observation = "\n".join(["line 1", "line 2", "line 3"])
-
-    renderer.render(
-        BusEvent(
-            type=EventType.OBSERVATION,
-            agent_id="agent",
-            payload={"observation": observation},
-        )
-    )
-
-    text = out.getvalue()
-    assert "[tail: last 2 lines" in text
-    assert text.count("[tail:") == 1
-    assert "\033[A\r\033[2K" not in text
+    assert "[7 of 20 lines /" in text
+    assert "line 1" in text
     assert "line 2" in text
-    assert "line 3" in text
+    assert "… 13 lines elided …" in text
+    assert "line 20" in text
+    assert "line 10" not in text
 
 
-def test_console_renderer_tail_can_be_disabled_for_old_truncation():
+def test_console_renderer_short_multiline_observation_shows_every_line():
     out = StringIO()
-    renderer = ConsoleRenderer(out=out, truncate=20, tail_large_outputs=False)
+    renderer = ConsoleRenderer(out=out, truncate=20, width=200)
+    observation = "\n".join(f"line {idx}" for idx in range(1, 6))
+
+    renderer.render(
+        BusEvent(
+            type=EventType.OBSERVATION,
+            agent_id="agent",
+            payload={"observation": observation},
+        )
+    )
+
+    text = out.getvalue()
+    assert "[5 lines /" in text
+    assert "elided" not in text
+    for idx in range(1, 6):
+        assert f"line {idx}" in text
+
+
+def test_console_renderer_clips_wide_lines_to_display_width():
+    out = StringIO()
+    renderer = ConsoleRenderer(out=out, truncate=20, width=80)
+    observation = "prefix-" + ("x" * 4_000) + "-tail"
+
+    renderer.render(
+        BusEvent(
+            type=EventType.OBSERVATION,
+            agent_id="agent",
+            payload={"observation": observation},
+        )
+    )
+
+    text = out.getvalue()
+    assert "prefix-" in text
+    assert "-tail" in text
+    assert len(observation) not in {len(line) for line in text.splitlines()}
+    assert max(len(line) for line in text.splitlines()) <= 80
+
+
+def test_console_renderer_tty_observation_renders_once_for_completed_event():
+    out = _TTYStringIO()
+    renderer = ConsoleRenderer(out=out, truncate=20, width=200)
+    observation = "\n".join(f"line {idx}" for idx in range(1, 21))
+
+    renderer.render(
+        BusEvent(
+            type=EventType.OBSERVATION,
+            agent_id="agent",
+            payload={"observation": observation},
+        )
+    )
+
+    text = out.getvalue()
+    assert text.count("lines elided") == 1
+    assert "\033[A\r\033[2K" not in text
+
+
+def test_console_renderer_excerpt_can_be_disabled_for_old_truncation():
+    out = StringIO()
+    renderer = ConsoleRenderer(out=out, truncate=20, excerpt_large_outputs=False)
 
     renderer.render(
         BusEvent(
@@ -324,7 +326,7 @@ def test_console_renderer_tail_can_be_disabled_for_old_truncation():
     text = out.getvalue()
     assert "prefix-" in text
     assert "-tail" not in text
-    assert "[tail:" not in text
+    assert "lines /" not in text
 
 
 def test_console_renderer_terminal_events_do_not_restart_spinner():
