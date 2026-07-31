@@ -226,7 +226,7 @@ class BrowserOAuthMCPAuth:
 
     @property
     def httpx_auth(self) -> Any:
-        """The ``httpx.Auth`` instance for streamable-HTTP / SSE transports.
+        """The ``httpx2.Auth`` instance for streamable-HTTP / SSE transports.
 
         ``MCPServerConnection`` detects this attribute and passes the
         provider straight to the transport client's ``auth=`` parameter,
@@ -241,7 +241,7 @@ class BrowserOAuthMCPAuth:
         return MCPAuth()
 
     def _build_provider(self) -> Any:
-        from mcp.client.auth import OAuthClientProvider
+        from mcp.client.auth import AuthorizationCodeResult, OAuthClientProvider
         from mcp.shared.auth import OAuthClientInformationFull, OAuthClientMetadata
 
         storage = _FileTokenStorage(self._auth_file, self._provider_name)
@@ -288,14 +288,15 @@ class BrowserOAuthMCPAuth:
             else:
                 print(f"{prefix} {url}")
 
-        async def callback_handler() -> tuple[str, str | None]:
+        async def callback_handler() -> AuthorizationCodeResult:
             from harness.oauth_browser import wait_for_oauth_callback
 
-            return await wait_for_oauth_callback(
+            code, state = await wait_for_oauth_callback(
                 port=port,
                 path=self._callback_path,
                 timeout=self._callback_timeout,
             )
+            return AuthorizationCodeResult(code=code, state=state)
 
         return OAuthClientProvider(
             server_url=self._server_url,
@@ -303,7 +304,6 @@ class BrowserOAuthMCPAuth:
             storage=storage,
             redirect_handler=redirect_handler,
             callback_handler=callback_handler,
-            timeout=self._callback_timeout,
         )
 
 
