@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sys
 import threading
 from collections.abc import AsyncIterator
@@ -34,6 +35,65 @@ def trunc(s: str, n: int) -> str:
     return s if len(s) <= n else s[:n] + "…"
 
 
+def clip_middle(s: str, n: int) -> str:
+    """Fit *s* into *n* characters by eliding its middle.
+
+    Unlike :func:`trunc` this keeps the end of the line, which is where a
+    single-line tool result (a status, an error) usually carries its point.
+    """
+    if len(s) <= n or n <= 1:
+        return trunc(s, n)
+    head = (n - 1) * 2 // 3
+    tail = n - 1 - head
+    return f"{s[:head]}…{s[-tail:]}" if tail else f"{s[:head]}…"
+
+
+class _Excerpt(NamedTuple):
+    """A head+tail view of multi-line text, with the middle elided.
+
+    Tool output carries context at the top (the command, a header row) and
+    the verdict at the bottom, so both ends are worth keeping.
+    """
+
+    head: list[str]
+    tail: list[str]
+    elided: int
+    total_lines: int
+    total_chars: int
+
+    @property
+    def truncated(self) -> bool:
+        return self.elided > 0
+
+
+def excerpt(text: str, *, head_lines: int, tail_lines: int) -> _Excerpt:
+    """Split *text* into leading and trailing line windows.
+
+    When the text fits within ``head_lines + tail_lines`` every line lands in
+    ``head`` and ``tail`` is empty, so callers can render the two windows
+    unconditionally.
+    """
+    head_lines = max(0, head_lines)
+    tail_lines = max(0, tail_lines)
+    lines = text.splitlines()
+    total = len(lines)
+    if total <= head_lines + tail_lines:
+        return _Excerpt(
+            head=lines,
+            tail=[],
+            elided=0,
+            total_lines=total,
+            total_chars=len(text),
+        )
+    return _Excerpt(
+        head=lines[:head_lines],
+        tail=lines[total - tail_lines :] if tail_lines else [],
+        elided=total - head_lines - tail_lines,
+        total_lines=total,
+        total_chars=len(text),
+    )
+
+
 class ConsoleRenderer:
     """Renders BusEvent objects to a text stream.
 
@@ -48,6 +108,12 @@ class ConsoleRenderer:
         show_tokens:        If True, TOKEN events are printed inline.
         spinner:            If True, show a TTY-only busy spinner between events.
         spinner_delay:      Seconds to wait before drawing the spinner.
+        excerpt_large_outputs: Render large observations as a head+tail excerpt
+                            instead of first-N-character truncation.
+        excerpt_head_lines: Lines to show from the start of an observation.
+        excerpt_tail_lines: Lines to show from the end of an observation.
+        width:              Display width for excerpt lines; None auto-detects
+                            the terminal size at render time.
         out:                Output stream (defaults to ``sys.stdout``).
     """
 
@@ -61,6 +127,10 @@ class ConsoleRenderer:
         show_tokens: bool = False,
         spinner: bool = True,
         spinner_delay: float = 0.4,
+        excerpt_large_outputs: bool = True,
+        excerpt_head_lines: int = 2,
+        excerpt_tail_lines: int = 5,
+        width: int | None = None,
         out: TextIO | None = None,
     ) -> None:
         self._truncate = truncate
@@ -68,6 +138,10 @@ class ConsoleRenderer:
         self._sep_width = sep_width
         self._label_w = agent_label_width
         self._show_tokens = show_tokens
+        self._excerpt_large_outputs = excerpt_large_outputs
+        self._excerpt_head_lines = excerpt_head_lines
+        self._excerpt_tail_lines = excerpt_tail_lines
+        self._width = width
         self._out = out or sys.stdout
         self._in_token_stream = False
         is_tty = bool(getattr(self._out, "isatty", lambda: False)())
@@ -190,10 +264,7 @@ class ConsoleRenderer:
 
         elif t == EventType.OBSERVATION:
             obs = p.get("observation", "")
-            print(
-                f"{self._label(event)} obs     {trunc(obs, 110)}",
-                file=self._out,
-            )
+            self._render_observation(event, str(obs))
 
         elif t == EventType.CONTEXT:
             tokens = int(p.get("tokens") or 0)
@@ -390,6 +461,43 @@ class ConsoleRenderer:
         if event.agent_id:
             return f"[{event.agent_id:<{self._label_w}}]"
         return f"[{event.type.value:<{self._label_w}}]"
+
+    def _render_observation(self, event: BusEvent, obs: str) -> None:
+        label = self._label(event)
+        large = len(obs) > self._truncate or "\n" in obs
+        if not (self._excerpt_large_outputs and large):
+            print(f"{label} obs     {trunc(obs, self._truncate)}", file=self._out)
+            return
+
+        view = excerpt(
+            obs,
+            head_lines=self._excerpt_head_lines,
+            tail_lines=self._excerpt_tail_lines,
+        )
+        self._print_excerpt(label, view)
+
+    def _print_excerpt(self, label: str, view: _Excerpt) -> None:
+        shown = len(view.head) + len(view.tail)
+        if view.truncated:
+            summary = f"{shown} of {view.total_lines:,} lines / {view.total_chars:,} chars"
+        else:
+            plural = "" if view.total_lines == 1 else "s"
+            summary = f"{view.total_lines:,} line{plural} / {view.total_chars:,} chars"
+        print(f"{label} obs     [{summary}]", file=self._out)
+
+        indent = self._label_w + 11
+        avail = max(20, self._line_width() - indent - 1)
+        for line in view.head:
+            print(f"{'':<{indent}}{clip_middle(line, avail)}", file=self._out)
+        if view.truncated:
+            print(f"{'':<{indent}}… {view.elided:,} lines elided …", file=self._out)
+        for line in view.tail:
+            print(f"{'':<{indent}}{clip_middle(line, avail)}", file=self._out)
+
+    def _line_width(self) -> int:
+        if self._width is not None:
+            return self._width
+        return shutil.get_terminal_size((100, 24)).columns
 
     def _schedule_spinner(self, event: BusEvent) -> None:
         label = self._spinner_label(event)
