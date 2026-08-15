@@ -147,6 +147,36 @@ async def test_stream_complete_filters_unsupported_max_output_tokens():
     assert "max_output_tokens" not in client.calls[0]["json"]
 
 
+async def test_stream_complete_maps_reasoning_effort_to_responses_payload():
+    body = (
+        "event: response.output_text.delta\n"
+        'data: {"delta":"ok"}\n\n'
+        "event: response.completed\n"
+        'data: {"response":{"usage":{"input_tokens":1,"output_tokens":1}}}\n\n'
+    )
+    client = _Client([_StreamResponse(200, body), _StreamResponse(200, body)])
+    llm = OpenAICodexLLM(
+        model="gpt-5.5",
+        credential_provider=_Creds(),
+        base_url="https://chatgpt.com/backend-api",
+        http_client=client,
+        reasoning_effort="high",
+    )
+
+    [delta async for delta in llm.stream_complete(system=None, messages=[])]
+    [
+        delta
+        async for delta in llm.stream_complete(
+            system=None,
+            messages=[],
+            reasoning_effort="low",
+        )
+    ]
+
+    assert client.calls[0]["json"]["reasoning"] == {"effort": "high"}
+    assert client.calls[1]["json"]["reasoning"] == {"effort": "low"}
+
+
 async def test_stream_complete_refreshes_creds_on_401():
     body = (
         "event: response.output_text.delta\n"

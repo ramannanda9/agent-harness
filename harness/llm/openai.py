@@ -49,6 +49,12 @@ import logging
 from collections.abc import AsyncGenerator, Callable
 from typing import Any
 
+from harness.llm.reasoning import (
+    OPENAI_REASONING_EFFORTS,
+    ReasoningEffort,
+    validate_reasoning_effort,
+)
+
 logger = logging.getLogger(__name__)
 
 # Response headers commonly emitted by proxy gateways for per-request cost.
@@ -105,6 +111,7 @@ class OpenAILLM:
         # which truncated JSON-mode responses inside ``BaseAgent``'s loop.
         # Per-call override available via ``complete(..., max_completion_tokens=N)``.
         max_completion_tokens: int | None = 4096,
+        reasoning_effort: ReasoningEffort | None = None,
         # Explicit context window override. When None (default), the
         # adapter consults ``_OPENAI_CONTEXT_WINDOWS`` and falls back to
         # 8K + a warning for models it doesn't recognise. Pass an int when
@@ -126,6 +133,11 @@ class OpenAILLM:
         self._model = model
         self._cost_fn = cost_fn
         self._max_completion_tokens = max_completion_tokens
+        self._reasoning_effort = validate_reasoning_effort(
+            reasoning_effort,
+            provider="openai",
+            allowed=OPENAI_REASONING_EFFORTS,
+        )
         self._context_window = context_window or _lookup_openai_context_window(model)
         self._budget = None
         # Last observed usage dict. Populated after every successful call; useful
@@ -177,6 +189,17 @@ class OpenAILLM:
         # supports {"type": "json_object"} to enforce strict JSON output.
         if "response_format" in kwargs:
             request["response_format"] = kwargs["response_format"]
+        effort = (
+            validate_reasoning_effort(
+                kwargs["reasoning_effort"],
+                provider="openai",
+                allowed=OPENAI_REASONING_EFFORTS,
+            )
+            if "reasoning_effort" in kwargs
+            else self._reasoning_effort
+        )
+        if effort is not None:
+            request["reasoning_effort"] = effort
         # Per-call override wins over the instance default; explicit ``None``
         # means "let the model use its own ceiling" so callers can opt out.
         max_completion_tokens = kwargs.get("max_completion_tokens", self._max_completion_tokens)
@@ -206,6 +229,7 @@ class OpenAILLM:
         source: str | None = None,
         response_format: dict | None = None,
         max_completion_tokens: int | None = _SENTINEL,
+        reasoning_effort: ReasoningEffort | None | object = _SENTINEL,
     ) -> AsyncGenerator[str, None]:
         full_messages = _prepend_system(system, messages)
         # include_usage adds a final SSE chunk with the same usage block as
@@ -223,6 +247,17 @@ class OpenAILLM:
         # accepting prose responses and crashing in ``_parse_action_json``.
         if response_format is not None:
             request_kwargs["response_format"] = response_format
+        effective_effort = (
+            self._reasoning_effort
+            if reasoning_effort is _SENTINEL
+            else validate_reasoning_effort(
+                reasoning_effort,
+                provider="openai",
+                allowed=OPENAI_REASONING_EFFORTS,
+            )
+        )
+        if effective_effort is not None:
+            request_kwargs["reasoning_effort"] = effective_effort
         # Sentinel-vs-None distinction so callers can explicitly pass
         # ``max_completion_tokens=None`` to opt out of the cap (let model
         # use its own ceiling). The instance default fills in otherwise.

@@ -17,6 +17,11 @@ from typing import Any
 
 from harness.llm._streaming import aiter_sse_events, format_streaming_error, read_error_body
 from harness.llm.auth import AuthFileOAuthProvider, OAuthCredential, OpenAICodexOAuthClient
+from harness.llm.reasoning import (
+    OPENAI_REASONING_EFFORTS,
+    ReasoningEffort,
+    validate_reasoning_effort,
+)
 
 
 class OpenAICodexLLM:
@@ -37,6 +42,7 @@ class OpenAICodexLLM:
         # OpenAILLM's max_completion_tokens; Codex calls this
         # max_output_tokens.
         max_output_tokens: int | None = 4096,
+        reasoning_effort: ReasoningEffort | None = None,
     ) -> None:
         if credential_provider is None:
             if auth_file is None:
@@ -55,6 +61,11 @@ class OpenAICodexLLM:
         self._owns_client = http_client is None
         self._codex_originator = codex_originator
         self._max_output_tokens = max_output_tokens
+        self._reasoning_effort = validate_reasoning_effort(
+            reasoning_effort,
+            provider="openai-codex",
+            allowed=OPENAI_REASONING_EFFORTS,
+        )
         # Reuse OpenAI's table — Codex models share the gpt-5 / o-series
         # lineage so the same context windows apply.
         from harness.llm.openai import (  # noqa: PLC0415
@@ -104,8 +115,7 @@ class OpenAICodexLLM:
         there is no separate non-streaming code path. The Codex backend
         only returns SSE; we just buffer the deltas before returning.
         """
-        extra = dict(kwargs)
-        extra.pop("max_output_tokens", None)
+        extra = self._request_extra(kwargs)
         text_parts: list[str] = []
         async for delta in self._iter_stream(system, messages, extra=extra, source=source):
             text_parts.append(delta)
@@ -132,14 +142,32 @@ class OpenAICodexLLM:
         rejects ``max_output_tokens``, so that public Responses API option is
         filtered out when shared harness code passes it through.
         """
-        extra = dict(kwargs)
-        extra.pop("max_output_tokens", None)
+        extra = self._request_extra(kwargs)
         async for delta in self._iter_stream(system, messages, extra=extra, source=source):
             yield delta
 
     async def aclose(self) -> None:
         if self._owns_client and self._client is not None:
             await self._client.aclose()
+
+    def _request_extra(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        extra = dict(kwargs)
+        extra.pop("max_output_tokens", None)
+        effort = (
+            validate_reasoning_effort(
+                extra.pop("reasoning_effort"),
+                provider="openai-codex",
+                allowed=OPENAI_REASONING_EFFORTS,
+            )
+            if "reasoning_effort" in extra
+            else self._reasoning_effort
+        )
+        if effort is not None:
+            reasoning = extra.get("reasoning")
+            reasoning = dict(reasoning) if isinstance(reasoning, dict) else {}
+            reasoning["effort"] = effort
+            extra["reasoning"] = reasoning
+        return extra
 
     # ── Streaming core ────────────────────────────────────────────────────────
 

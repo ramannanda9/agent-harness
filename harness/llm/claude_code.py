@@ -16,6 +16,11 @@ from harness.llm.auth import (
     AuthFileOAuthProvider,
     OAuthCredential,
 )
+from harness.llm.reasoning import (
+    ANTHROPIC_REASONING_EFFORTS,
+    ReasoningEffort,
+    validate_reasoning_effort,
+)
 
 CLAUDE_CODE_BETAS = os.environ.get(
     "CLAUDE_CODE_BETAS",
@@ -49,6 +54,7 @@ class ClaudeCodeLLM:
         # Explicit context window override; falls back to the Anthropic
         # lookup table since Claude Code is Anthropic underneath.
         context_window: int | None = None,
+        reasoning_effort: ReasoningEffort | None = None,
     ) -> None:
         if credential_provider is None:
             if auth_file is None:
@@ -74,6 +80,11 @@ class ClaudeCodeLLM:
         self._user_agent = user_agent or _default_user_agent()
         self._betas = betas
         self._prompt_caching = prompt_caching
+        self._reasoning_effort = validate_reasoning_effort(
+            reasoning_effort,
+            provider="claude-code",
+            allowed=ANTHROPIC_REASONING_EFFORTS,
+        )
         # Reuse Anthropic's table — Claude Code is Anthropic underneath.
         from harness.llm.anthropic import (  # noqa: PLC0415
             _ANTHROPIC_TOKEN_BUDGET_SAFETY,
@@ -119,9 +130,10 @@ class ClaudeCodeLLM:
         `stream=true` and accumulate the deltas.
         """
         max_tokens = int(kwargs.pop("max_tokens", self._max_tokens))
+        extra = self._request_extra(kwargs)
         parts: list[str] = []
         async for delta in self._iter_stream(
-            system, messages, max_tokens=max_tokens, extra=kwargs, source=source
+            system, messages, max_tokens=max_tokens, extra=extra, source=source
         ):
             parts.append(delta)
         text = "".join(parts)
@@ -135,18 +147,37 @@ class ClaudeCodeLLM:
         messages: list[dict],
         *,
         source: str | None = None,
-        **_kwargs: Any,
+        **kwargs: Any,
     ) -> AsyncGenerator[str, None]:
-        # ``_kwargs`` swallows OpenAI-style hints like ``response_format``;
-        # Claude Code (Anthropic underneath) doesn't expose an equivalent.
+        max_tokens = int(kwargs.pop("max_tokens", self._max_tokens))
+        extra = self._request_extra(kwargs)
         async for delta in self._iter_stream(
-            system, messages, max_tokens=self._max_tokens, extra={}, source=source
+            system, messages, max_tokens=max_tokens, extra=extra, source=source
         ):
             yield delta
 
     async def aclose(self) -> None:
         if self._owns_client and self._client is not None:
             await self._client.aclose()
+
+    def _request_extra(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        extra = dict(kwargs)
+        extra.pop("response_format", None)
+        effort = (
+            validate_reasoning_effort(
+                extra.pop("reasoning_effort"),
+                provider="claude-code",
+                allowed=ANTHROPIC_REASONING_EFFORTS,
+            )
+            if "reasoning_effort" in extra
+            else self._reasoning_effort
+        )
+        if effort is not None:
+            output_config = extra.get("output_config")
+            output_config = dict(output_config) if isinstance(output_config, dict) else {}
+            output_config["effort"] = effort
+            extra["output_config"] = output_config
+        return extra
 
     # ── Streaming core ────────────────────────────────────────────────────────
 
@@ -347,7 +378,14 @@ def _build_payload(
         "system": _system_blocks(instructions, prompt_caching=prompt_caching),
         "messages": built_messages,
     }
-    for key in ("temperature", "top_p", "top_k", "stop_sequences", "thinking"):
+    for key in (
+        "temperature",
+        "top_p",
+        "top_k",
+        "stop_sequences",
+        "thinking",
+        "output_config",
+    ):
         if key in extra:
             payload[key] = extra[key]
     return payload

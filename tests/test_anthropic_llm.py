@@ -250,6 +250,23 @@ async def test_complete_no_system_omits_system_param(monkeypatch):
     assert "system" not in call
 
 
+async def test_complete_maps_reasoning_effort_to_output_config(monkeypatch):
+    llm, messages = _build(monkeypatch, reasoning_effort="high")
+    messages.next_response = _FakeMessage([_FakeContentBlock("ok")])
+
+    await llm.complete(system=None, messages=[])
+    assert messages.calls[0]["output_config"] == {"effort": "high"}
+
+    messages.next_response = _FakeMessage([_FakeContentBlock("ok")])
+    await llm.complete(system=None, messages=[], reasoning_effort="low")
+    assert messages.calls[1]["output_config"] == {"effort": "low"}
+
+
+def test_anthropic_rejects_openai_only_minimal_effort(monkeypatch):
+    with pytest.raises(ValueError, match="unsupported reasoning_effort"):
+        _build(monkeypatch, reasoning_effort="minimal")
+
+
 # ── last_usage includes cache fields ─────────────────────────────────────────
 
 
@@ -292,6 +309,15 @@ async def test_stream_complete_yields_tokens(monkeypatch):
     ]
 
     assert tokens == ["He", "llo", " world"]
+
+
+async def test_stream_complete_forwards_reasoning_effort(monkeypatch):
+    llm, messages = _build(monkeypatch, reasoning_effort="medium")
+    messages.next_stream_tokens = ["ok"]
+    messages.next_stream_final = _FakeMessage([], usage=_FakeUsage())
+
+    assert [token async for token in llm.stream_complete(system=None, messages=[])] == ["ok"]
+    assert messages.calls[0]["output_config"] == {"effort": "medium"}
 
 
 async def test_stream_complete_sets_last_usage(monkeypatch):
