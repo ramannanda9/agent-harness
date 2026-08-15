@@ -39,6 +39,7 @@ from typing import Any, Final
 
 from harness.checkpoint import _ResumeHint
 from harness.events import BusEvent, EventType
+from harness.llm.reasoning import ReasoningEffort, validate_reasoning_effort
 from harness.skills import Skill
 from harness.utils import fire
 from memory.manager import MemoryManager
@@ -75,6 +76,10 @@ class AgentConfig:
     memory_context_enabled: bool = True
     confidence_from_llm: bool = True  # if False, confidence=1.0 on success
     stream_tokens: bool = False  # if True, TOKEN events are emitted as the LLM streams
+    # Optional per-agent reasoning depth. Overrides the LLM adapter's default
+    # for ReAct calls, including retries. Provider adapters validate which
+    # levels their backend supports.
+    reasoning_effort: ReasoningEffort | None = None
     # ``None`` → derive from ``llm.input_token_budget * 0.8`` at runtime
     # (each adapter reports a per-model context window; OpenAILLM /
     # AnthropicLLM / etc. expose ``input_token_budget``). Pass an explicit
@@ -108,6 +113,7 @@ class AgentConfig:
     max_subagent_depth: int = 3
 
     def __post_init__(self):
+        self.reasoning_effort = validate_reasoning_effort(self.reasoning_effort)
         if self.hitl_tools is None:
             self.hitl_tools = []
         if self.skills is None:
@@ -870,6 +876,7 @@ class BaseAgent:
                     messages=messages,
                     source=react_source,
                     response_format={"type": "json_object"},
+                    **self._reasoning_options(),
                 ):
                     accumulated += token
                     if self.config.stream_tokens:
@@ -888,6 +895,7 @@ class BaseAgent:
                     messages=messages,
                     response_format={"type": "json_object"},
                     source=react_source,
+                    **self._reasoning_options(),
                 )
                 response = _normalize_response(raw)
                 if response is None:
@@ -956,6 +964,7 @@ class BaseAgent:
                 ],
                 response_format={"type": "json_object"},
                 source=react_source,
+                **self._reasoning_options(),
             )
             response = _normalize_response(raw)
         except Exception as e:
@@ -966,6 +975,11 @@ class BaseAgent:
             if response is None:
                 self._last_think_error = f"Unparseable stream response: {accumulated[:300]}"
         return response
+
+    def _reasoning_options(self) -> dict[str, ReasoningEffort]:
+        if self.config.reasoning_effort is None:
+            return {}
+        return {"reasoning_effort": self.config.reasoning_effort}
 
     async def _record_tool_observation(
         self,

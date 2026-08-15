@@ -213,6 +213,38 @@ async def test_stream_complete_yields_deltas_incrementally():
     assert "oauth-2025-04-20" in client.calls[0]["headers"]["anthropic-beta"]
 
 
+async def test_stream_complete_maps_reasoning_effort_to_output_config():
+    body = _sse(
+        [
+            {"type": "message_start", "message": {"usage": {"input_tokens": 1}}},
+            {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "ok"}},
+            {"type": "message_delta", "usage": {"output_tokens": 1}},
+        ]
+    )
+    client = _Client([_StreamResponse(200, body), _StreamResponse(200, body)])
+    llm = ClaudeCodeLLM(
+        model="claude-sonnet-4-6",
+        credential_provider=_Creds(),
+        base_url="https://api.anthropic.com",
+        http_client=client,
+        user_agent="claude-cli/2.1.150 (external, cli)",
+        reasoning_effort="high",
+    )
+
+    [delta async for delta in llm.stream_complete(system=None, messages=[])]
+    [
+        delta
+        async for delta in llm.stream_complete(
+            system=None,
+            messages=[],
+            reasoning_effort="low",
+        )
+    ]
+
+    assert client.calls[0]["json"]["output_config"] == {"effort": "high"}
+    assert client.calls[1]["json"]["output_config"] == {"effort": "low"}
+
+
 async def test_stream_complete_refreshes_creds_on_401():
     body = _sse(
         [

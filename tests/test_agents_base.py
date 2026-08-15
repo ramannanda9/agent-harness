@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from agents.base import AgentConfig
 from harness.events import EventType
 from harness.skills import Skill
@@ -31,6 +33,32 @@ async def test_finish_on_first_step_returns_answer(agent_factory, llm: ScriptedL
     assert result["steps"] == 1
     assert "error" not in result
     assert "done:" in result["answer"]
+
+
+async def test_agent_forwards_reasoning_effort_to_llm(agent_factory, llm: ScriptedLLM):
+    config = AgentConfig(
+        agent_id="reasoner",
+        role="reasons",
+        system_prompt="finish.",
+        allowed_tools=[],
+        reasoning_effort="high",
+    )
+    agent = agent_factory(config)
+
+    await agent.run("solve this")
+
+    assert llm.calls[0]["kwargs"]["reasoning_effort"] == "high"
+
+
+def test_agent_config_rejects_unknown_reasoning_effort():
+    with pytest.raises(ValueError, match="unsupported reasoning_effort"):
+        AgentConfig(
+            agent_id="reasoner",
+            role="reasons",
+            system_prompt="finish.",
+            allowed_tools=[],
+            reasoning_effort="extreme",
+        )
 
 
 async def test_agent_skills_are_injected_without_granting_tools(agent_factory, llm: ScriptedLLM):

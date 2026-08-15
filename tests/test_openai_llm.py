@@ -200,6 +200,30 @@ async def test_complete_allows_max_completion_tokens_override_and_opt_out(monkey
     assert "max_completion_tokens" not in raw.calls[1]
 
 
+async def test_reasoning_effort_constructor_default_and_per_call_override(monkeypatch):
+    llm, raw = _build(monkeypatch, reasoning_effort="high")
+    raw.next_body = _fake_response("{}")
+    await llm.complete(system=None, messages=[])
+    assert raw.calls[0]["reasoning_effort"] == "high"
+
+    raw.next_body = _fake_response("{}")
+    await llm.complete(system=None, messages=[], reasoning_effort="low")
+    assert raw.calls[1]["reasoning_effort"] == "low"
+
+
+async def test_stream_complete_forwards_reasoning_effort(monkeypatch):
+    llm, raw = _build(monkeypatch, reasoning_effort="medium")
+    raw.next_stream_chunks = [_fake_chunk("ok")]
+
+    assert [token async for token in llm.stream_complete(system=None, messages=[])] == ["ok"]
+    assert raw.calls[0]["reasoning_effort"] == "medium"
+
+
+def test_openai_rejects_anthropic_only_max_effort(monkeypatch):
+    with pytest.raises(ValueError, match="unsupported reasoning_effort"):
+        _build(monkeypatch, reasoning_effort="max")
+
+
 # ── cost: gateway header takes precedence ────────────────────────────────────
 
 

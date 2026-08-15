@@ -177,6 +177,25 @@ llm = OpenAILLM(model="gpt-4o-mini")                # reads OPENAI_API_KEY from 
 runtime = AgentRuntime(..., llm=llm)
 ```
 
+Reasoning effort can be set once on an adapter, or overridden for one agent:
+
+```python
+llm = OpenAILLM(model="gpt-5", reasoning_effort="high")
+
+researcher = AgentConfig(
+    agent_id="researcher",
+    role="deep research",
+    system_prompt="Research carefully.",
+    allowed_tools=["web_search"],
+    reasoning_effort="medium",  # overrides the adapter default for this agent
+)
+```
+
+The adapter includes the configured value on every provider request. OpenAI
+supports `none`, `minimal`, `low`, `medium`, `high`, and `xhigh`; Anthropic
+supports `low`, `medium`, `high`, `xhigh`, and `max` on compatible models.
+Unsupported provider/value combinations fail before the request is sent.
+
 Credential-backed adapters can also plug into the same contract. This is the
 shape used for provider-specific subscription or OAuth flows without teaching
 agents about auth:
@@ -1820,3 +1839,4 @@ agents alongside HITL on the shell tool.
 | `hitl_tools` | `[]` | Tool names that require human approval before execution |
 | `checkpoint_every` | `0` | Write a crash-resumable checkpoint every N steps; `0` disables periodic checkpoints |
 | `stream_tokens` | `False` | Emit `TOKEN` events as the LLM streams. Disabled by default — enable if you want to render partial output in real time: `AgentConfig(..., stream_tokens=True)` |
+| `reasoning_effort` | `None` (adapter/provider default) | Per-agent reasoning depth override. Supported values depend on the provider; set it once on the LLM adapter to apply across all calls instead. |

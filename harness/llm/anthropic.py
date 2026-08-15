@@ -51,6 +51,12 @@ import os
 from collections.abc import AsyncGenerator, Callable
 from typing import Any
 
+from harness.llm.reasoning import (
+    ANTHROPIC_REASONING_EFFORTS,
+    ReasoningEffort,
+    validate_reasoning_effort,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -131,6 +137,7 @@ class AnthropicLLM:
         prompt_caching: bool = True,
         # Explicit context window override; see ``_lookup_anthropic_context_window``.
         context_window: int | None = None,
+        reasoning_effort: ReasoningEffort | None = None,
     ) -> None:
         try:
             import anthropic
@@ -146,6 +153,11 @@ class AnthropicLLM:
         self._cost_fn = cost_fn
         self._prompt_caching = prompt_caching
         self._context_window = context_window or _lookup_anthropic_context_window(model)
+        self._reasoning_effort = validate_reasoning_effort(
+            reasoning_effort,
+            provider="anthropic",
+            allowed=ANTHROPIC_REASONING_EFFORTS,
+        )
         self._budget: Any = None
         # Populated after every successful call; streaming callers read it here.
         self.last_usage: dict | None = None
@@ -190,6 +202,9 @@ class AnthropicLLM:
         }
         if sys_blocks:
             request["system"] = sys_blocks
+        output_config = self._reasoning_output_config(kwargs)
+        if output_config is not None:
+            request["output_config"] = output_config
 
         resp = await self._client.messages.create(**request)
         usage = _extract_usage(resp.usage, resp.model or self._model)
@@ -225,6 +240,9 @@ class AnthropicLLM:
         }
         if sys_blocks:
             request["system"] = sys_blocks
+        output_config = self._reasoning_output_config(kwargs)
+        if output_config is not None:
+            request["output_config"] = output_config
 
         async with self._client.messages.stream(**request) as stream:
             yielded = False
@@ -248,6 +266,22 @@ class AnthropicLLM:
                 usage["cost_usd"] = cost
             self._record_usage(usage, source=source)
             self.last_usage = usage
+
+    def _reasoning_output_config(self, kwargs: dict[str, Any]) -> dict[str, Any] | None:
+        existing = kwargs.get("output_config")
+        output_config = dict(existing) if isinstance(existing, dict) else {}
+        effort = (
+            validate_reasoning_effort(
+                kwargs["reasoning_effort"],
+                provider="anthropic",
+                allowed=ANTHROPIC_REASONING_EFFORTS,
+            )
+            if "reasoning_effort" in kwargs
+            else self._reasoning_effort
+        )
+        if effort is not None:
+            output_config["effort"] = effort
+        return output_config or None
 
     # ── Internals ─────────────────────────────────────────────────────────────
 

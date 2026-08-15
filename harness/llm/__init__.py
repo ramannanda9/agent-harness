@@ -8,6 +8,7 @@ from harness.llm.auth import (
 )
 from harness.llm.claude_code import ClaudeCodeLLM
 from harness.llm.openai_codex import OpenAICodexLLM
+from harness.llm.reasoning import ReasoningEffort
 
 __all__ = [
     "AnthropicClaudeCodeOAuthClient",
@@ -16,4 +17,5 @@ __all__ = [
     "OAuthCredential",
     "OpenAICodexLLM",
     "OpenAICodexOAuthClient",
+    "ReasoningEffort",
 ]
