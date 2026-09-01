@@ -16,6 +16,7 @@ from harness.runstate import (
     STATE_VERSION,
     ActionState,
     ActionStatus,
+    ErrorKind,
     LegacyCheckpointError,
     OrchestratorState,
     Phase,
@@ -65,7 +66,7 @@ def test_run_state_survives_a_json_round_trip():
         memory={"messages": [{"role": "user", "content": "hi"}], "summarization_count": 2},
         step=4,
         phase=Phase.ACT,
-        response={"thought": "look around", "action": "shell", "args": {"cmd": "ls"}},
+        assistant_message='{"thought": "look around", "action": "shell"}',
         actions=[
             ActionState(
                 tool="shell",
@@ -73,6 +74,7 @@ def test_run_state_survives_a_json_round_trip():
                 status=ActionStatus.EXECUTED,
                 observation="a\nb",
                 approval_id="ap-1",
+                attempts=1,
             ),
             ActionState(tool="shell", args={"cmd": "ps"}, status=ActionStatus.PENDING),
         ],
@@ -92,6 +94,7 @@ def test_run_state_survives_a_json_round_trip():
     assert restored.phase is Phase.ACT
     assert restored.step == 4
     assert restored.budget["cost_usd"] == 0.25
+    assert restored.actions[0].attempts == 1
 
 
 def test_run_state_preserves_per_action_status_and_observations():
@@ -229,6 +232,92 @@ def test_load_state_dispatches_on_kind_not_on_key_sniffing():
     agent.memory = {"messages": [{"role": "user", "content": "plan"}]}
 
     assert isinstance(load_state(agent.to_dict()), RunState)
+
+
+# ── Fields that make resumption decidable ────────────────────────────────────
+
+
+@pytest.mark.parametrize("kind", list(ErrorKind))
+def test_error_kind_survives_a_round_trip(kind):
+    """Resume behaviour differs per failure: a max_steps run re-enters THINK
+    against a raised limit, a budget run must not restore the budget that
+    just tripped. Both are FAILED, so the reason has to be recorded."""
+    state = RunState(
+        run_id="r1",
+        agent_id="a",
+        task="t",
+        phase=Phase.FAILED,
+        error="something went wrong",
+        error_kind=kind,
+    )
+
+    restored = _roundtrip(state)
+
+    assert restored.error_kind is kind
+    assert restored.is_terminal
+
+
+def test_error_kind_defaults_to_none_for_a_healthy_run():
+    assert _roundtrip(RunState(run_id="r1", agent_id="a", task="t")).error_kind is None
+
+
+def test_assistant_message_is_stored_verbatim():
+    """Storing the serialized string rather than the parsed dict keeps prompt
+    bytes stable across a checkpoint round-trip, which is what preserves the
+    provider-side prefix cache on a resumed run."""
+    raw = '{"thought": "b", "action": "shell", "confidence": 0.30}'
+    state = RunState(run_id="r1", agent_id="a", task="t", assistant_message=raw)
+
+    assert _roundtrip(state).assistant_message == raw
+
+
+def test_action_attempts_track_re_execution():
+    """Tool execution is at-least-once: an approved action whose observation
+    never landed is re-run on resume, and this is what bounds that."""
+    state = RunState(
+        run_id="r1",
+        agent_id="a",
+        task="t",
+        phase=Phase.ACT,
+        actions=[ActionState(tool="shell", status=ActionStatus.APPROVED, attempts=2)],
+    )
+
+    assert _roundtrip(state).actions[0].attempts == 2
+
+
+def test_action_carries_a_delegation_invocation_id():
+    state = RunState(
+        run_id="r1",
+        agent_id="a",
+        task="t",
+        actions=[ActionState(tool="delegate", invocation_id="child-run-7")],
+    )
+
+    assert _roundtrip(state).actions[0].invocation_id == "child-run-7"
+
+
+def test_task_state_stores_the_composed_instruction():
+    """The instruction actually sent, including injected upstream answers —
+    so a resumed task does not silently change when an upstream task is re-run."""
+    state = OrchestratorState(
+        run_id="r1",
+        goal="g",
+        tasks={"t1": TaskState(task_id="t1", instruction="Do X. Upstream said: Y")},
+    )
+
+    assert _roundtrip(state).tasks["t1"].instruction == "Do X. Upstream said: Y"
+
+
+def test_orchestrator_state_records_an_abort():
+    """Without this, a crash between the abort and the checkpoint delete lets
+    a resume re-run the task that aborted the run."""
+    state = OrchestratorState(run_id="r1", goal="g", aborted=True)
+
+    assert _roundtrip(state).aborted is True
+
+
+def test_orchestrator_state_defaults_to_not_aborted():
+    assert _roundtrip(OrchestratorState(run_id="r1", goal="g")).aborted is False
 
 
 def test_load_state_rejects_legacy_checkpoints_with_a_clear_message():

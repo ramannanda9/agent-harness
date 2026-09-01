@@ -40,6 +40,29 @@ agent that was running it.
 
 Both records carry a ``kind`` discriminator so stored state is identified by a
 field rather than by sniffing which keys happen to be present.
+
+Deliberate non-goals
+--------------------
+Some things a run depends on are *not* here, and cannot be, so callers should
+not read this record as a complete snapshot of a process:
+
+- **Steering.** ``BaseAgent._steering`` is an in-process ``asyncio.Queue``.
+  Guidance queued but not yet drained is lost when the process dies.
+- **Tool execution is at-least-once.** No tool carries an idempotency key, so
+  an action that was approved but whose observation never landed is re-executed
+  on resume. ``ActionState.attempts`` records how often that has happened so a
+  crash-loop can be capped rather than repeated forever.
+- **Session allow-lists.** ``harness.hitl`` keeps ``a``/session-allow decisions
+  in a process-local set; only ``A``/always-allow reaches the durable policy
+  store. A resumed run re-prompts for session-allowed tools.
+- **Tool result caching.** ``BaseAgent._tool_cache`` is per-process.
+
+Budget ownership
+----------------
+Both records carry a ``budget`` field, but a nested run (an orchestrated agent)
+shares its parent's guard. The rule is that **the outermost state being resumed
+owns the budget**; ``budget`` on an inner state is informational and must be
+ignored whenever an outer state is also being restored.
 """
 
 from __future__ import annotations
@@ -67,6 +90,22 @@ class Phase(str, Enum):
 TERMINAL_PHASES = (Phase.DONE, Phase.FAILED)
 
 
+class ErrorKind(str, Enum):
+    """Why a run reached :attr:`Phase.FAILED`.
+
+    Resumption is not one behaviour: a run that exhausted ``max_steps`` should
+    re-enter thinking against a raised limit, whereas one that blew its budget
+    must not silently restore that budget and immediately fail again at the
+    same point. Recording *why* it failed is what lets resume do the right
+    thing per case instead of guessing.
+    """
+
+    MAX_STEPS = "max_steps"  # ran out of steps; resume against a raised limit
+    UNPARSEABLE_THINK = "unparseable_think"  # LLM output could not be parsed
+    BUDGET = "budget"  # cost / time / token guard tripped
+    CRASH = "crash"  # unexpected exception mid-run
+
+
 class ActionStatus(str, Enum):
     """Where one tool call within a step currently is."""
 
@@ -84,6 +123,19 @@ class ActionState:
     value, or an image content block. It is written once the action reaches
     ``EXECUTED`` so that a resumed run does not re-run a tool whose side
     effects already happened.
+
+    ``args`` is a deep copy taken when the action is created, and is the only
+    thing ever executed. Tool kwargs used to alias into the raw LLM response
+    dict, so a tool that mutated its own arguments would retroactively change
+    what the record says the human approved.
+
+    ``attempts`` counts executions started. An ``APPROVED`` action whose
+    observation never landed is re-run on resume (see the at-least-once note in
+    the module docstring); this is what makes that bounded rather than endless.
+
+    ``invocation_id`` is a delegating tool's child run id, captured from the
+    ``subagent_start`` event, so a nested run can later be resumed rather than
+    restarted.
     """
 
     tool: str
@@ -91,6 +143,8 @@ class ActionState:
     status: ActionStatus = ActionStatus.PENDING
     observation: Any = None
     approval_id: str | None = None
+    attempts: int = 0
+    invocation_id: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -99,6 +153,8 @@ class ActionState:
             "status": self.status.value,
             "observation": self.observation,
             "approval_id": self.approval_id,
+            "attempts": self.attempts,
+            "invocation_id": self.invocation_id,
         }
 
     @classmethod
@@ -109,12 +165,21 @@ class ActionState:
             status=ActionStatus(d.get("status", ActionStatus.PENDING.value)),
             observation=d.get("observation"),
             approval_id=d.get("approval_id"),
+            attempts=d.get("attempts", 0),
+            invocation_id=d.get("invocation_id"),
         )
 
 
 @dataclass
 class RunState:
-    """Everything needed to continue one agent's ReAct loop."""
+    """Everything needed to continue one agent's ReAct loop.
+
+    ``assistant_message`` holds the model's response for the current step
+    *already serialized*, rather than the parsed dict. Working memory only ever
+    needs the string, and keeping the string means a checkpoint round-trip
+    cannot re-order keys or renormalize floats — which would change the prompt
+    bytes and silently cost a prefix-cache hit on every resumed run.
+    """
 
     run_id: str
     agent_id: str
@@ -122,11 +187,12 @@ class RunState:
     memory: dict = field(default_factory=dict)  # WorkingMemory.to_dict()
     step: int = 0
     phase: Phase = Phase.THINK
-    response: dict | None = None  # parsed LLM action JSON for this step
+    assistant_message: str | None = None  # serialized LLM response for this step
     actions: list[ActionState] = field(default_factory=list)
     budget: dict | None = None  # BudgetGuard.snapshot()
     result: dict | None = None
     error: str | None = None
+    error_kind: ErrorKind | None = None
     kind: str = "agent"
     version: int = STATE_VERSION
 
@@ -144,11 +210,12 @@ class RunState:
             "step": self.step,
             "phase": self.phase.value,
             "memory": self.memory,
-            "response": self.response,
+            "assistant_message": self.assistant_message,
             "actions": [a.to_dict() for a in self.actions],
             "budget": self.budget,
             "result": self.result,
             "error": self.error,
+            "error_kind": self.error_kind.value if self.error_kind else None,
         }
 
     @classmethod
@@ -160,11 +227,12 @@ class RunState:
             memory=d.get("memory") or {},
             step=d.get("step", 0),
             phase=Phase(d.get("phase", Phase.THINK.value)),
-            response=d.get("response"),
+            assistant_message=d.get("assistant_message"),
             actions=[ActionState.from_dict(a) for a in d.get("actions") or []],
             budget=d.get("budget"),
             result=d.get("result"),
             error=d.get("error"),
+            error_kind=ErrorKind(d["error_kind"]) if d.get("error_kind") else None,
             version=d.get("version", STATE_VERSION),
         )
 
@@ -194,6 +262,11 @@ class TaskState:
     ``agent_ckp_id`` is the checkpoint key of the agent that was running this
     task, which is what lets an interrupted task resume from its own ReAct
     position rather than from the top.
+
+    ``instruction`` is the *composed* instruction actually sent to the agent —
+    the planned instruction plus any upstream results injected into it. Storing
+    the composed form keeps a resumed task deterministic even when an upstream
+    task is later re-run and produces a different answer.
     """
 
     task_id: str
@@ -201,6 +274,7 @@ class TaskState:
     attempt: int = 0
     result: dict | None = None  # TaskResult, as a dict
     agent_ckp_id: str | None = None
+    instruction: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -209,6 +283,7 @@ class TaskState:
             "attempt": self.attempt,
             "result": self.result,
             "agent_ckp_id": self.agent_ckp_id,
+            "instruction": self.instruction,
         }
 
     @classmethod
@@ -219,6 +294,7 @@ class TaskState:
             attempt=d.get("attempt", 0),
             result=d.get("result"),
             agent_ckp_id=d.get("agent_ckp_id"),
+            instruction=d.get("instruction"),
         )
 
 
@@ -229,6 +305,10 @@ class OrchestratorState:
     ``plan`` is the *current* plan. Replanning replaces it here, so resuming
     after a replan continues with the DAG the run was actually executing
     rather than the one it started with.
+
+    ``aborted`` records that ``on_failure=abort`` fired. Without it, a crash
+    between the abort and the checkpoint delete would let a resume cheerfully
+    re-run the very task that aborted the run.
     """
 
     run_id: str
@@ -236,6 +316,7 @@ class OrchestratorState:
     plan: dict = field(default_factory=dict)  # Plan, as a dict
     tasks: dict[str, TaskState] = field(default_factory=dict)
     replan_count: int = 0
+    aborted: bool = False
     budget: dict | None = None
     kind: str = "orchestrator"
     version: int = STATE_VERSION
@@ -257,6 +338,7 @@ class OrchestratorState:
             "plan": self.plan,
             "tasks": {tid: ts.to_dict() for tid, ts in self.tasks.items()},
             "replan_count": self.replan_count,
+            "aborted": self.aborted,
             "budget": self.budget,
         }
 
@@ -268,6 +350,7 @@ class OrchestratorState:
             plan=d.get("plan") or {},
             tasks={tid: TaskState.from_dict(ts) for tid, ts in (d.get("tasks") or {}).items()},
             replan_count=d.get("replan_count", 0),
+            aborted=d.get("aborted", False),
             budget=d.get("budget"),
             version=d.get("version", STATE_VERSION),
         )
