@@ -24,11 +24,14 @@ approaches stay in the framework; users pick per use case.
 from __future__ import annotations
 
 import copy
+import logging
 import uuid
 from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING, Any
 
 from harness.events import BusEvent, EventType
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from agents.base import BaseAgent
@@ -101,6 +104,64 @@ class SubAgentTool:
         """Used by the parent agent's tool listing; defaults to the role."""
         return f"Delegate to {self._agent.config.agent_id}: {self._agent.role}"
 
+    async def load_resume_state(self, invocation_id: str) -> Any | None:
+        """Stored state for a delegation that started and never finished.
+
+        A delegation's ``run_id`` is minted inside :meth:`execute_stream`, so
+        the sub-agent's checkpoint lands under a key the parent could not
+        otherwise name. The parent learns it from the ``invocation_id`` on the
+        ``subagent_start`` event and hands it back here.
+
+        Returns ``None`` whenever resuming is not possible — no store, no
+        checkpoint, an unreadable or legacy one, or a run that already
+        reached a terminal phase. Restarting is always safe, so this never
+        raises: a delegation that cannot be resumed is simply re-run, which
+        is what happened before this existed.
+        """
+        store = getattr(self._agent, "_checkpoint_store", None)
+        if store is None or not invocation_id:
+            return None
+
+        from harness.runstate import RunState, load_state
+
+        try:
+            stored = await store.read(self._agent._checkpoint_key(invocation_id))
+        except Exception as exc:  # noqa: BLE001 — restarting is always safe
+            logger.warning("Ignoring unreadable delegation checkpoint: %s", exc)
+            return None
+        if not stored:
+            return None
+        try:
+            state = load_state(stored)
+        except Exception as exc:  # noqa: BLE001 — e.g. a pre-0.13 checkpoint
+            logger.warning("Ignoring undecodable delegation checkpoint: %s", exc)
+            return None
+        if not isinstance(state, RunState) or state.is_terminal:
+            return None
+        return state
+
+    async def resume_stream(self, state: Any) -> AsyncIterator[BusEvent | dict]:
+        """Continue a delegation from stored state instead of restarting it.
+
+        Emits the same ``subagent_start`` / events / terminal-dict shape as
+        :meth:`execute_stream`, reusing the original ``invocation_id`` so a
+        consumer watching across the crash sees one continuous delegation
+        rather than two.
+        """
+        invoking_parent = self._invoking_agent_id
+        yield BusEvent.subagent_start(
+            self.agent_id,
+            task=state.task[:300],
+            invocation_id=state.run_id,
+            parent_agent_id=invoking_parent,
+        )
+        async for item in self._drive(
+            self._agent._resume_stream(state),
+            run_id=state.run_id,
+            invoking_parent=invoking_parent,
+        ):
+            yield item
+
     async def execute_stream(
         self,
         **args: Any,
@@ -136,7 +197,8 @@ class SubAgentTool:
         # Per-delegation run_id keeps checkpoints / OTel spans / memory
         # writes correctly scoped under this specific invocation, even when
         # the same sub-agent is delegated to multiple times in one parent
-        # run.
+        # run. It reaches the parent on the ``subagent_start`` event below,
+        # which is how a delegation becomes addressable for resume.
         run_id = str(uuid.uuid4())
 
         # The invoking agent's id (set by BaseAgent before this call). For
@@ -153,10 +215,29 @@ class SubAgentTool:
             parent_agent_id=invoking_parent,
         )
 
+        async for item in self._drive(
+            self._agent.run_stream(task=task, run_id=run_id),
+            run_id=run_id,
+            invoking_parent=invoking_parent,
+        ):
+            yield item
+
+    async def _drive(
+        self,
+        stream: AsyncIterator[BusEvent],
+        *,
+        run_id: str,
+        invoking_parent: str,
+    ) -> AsyncIterator[BusEvent | dict]:
+        """Tag and forward a sub-agent's events, then yield the terminal dict.
+
+        Shared by :meth:`execute_stream` and :meth:`resume_stream` so a
+        resumed delegation is indistinguishable downstream from a fresh one.
+        """
         last_done: dict | None = None
         last_error: str | None = None
         try:
-            async for event in self._agent.run_stream(task=task, run_id=run_id):
+            async for event in stream:
                 tagged = BusEvent(
                     type=event.type,
                     agent_id=event.agent_id,
