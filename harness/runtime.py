@@ -623,7 +623,6 @@ class AgentRuntime:
         """
         from harness.events import EventType
         from harness.runstate import OrchestratorState, load_state
-        from orchestrator.planner import _plan_from_dict, _task_result_from_dict
 
         if self._checkpoint_store is None:
             raise RuntimeError("resume_orchestration requires checkpoint_store")
@@ -636,15 +635,10 @@ class AgentRuntime:
         if not isinstance(state, OrchestratorState):
             raise ValueError(f"Checkpoint {run_id!r} is an agent run, not an orchestration.")
 
-        goal = state.goal
-        plan = _plan_from_dict(state.plan)
-        completed = {tid: _task_result_from_dict(r) for tid, r in state.recorded_results().items()}
-        replan_count = state.replan_count
-
         orchestrator, tracer, _ = self._build_orchestrator(run_id=run_id)
         result: dict = {}
         try:
-            async for event in orchestrator.resume_stream(goal, plan, completed, replan_count):
+            async for event in orchestrator.resume_stream(state):
                 if event.type == EventType.DONE:
                     result = event.payload
                 elif event.type == EventType.ERROR:
@@ -676,17 +670,9 @@ class AgentRuntime:
         state = load_state(checkpoint)
 
         if isinstance(state, OrchestratorState):
-            from orchestrator.planner import _plan_from_dict, _task_result_from_dict
-
-            plan = _plan_from_dict(state.plan)
-            completed = {
-                tid: _task_result_from_dict(r) for tid, r in state.recorded_results().items()
-            }
             # Orchestrator calls self._tracer.end_run() inside _execute_plan_stream.
             orchestrator, _tracer, _ = self._build_orchestrator(run_id=key)
-            async for event in orchestrator.resume_stream(
-                state.goal, plan, completed, state.replan_count
-            ):
+            async for event in orchestrator.resume_stream(state):
                 yield event
         else:
             agent, tracer = self._agent_for_state(state)
