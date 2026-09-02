@@ -241,6 +241,40 @@ class BaseAgent:
 
     # ── Async steering ────────────────────────────────────────────────────────
 
+    def clone_for_run(self, *, ckp_scope: str | None = None) -> BaseAgent:
+        """A copy of this agent safe to drive as a separate, concurrent run.
+
+        ``BaseAgent`` keeps a run's working memory, task, checkpoint key,
+        steering queue and tool cache as instance attributes, and
+        ``run_stream`` assigns them on entry. Driving one instance from two
+        concurrent tasks therefore has the second run overwrite the first
+        mid-flight: both continue in the *same* working memory, and both
+        return the second task's answer while reporting success.
+
+        Configuration, tools, memory, tracer, guard and LLM client are shared
+        deliberately — they are either immutable or intentionally common to the
+        whole run (the guard especially, which enforces one budget across it).
+
+        Tools that carry per-invocation state say so by offering their own
+        ``clone_for_run``; everything else is shared, since most tools are
+        stateless and some deliberately hold a connection.
+        """
+        clone = copy.copy(self)
+        clone._working_memory = None
+        clone._task = ""
+        clone._last_think_error = None
+        clone._ckp_id = ""
+        clone._ckp_scope = ckp_scope
+        clone._resume_key = ""
+        clone._subagent_depth = self._subagent_depth
+        clone._steering = asyncio.Queue()
+        clone._tool_cache = {} if self.config.cache_tool_results else None
+        clone._tools = {
+            name: (tool.clone_for_run() if hasattr(tool, "clone_for_run") else tool)
+            for name, tool in self._tools.items()
+        }
+        return clone
+
     def steer(self, text: str) -> None:
         """Inject human guidance to be consumed at the next ReAct step boundary.
 

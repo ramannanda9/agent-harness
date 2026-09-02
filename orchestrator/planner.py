@@ -727,7 +727,13 @@ class Orchestrator:
         DRIVER_DONE = object()
 
         async def drive(task: Task) -> None:
-            agent = self._agents.get(task.agent_id)
+            registered = self._agents.get(task.agent_id)
+            # Each task drives its own copy. A plan may put two independent
+            # tasks on one agent, and BaseAgent holds a run's working memory
+            # and task on the instance — shared, the second run overwrites the
+            # first mid-flight and both return the second task's answer while
+            # reporting success.
+            agent = registered.clone_for_run(ckp_scope=task.id) if registered else None
             if agent is None:
                 await bus.put(
                     (
@@ -764,9 +770,9 @@ class Orchestrator:
                         f"--- Context from completed upstream tasks ---\n" + "\n\n".join(dep_parts)
                     )
 
-            # Scope the agent's checkpoint key to this task, so a plan naming
-            # the same agent twice does not have both write to one key.
-            agent._ckp_scope = task.id
+            # _set_agent_resume_keys ran against the registered instances, so
+            # carry the outer run id onto the copy this task actually drives.
+            agent._resume_key = registered._resume_key or self._run_id
 
             resume_state = (resume_states or {}).get(task.id)
             stream = (

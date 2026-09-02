@@ -23,6 +23,7 @@ approaches stay in the framework; users pick per use case.
 
 from __future__ import annotations
 
+import copy
 import uuid
 from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING, Any
@@ -77,6 +78,19 @@ class SubAgentTool:
         # in ``parent_agent_id``, not the sub-agent's own id. Default
         # empty for direct callers (e.g. tests) — "no known parent".
         self._invoking_agent_id: str = ""
+
+    def clone_for_run(self) -> SubAgentTool:
+        """A copy safe to use from a separate, concurrent run.
+
+        Both this tool and the agent behind it hold per-invocation state
+        (``_invoking_agent_id`` here; working memory and the current task on
+        the agent), so two parents delegating through one shared instance
+        would overwrite each other exactly as two tasks sharing one agent do.
+        """
+        clone = copy.copy(self)
+        clone._agent = self._agent.clone_for_run()
+        clone._invoking_agent_id = ""
+        return clone
 
     @property
     def agent_id(self) -> str:
