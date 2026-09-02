@@ -329,6 +329,16 @@ class OrchestratorState:
             if ts.status is TaskStatus.DONE and ts.result is not None
         }
 
+    def recorded_results(self) -> dict[str, dict]:
+        """Results of every task that produced one, successful or not.
+
+        A failed task still carries a result, and the orchestrator uses the
+        presence of one to decide a task needs no re-running — the failure has
+        already been through its ``on_failure`` policy. Use this, not
+        :meth:`completed_results`, when reconstructing what has been attempted.
+        """
+        return {tid: ts.result for tid, ts in self.tasks.items() if ts.result is not None}
+
     def to_dict(self) -> dict:
         return {
             "kind": self.kind,

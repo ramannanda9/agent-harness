@@ -22,6 +22,7 @@ Orchestrator resume covers:
 from __future__ import annotations
 
 import asyncio
+import json
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -29,6 +30,16 @@ import pytest
 from agents.base import AgentConfig, BaseAgent
 from harness.events import EventType
 from harness.hitl import ApprovalResponse
+from harness.runstate import (
+    ActionState,
+    ActionStatus,
+    OrchestratorState,
+    Phase,
+    RunState,
+    TaskState,
+    TaskStatus,
+    load_state,
+)
 from harness.runtime import (
     AgentRegistry,
     AgentRuntime,
@@ -125,16 +136,30 @@ def _agent_ckp(
     stored shape lives in one place — changing the checkpoint format is then
     one edit here instead of one per test.
     """
-    ckp = {
-        "run_id": run_id,
-        "agent_id": agent_id,
-        "task": task,
-        "step": step,
-        "memory": memory,
-    }
+    actions = []
+    assistant_message = None
     if pending is not None:
-        ckp["pending"] = pending
-    return ckp
+        # A checkpoint written at an approval prompt: the action is PENDING —
+        # awaiting a human decision, distinct from approved-but-not-yet-run.
+        actions = [
+            ActionState(
+                tool=pending["tool"],
+                args=pending["args"],
+                status=ActionStatus.PENDING,
+                approval_id=pending["approval_id"],
+            )
+        ]
+        assistant_message = json.dumps(pending["llm_response"])
+    return RunState(
+        run_id=run_id,
+        agent_id=agent_id,
+        task=task,
+        memory=memory,
+        step=step,
+        phase=Phase.APPROVE if pending else Phase.THINK,
+        assistant_message=assistant_message,
+        actions=actions,
+    ).to_dict()
 
 
 def _orch_ckp(
@@ -146,13 +171,16 @@ def _orch_ckp(
     replan_count: int = 0,
 ) -> dict:
     """Build a stored orchestrator checkpoint. See :func:`_agent_ckp`."""
-    return {
-        "run_id": run_id,
-        "goal": goal,
-        "plan": plan,
-        "completed": completed or {},
-        "replan_count": replan_count,
-    }
+    return OrchestratorState(
+        run_id=run_id,
+        goal=goal,
+        plan=plan,
+        tasks={
+            tid: TaskState(task_id=tid, status=TaskStatus.DONE, result=result)
+            for tid, result in (completed or {}).items()
+        },
+        replan_count=replan_count,
+    ).to_dict()
 
 
 # ── Checkpoint key namespacing ─────────────────────────────────────────────────
@@ -334,11 +362,9 @@ async def test_resume_continues_from_saved_step(
         max_steps=10,
     )
     agent = _make_agent(config, llm, memory, ckp_store)
-    agent._working_memory = WorkingMemory.from_dict(wm.to_dict(), llm=llm)
-    agent._task = "the task"
 
     result: dict = {}
-    async for event in agent._resume_stream(run_id=run_id, start_step=2):
+    async for event in agent._resume_stream(load_state(ckp_store.data[ckp_id])):
         if event.type == EventType.TASK_DONE:
             result = event.payload
 
@@ -402,8 +428,6 @@ async def test_resume_with_pending_hitl_replays_and_executes_tool(
         max_steps=5,
     )
     agent = _make_agent(config, llm, memory, ckp_store, tools={"echo": EchoTool()})
-    agent._working_memory = WorkingMemory.from_dict(wm.to_dict(), llm=llm)
-    agent._task = "hitl task"
 
     approval = ApprovalResponse(approval_id="appr-abc", approved=True)
 
@@ -411,11 +435,7 @@ async def test_resume_with_pending_hitl_replays_and_executes_tool(
     result: dict = {}
 
     with patch("harness.hitl.request_approval", AsyncMock(return_value=approval)):
-        async for event in agent._resume_stream(
-            run_id=run_id,
-            start_step=2,
-            pending=pending,
-        ):
+        async for event in agent._resume_stream(load_state(ckp_store.data[ckp_id])):
             if event.type == EventType.OBSERVATION:
                 observation_events.append(event)
             elif event.type == EventType.TASK_DONE:
@@ -483,14 +503,12 @@ async def test_resume_with_rejected_hitl_skips_tool(
         max_steps=5,
     )
     agent = _make_agent(config, llm, memory, ckp_store, tools={"echo": echo})
-    agent._working_memory = WorkingMemory.from_dict(wm.to_dict(), llm=llm)
-    agent._task = "reject task"
 
     rejection = ApprovalResponse(approval_id="appr-rej", approved=False)
 
     result: dict = {}
     with patch("harness.hitl.request_approval", AsyncMock(return_value=rejection)):
-        async for event in agent._resume_stream(run_id=run_id, start_step=1, pending=pending):
+        async for event in agent._resume_stream(load_state(ckp_store.data[ckp_id])):
             if event.type == EventType.TASK_DONE:
                 result = event.payload
 
@@ -735,7 +753,12 @@ async def test_orchestrator_checkpoint_has_plan_field(
     llm: ScriptedLLM,
     ckp_store: InMemoryCheckpointStore,
 ):
-    """The orchestrator checkpoint schema includes 'plan', 'completed', 'goal', 'replan_count'."""
+    """The orchestrator checkpoint stores an OrchestratorState.
+
+    'completed' is gone: a map of finished results could not say whether an
+    absent task had never started or had started and died, so both restarted
+    from zero. Per-task status replaces it.
+    """
     llm.routes = _orch_routes()
     runtime, _ = _make_runtime(llm, ckp_store)
 
@@ -754,11 +777,15 @@ async def test_orchestrator_checkpoint_has_plan_field(
 
     assert written_payloads, "no orchestrator checkpoint was written"
     ckp = written_payloads[0]
-    assert "plan" in ckp
-    assert "completed" in ckp
-    assert "goal" in ckp
-    assert "replan_count" in ckp
-    assert "run_id" in ckp
+    assert ckp["kind"] == "orchestrator"
+    assert "completed" not in ckp
+    assert set(ckp) >= {"plan", "tasks", "goal", "replan_count", "run_id", "aborted"}
+
+    state = load_state(ckp)
+    assert isinstance(state, OrchestratorState)
+    assert state.goal == "test goal"
+    # Every planned task is represented, not only the finished ones.
+    assert set(state.tasks) == {t["id"] for t in state.plan["tasks"]}
 
 
 async def test_orchestrator_checkpoint_deleted_on_done(
@@ -1225,3 +1252,95 @@ def test_planner_honours_max_retries_from_llm_output():
     )
 
     assert plan.tasks[0].max_retries == 5
+
+
+async def test_orchestrator_checkpoint_it_wrote_can_be_resumed(
+    llm: ScriptedLLM,
+    ckp_store: InMemoryCheckpointStore,
+):
+    """Round-trip through the real writer, not a fixture.
+
+    The resume tests build checkpoints by hand, so writer and reader could
+    disagree about the stored shape without any test noticing. This drives a
+    real orchestration, keeps the checkpoint it wrote, and resumes from it.
+    """
+    llm.routes = _orch_routes()
+    runtime, _ = _make_runtime(llm, ckp_store)
+
+    kept: list[tuple[str, dict]] = []
+    original_write = ckp_store.write
+
+    async def capturing_write(key: str, data: dict) -> None:
+        await original_write(key, data)
+        if data.get("kind") == "orchestrator":
+            kept.append((key, dict(data)))
+
+    ckp_store.write = capturing_write
+    await runtime.run("test goal")
+
+    assert kept, "no orchestrator checkpoint was written"
+    # The last one written before the run finished: some tasks have results.
+    key, checkpoint = kept[-1]
+    assert load_state(checkpoint).recorded_results(), "expected recorded task results"
+
+    ckp_store.data[key] = checkpoint  # the real run deleted it on DONE
+    result = await runtime.resume_orchestration(key)
+
+    assert result["answer"]
+
+
+async def test_agent_checkpoint_it_wrote_can_be_resumed(
+    llm: ScriptedLLM,
+    memory: MemoryManager,
+    ckp_store: InMemoryCheckpointStore,
+):
+    """The agent counterpart of the round-trip above: resume a checkpoint the
+    agent actually wrote, rather than one a fixture composed."""
+    steps = {"n": 0}
+
+    def react(system, messages, kwargs):
+        steps["n"] += 1
+        if steps["n"] == 1:
+            return {"thought": "look", "action": "echo", "args": {"message": "hi"}}
+        return {"thought": "done", "action": "finish", "answer": "resumed ok", "confidence": 1.0}
+
+    llm.routes = {"react": react}
+    config = AgentConfig(
+        agent_id="rt",
+        role="r",
+        system_prompt="ReAct.",
+        allowed_tools=["echo"],
+        checkpoint_every=1,
+        max_steps=5,
+    )
+    agent = _make_agent(config, llm, memory, ckp_store, tools={"echo": EchoTool()})
+
+    kept: list[dict] = []
+    original_write = ckp_store.write
+
+    async def capturing_write(key: str, data: dict) -> None:
+        await original_write(key, data)
+        kept.append(dict(data))
+
+    ckp_store.write = capturing_write
+
+    async for _ in agent.run_stream(task="the task", run_id="rt-run"):
+        pass
+
+    assert kept, "no agent checkpoint was written"
+    state = load_state(kept[-1])
+    assert isinstance(state, RunState)
+    assert state.agent_id == "rt"
+    assert state.task == "the task"
+
+    # Drive a fresh agent from that state alone.
+    steps["n"] = 1  # so the resumed agent finishes rather than re-calling the tool
+    resumed = _make_agent(config, llm, memory, ckp_store, tools={"echo": EchoTool()})
+    result: dict = {}
+    async for event in resumed._resume_stream(state):
+        if event.type == EventType.TASK_DONE:
+            result = event.payload
+
+    assert result["answer"] == "resumed ok"
+    assert resumed._task == "the task"
+    assert resumed._working_memory is not None

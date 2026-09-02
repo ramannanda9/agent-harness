@@ -39,6 +39,7 @@ from typing import Any
 from harness.checkpoint import _ResumeHint
 from harness.events import BusEvent, EventType
 from harness.hitl import stdout_lock as _hitl_stdout_lock
+from harness.runstate import OrchestratorState, TaskState, TaskStatus
 from harness.utils import fire, parse_llm_json
 
 logger = logging.getLogger(__name__)
@@ -496,15 +497,29 @@ class Orchestrator:
     ) -> None:
         if self._checkpoint_store is None:
             return
+        # Every planned task gets a TaskState, so the record says what is
+        # outstanding rather than leaving it to be inferred from absence.
+        tasks = {
+            t.id: TaskState(task_id=t.id, status=TaskStatus.PENDING, attempt=t._retry_count)
+            for t in plan.tasks
+        }
+        for tid, result in completed.items():
+            tasks[tid] = TaskState(
+                task_id=tid,
+                status=TaskStatus.DONE if result.success else TaskStatus.FAILED,
+                attempt=tasks[tid].attempt if tid in tasks else 0,
+                result=_task_result_to_dict(result),
+                instruction=next((t.instruction for t in plan.tasks if t.id == tid), None),
+            )
         await self._checkpoint_store.write(
             self._run_id,
-            {
-                "run_id": self._run_id,
-                "goal": goal,
-                "plan": _plan_to_dict(plan),
-                "completed": {tid: _task_result_to_dict(r) for tid, r in completed.items()},
-                "replan_count": replan_count,
-            },
+            OrchestratorState(
+                run_id=self._run_id,
+                goal=goal,
+                plan=_plan_to_dict(plan),
+                tasks=tasks,
+                replan_count=replan_count,
+            ).to_dict(),
         )
 
     async def _delete_orch_checkpoint(self) -> None:

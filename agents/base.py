@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import json
 import logging
 import os
@@ -40,6 +41,7 @@ from typing import Any, Final
 from harness.checkpoint import _ResumeHint
 from harness.events import BusEvent, EventType
 from harness.llm.reasoning import ReasoningEffort, validate_reasoning_effort
+from harness.runstate import ActionState, ActionStatus, Phase, RunState
 from harness.skills import Skill
 from harness.utils import fire
 from memory.manager import MemoryManager
@@ -50,6 +52,18 @@ logger = logging.getLogger(__name__)
 # Sentinel returned by _run_tool_gated when human injects a correction.
 # Caller must `continue` the ReAct loop — WM is already updated.
 _HITL_CORRECTION: Final = object()
+
+
+def _assistant_message(response: dict) -> str:
+    """Serialize a model response for working memory.
+
+    One function so the string written to WorkingMemory and the string
+    persisted in a checkpoint are produced identically. ``default=str``
+    matches what the checkpoint stores use, so a response containing a
+    non-JSON-native value cannot serialize on one path and raise on the
+    other.
+    """
+    return json.dumps(response, default=str)
 
 
 def _freeze_factory(tool: Any, args: dict) -> Any:
@@ -348,26 +362,34 @@ class BaseAgent:
                             hint.done = True
                     yield event
 
-    async def _resume_stream(
-        self,
-        run_id: str,
-        start_step: int,
-        pending: dict | None = None,
-    ) -> AsyncGenerator[BusEvent, None]:
+    async def _resume_stream(self, state: RunState) -> AsyncGenerator[BusEvent, None]:
         """
-        Re-enter the ReAct loop from a checkpoint.
+        Re-enter the ReAct loop from a stored :class:`RunState`.
 
-        If pending is set, the last step was interrupted mid-approval.
-        The approval prompt is shown again; once the human responds the
-        tool runs (or the correction is injected) before the loop continues.
+        The state carries everything needed to continue, so this rebuilds
+        working memory and the task itself rather than requiring the caller
+        to graft them on first — two callers used to do that identically and
+        could drift.
+
+        Actions still ``PENDING`` mean the run died at an approval prompt.
+        Each is re-prompted; once the human responds the tool runs (or the
+        correction is injected) before the loop continues.
         """
+        run_id = state.run_id
         self._ckp_id = f"{run_id}:{self.config.agent_id}"
         if not self._resume_key:
             self._resume_key = self._ckp_id
+        self._task = state.task
+        if state.memory:
+            self._working_memory = WorkingMemory.from_dict(state.memory, llm=self._llm)
+
+        start_step = state.step
+        pending = [a for a in state.actions if a.status is ActionStatus.PENDING]
         if pending:
-            async for event in self._replay_pending_step(run_id, pending):
-                yield event
-            start_step = pending["step"] + 1
+            for action in pending:
+                async for event in self._replay_pending_action(state, action):
+                    yield event
+            start_step = state.step + 1
 
         source_cm = (
             self._steering_source_factory(self)
@@ -483,19 +505,38 @@ class BaseAgent:
 
     # ── ReAct Loop (stream) ───────────────────────────────────────────────────
 
+    def _state(
+        self,
+        run_id: str,
+        step: int,
+        *,
+        phase: Phase = Phase.THINK,
+        assistant_message: str | None = None,
+        actions: list[ActionState] | None = None,
+    ) -> RunState:
+        """Snapshot the agent's position as a :class:`RunState`.
+
+        One builder for every checkpoint writer, so the stored shape cannot
+        drift between the step write, the pre-approval write and the
+        post-tool write — which is how the previous format grew a ``pending``
+        key that only one of the three knew about.
+        """
+        return RunState(
+            run_id=run_id,
+            agent_id=self.config.agent_id,
+            task=self._task,
+            memory=self._working_memory.to_dict(),
+            step=step,
+            phase=phase,
+            assistant_message=assistant_message,
+            actions=actions or [],
+            budget=self._guard.snapshot() if hasattr(self._guard, "snapshot") else None,
+        )
+
     async def _write_step_checkpoint(self, run_id: str, step: int) -> None:
         if self._checkpoint_store is None or not self._checkpoint_resume_enabled:
             return
-        await self._checkpoint_store.write(
-            self._ckp_id,
-            {
-                "run_id": run_id,
-                "agent_id": self.config.agent_id,
-                "task": self._task,
-                "step": step,
-                "memory": self._working_memory.to_dict(),
-            },
-        )
+        await self._checkpoint_store.write(self._ckp_id, self._state(run_id, step).to_dict())
 
     async def _react_stream(
         self, run_id: str, start_step: int = 0
@@ -599,7 +640,7 @@ class BaseAgent:
                         approved.append(act)
                     elif approval.correction:
                         await self._inject_human_guidance(
-                            response, approval.correction, run_id, step
+                            _assistant_message(response), approval.correction, run_id, step
                         )
                         correction_injected = True
                         break
@@ -734,7 +775,9 @@ class BaseAgent:
                     for act, obs in zip(parallel_actions, observations, strict=False)
                     if _is_image_block(obs)
                 ]
-                await self._record_parallel_observations(response, combined, image_blocks)
+                await self._record_parallel_observations(
+                    _assistant_message(response), combined, image_blocks
+                )
                 for event in observation_events:
                     yield event
             else:
@@ -770,7 +813,9 @@ class BaseAgent:
                     if observation is _HITL_CORRECTION:
                         continue
 
-                await self._record_tool_observation(response, tool_name, observation)
+                await self._record_tool_observation(
+                    _assistant_message(response), tool_name, observation
+                )
                 is_img = _is_image_block(observation)
                 obs_raw = "[image]" if is_img else str(observation)
                 obs_display = obs_raw if is_img else obs_raw[:500]
@@ -983,12 +1028,19 @@ class BaseAgent:
 
     async def _record_tool_observation(
         self,
-        response: dict,
+        assistant_message: str,
         tool_name: str,
         observation: Any,
     ) -> None:
-        """Record one ReAct action and its observation in working memory."""
-        await self._working_memory.append("assistant", json.dumps(response))
+        """Record one ReAct action and its observation in working memory.
+
+        Takes the already-serialized assistant message rather than the parsed
+        response dict, so the bytes written here are the same bytes a
+        checkpoint holds. Re-serializing a dict that has been through a JSON
+        round-trip can reorder keys, which changes the prompt prefix and
+        silently costs a provider-side cache hit on a resumed run.
+        """
+        await self._working_memory.append("assistant", assistant_message)
         if _is_image_block(observation):
             await self._working_memory.append(
                 "user",
@@ -1011,12 +1063,16 @@ class BaseAgent:
 
     async def _record_parallel_observations(
         self,
-        response: dict,
+        assistant_message: str,
         combined: list[dict],
         image_blocks: list[tuple[str, Any]],
     ) -> None:
-        """Record one parallel ReAct action batch and its observations."""
-        await self._working_memory.append("assistant", json.dumps(response))
+        """Record one parallel ReAct action batch and its observations.
+
+        See :meth:`_record_tool_observation` on why this takes the serialized
+        message rather than the response dict.
+        """
+        await self._working_memory.append("assistant", assistant_message)
         if image_blocks:
             content: list = [
                 {
@@ -1118,22 +1174,25 @@ class BaseAgent:
 
         approval_id = str(uuid.uuid4())
         if self._checkpoint_store is not None and self._checkpoint_resume_enabled:
+            # Written *before* blocking on the human, so a process that dies
+            # at the prompt is resumable. The action is recorded as PENDING:
+            # awaiting a decision, distinct from approved-but-not-yet-run.
             await self._checkpoint_store.write(
                 self._ckp_id,
-                {
-                    "run_id": run_id,
-                    "agent_id": self.config.agent_id,
-                    "task": self._task,
-                    "step": step,
-                    "memory": self._working_memory.to_dict(),
-                    "pending": {
-                        "approval_id": approval_id,
-                        "tool": tool_name,
-                        "args": tool_args,
-                        "step": step,
-                        "llm_response": llm_response,
-                    },
-                },
+                self._state(
+                    run_id,
+                    step,
+                    phase=Phase.APPROVE,
+                    assistant_message=_assistant_message(llm_response),
+                    actions=[
+                        ActionState(
+                            tool=tool_name,
+                            args=copy.deepcopy(tool_args),
+                            status=ActionStatus.PENDING,
+                            approval_id=approval_id,
+                        )
+                    ],
+                ).to_dict(),
             )
         return await request_approval(
             ApprovalRequest(
@@ -1167,7 +1226,9 @@ class BaseAgent:
         approval = await self._gate_tool(run_id, step, tool_name, tool_args, response)
         if approval is not None:
             if approval.correction:
-                await self._inject_human_guidance(response, approval.correction, run_id, step)
+                await self._inject_human_guidance(
+                    _assistant_message(response), approval.correction, run_id, step
+                )
                 return _HITL_CORRECTION
             if not approval.approved:
                 await self._commit_checkpoint(run_id, step)
@@ -1236,7 +1297,9 @@ class BaseAgent:
         approval = await self._gate_tool(run_id, step, tool_name, tool_args, response)
         if approval is not None:
             if approval.correction:
-                await self._inject_human_guidance(response, approval.correction, run_id, step)
+                await self._inject_human_guidance(
+                    _assistant_message(response), approval.correction, run_id, step
+                )
                 yield ("correction", None)
                 return
             if not approval.approved:
@@ -1265,10 +1328,10 @@ class BaseAgent:
         yield ("result", observation)
 
     async def _inject_human_guidance(
-        self, response: dict, correction: str, run_id: str, step: int
+        self, assistant_message: str, correction: str, run_id: str, step: int
     ) -> None:
         """Append human correction to WorkingMemory and commit a clean checkpoint."""
-        await self._working_memory.append("assistant", json.dumps(response))
+        await self._working_memory.append("assistant", assistant_message)
         await self._working_memory.append("user", f"Human guidance: {correction}")
         await self._commit_checkpoint(run_id, step)
 
@@ -1287,39 +1350,31 @@ class BaseAgent:
         """
         if self._checkpoint_store is None or not self._checkpoint_resume_enabled:
             return
-        await self._checkpoint_store.write(
-            self._ckp_id,
-            {
-                "run_id": run_id,
-                "agent_id": self.config.agent_id,
-                "task": self._task,
-                "step": step,
-                "memory": self._working_memory.to_dict(),
-            },
-        )
+        await self._checkpoint_store.write(self._ckp_id, self._state(run_id, step).to_dict())
 
     async def _clear_checkpoint(self, run_id: str) -> None:
         if self._checkpoint_store:
             await self._checkpoint_store.delete(self._ckp_id)
 
-    async def _replay_pending_step(
+    async def _replay_pending_action(
         self,
-        run_id: str,
-        pending: dict,
+        state: RunState,
+        action: ActionState,
     ) -> AsyncGenerator[BusEvent, None]:
-        """Re-prompt approval for a step interrupted by a crash, then complete it."""
+        """Re-prompt approval for an action interrupted by a crash, then complete it."""
         from harness.hitl import ApprovalRequest, is_allowed, request_approval
 
-        tool_name = pending["tool"]
-        tool_args = pending["args"]
-        step = pending["step"]
-        llm_response = pending["llm_response"]
+        run_id = state.run_id
+        tool_name = action.tool
+        tool_args = action.args
+        step = state.step
+        assistant_message = state.assistant_message or "{}"
 
         approval = None
         if not is_allowed(tool_name, tool_args):
             approval = await request_approval(
                 ApprovalRequest(
-                    approval_id=pending["approval_id"],
+                    approval_id=action.approval_id or str(uuid.uuid4()),
                     run_id=self._resume_key,  # standalone: ckp_id; orchestrated: outer run_id
                     agent_id=self.config.agent_id,
                     tool=tool_name,
@@ -1331,7 +1386,7 @@ class BaseAgent:
             )
 
         if approval is not None and approval.correction:
-            await self._inject_human_guidance(llm_response, approval.correction, run_id, step)
+            await self._inject_human_guidance(assistant_message, approval.correction, run_id, step)
             return
 
         observation = (
@@ -1339,12 +1394,19 @@ class BaseAgent:
             if approval is None or approval.approved
             else f"Tool rejected by human: {approval.correction or 'no reason given'}"
         )
-        await self._record_tool_observation(llm_response, tool_name, observation)
+        action.status = ActionStatus.EXECUTED
+        action.observation = observation
+        action.attempts += 1
+        await self._record_tool_observation(assistant_message, tool_name, observation)
+        # Persist before yielding, never after. A consumer that breaks on this
+        # observation must not leave a checkpoint still calling the action
+        # pending: the tool has already run, and replaying it on the next
+        # resume would repeat its side effects.
+        await self._commit_checkpoint(run_id, step)
         obs_display = "[image]" if _is_image_block(observation) else str(observation)[:500]
         yield BusEvent.observation(
             self.config.agent_id, step=step, tool=tool_name, observation=obs_display
         )
-        await self._commit_checkpoint(run_id, step)
 
 
 # ── LLM call shaping (module-level for testability) ──────────────────────────

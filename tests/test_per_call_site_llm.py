@@ -14,6 +14,7 @@ import pytest
 
 from agents.base import AgentConfig
 from harness.events import BusEvent, EventType
+from harness.runstate import RunState
 from harness.runtime import AgentRegistry, AgentRuntime, GuardrailConfig, ToolRegistry
 from memory.manager import MemoryManager
 from memory.stores import InMemoryEpisodicStore, InMemorySemanticStore
@@ -202,7 +203,7 @@ async def test_resume_stream_agent_checkpoint_attaches_budget_to_all_slots(monke
         def __init__(self, **kwargs) -> None:
             self.config = kwargs["config"]
 
-        async def _resume_stream(self, **_kwargs):
+        async def _resume_stream(self, *_args, **_kwargs):
             yield BusEvent(
                 type=EventType.TASK_DONE,
                 agent_id=self.config.agent_id,
@@ -217,19 +218,18 @@ async def test_resume_stream_agent_checkpoint_attaches_budget_to_all_slots(monke
     cheap = _RecordingLLM(name="cheap", answer={})
     checkpoint_store = _MemoryCheckpointStore(
         {
-            "run-1:alpha": {
-                "run_id": "run-1",
-                "agent_id": "alpha",
-                "task": "resume me",
-                "step": 0,
-                "memory": {
+            "run-1:alpha": RunState(
+                run_id="run-1",
+                agent_id="alpha",
+                task="resume me",
+                memory={
                     "messages": [],
                     "summarization_count": 0,
                     "max_tokens": 8000,
                     "summarize_ratio": 0.5,
                     "recency_window": 4,
                 },
-            }
+            ).to_dict()
         }
     )
     runtime = _build_two_agent_runtime(
