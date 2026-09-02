@@ -110,6 +110,51 @@ async def _minimal_wm(llm: ScriptedLLM) -> WorkingMemory:
     return wm
 
 
+def _agent_ckp(
+    *,
+    run_id: str,
+    agent_id: str,
+    task: str,
+    memory: dict,
+    step: int = 0,
+    pending: dict | None = None,
+) -> dict:
+    """Build a stored agent checkpoint.
+
+    Tests go through this rather than writing the dict inline so that the
+    stored shape lives in one place — changing the checkpoint format is then
+    one edit here instead of one per test.
+    """
+    ckp = {
+        "run_id": run_id,
+        "agent_id": agent_id,
+        "task": task,
+        "step": step,
+        "memory": memory,
+    }
+    if pending is not None:
+        ckp["pending"] = pending
+    return ckp
+
+
+def _orch_ckp(
+    *,
+    run_id: str,
+    goal: str,
+    plan: dict,
+    completed: dict | None = None,
+    replan_count: int = 0,
+) -> dict:
+    """Build a stored orchestrator checkpoint. See :func:`_agent_ckp`."""
+    return {
+        "run_id": run_id,
+        "goal": goal,
+        "plan": plan,
+        "completed": completed or {},
+        "replan_count": replan_count,
+    }
+
+
 # ── Checkpoint key namespacing ─────────────────────────────────────────────────
 
 
@@ -263,13 +308,13 @@ async def test_resume_continues_from_saved_step(
     await wm.append("assistant", '{"thought":"step1","action":"echo","args":{"message":"y"}}')
     await wm.append("user", "Observation: step1 done")
 
-    ckp_store.data[ckp_id] = {
-        "run_id": run_id,
-        "agent_id": agent_id,
-        "task": "the task",
-        "step": 2,
-        "memory": wm.to_dict(),
-    }
+    ckp_store.data[ckp_id] = _agent_ckp(
+        run_id=run_id,
+        agent_id=agent_id,
+        task="the task",
+        step=2,
+        memory=wm.to_dict(),
+    )
 
     call_count = {"n": 0}
     seen_messages: list[list] = []
@@ -334,14 +379,14 @@ async def test_resume_with_pending_hitl_replays_and_executes_tool(
             "args": {"message": "pending call"},
         },
     }
-    ckp_store.data[ckp_id] = {
-        "run_id": run_id,
-        "agent_id": agent_id,
-        "task": "hitl task",
-        "step": 1,
-        "memory": wm.to_dict(),
-        "pending": pending,
-    }
+    ckp_store.data[ckp_id] = _agent_ckp(
+        run_id=run_id,
+        agent_id=agent_id,
+        task="hitl task",
+        step=1,
+        memory=wm.to_dict(),
+        pending=pending,
+    )
 
     def react(system, messages, kwargs):
         return {"thought": "done", "action": "finish", "answer": "hitl ok", "confidence": 0.9}
@@ -405,14 +450,14 @@ async def test_resume_with_rejected_hitl_skips_tool(
             "args": {"message": "should not run"},
         },
     }
-    ckp_store.data[ckp_id] = {
-        "run_id": run_id,
-        "agent_id": agent_id,
-        "task": "reject task",
-        "step": 0,
-        "memory": wm.to_dict(),
-        "pending": pending,
-    }
+    ckp_store.data[ckp_id] = _agent_ckp(
+        run_id=run_id,
+        agent_id=agent_id,
+        task="reject task",
+        step=0,
+        memory=wm.to_dict(),
+        pending=pending,
+    )
 
     echo = EchoTool()
     execute_calls: list = []
@@ -470,13 +515,13 @@ async def test_runtime_resume_agent_reads_ckp_id_and_returns_result(
     ckp_id = f"{run_id}:{agent_id}"
 
     wm = await _minimal_wm(llm)
-    ckp_store.data[ckp_id] = {
-        "run_id": run_id,
-        "agent_id": agent_id,
-        "task": "the task",
-        "step": 0,
-        "memory": wm.to_dict(),
-    }
+    ckp_store.data[ckp_id] = _agent_ckp(
+        run_id=run_id,
+        agent_id=agent_id,
+        task="the task",
+        step=0,
+        memory=wm.to_dict(),
+    )
 
     def react(system, messages, kwargs):
         return {
@@ -552,13 +597,13 @@ async def test_runtime_resume_agent_recomputes_ckp_id_correctly(
     ckp_id = f"{run_id}:{agent_id}"
 
     wm = await _minimal_wm(llm)
-    ckp_store.data[ckp_id] = {
-        "run_id": run_id,
-        "agent_id": agent_id,
-        "task": "task",
-        "step": 0,
-        "memory": wm.to_dict(),
-    }
+    ckp_store.data[ckp_id] = _agent_ckp(
+        run_id=run_id,
+        agent_id=agent_id,
+        task="task",
+        step=0,
+        memory=wm.to_dict(),
+    )
 
     def react(system, messages, kwargs):
         return {"thought": "done", "action": "finish", "answer": "ok", "confidence": 1.0}
@@ -776,13 +821,13 @@ async def test_resume_orchestration_skips_completed_tasks(
             },
         ],
     }
-    ckp_store.data[run_id] = {
-        "run_id": run_id,
-        "goal": "test goal",
-        "plan": plan_dict,
-        "completed": {"t1": _task_result_to_dict(t1_result)},
-        "replan_count": 0,
-    }
+    ckp_store.data[run_id] = _orch_ckp(
+        run_id=run_id,
+        goal="test goal",
+        plan=plan_dict,
+        completed={"t1": _task_result_to_dict(t1_result)},
+        replan_count=0,
+    )
 
     agents_run: list[str] = []
 
@@ -845,13 +890,13 @@ async def test_resume_orchestration_reruns_incomplete_tasks(
             },
         ],
     }
-    ckp_store.data[run_id] = {
-        "run_id": run_id,
-        "goal": "fresh goal",
-        "plan": plan_dict,
-        "completed": {},  # nothing done yet
-        "replan_count": 0,
-    }
+    ckp_store.data[run_id] = _orch_ckp(
+        run_id=run_id,
+        goal="fresh goal",
+        plan=plan_dict,
+        completed={},
+        replan_count=0,
+    )
 
     agents_run: list[str] = []
 
@@ -929,13 +974,13 @@ async def test_resume_unified_detects_orchestrator_checkpoint(
             },
         ],
     }
-    ckp_store.data[run_id] = {
-        "run_id": run_id,
-        "goal": "unified goal",
-        "plan": plan_dict,
-        "completed": {"t1": _task_result_to_dict(t1_result)},
-        "replan_count": 0,
-    }
+    ckp_store.data[run_id] = _orch_ckp(
+        run_id=run_id,
+        goal="unified goal",
+        plan=plan_dict,
+        completed={"t1": _task_result_to_dict(t1_result)},
+        replan_count=0,
+    )
 
     llm.routes = {
         "decomposes goals": lambda *a: plan_dict,
@@ -976,13 +1021,13 @@ async def test_resume_unified_detects_agent_checkpoint(
     ckp_id = f"{run_id}:{agent_id}"
 
     wm = await _minimal_wm(llm)
-    ckp_store.data[ckp_id] = {
-        "run_id": run_id,
-        "agent_id": agent_id,
-        "task": "agent task",
-        "step": 0,
-        "memory": wm.to_dict(),
-    }
+    ckp_store.data[ckp_id] = _agent_ckp(
+        run_id=run_id,
+        agent_id=agent_id,
+        task="agent task",
+        step=0,
+        memory=wm.to_dict(),
+    )
 
     llm.routes = {
         "react": lambda *a: {
