@@ -839,7 +839,7 @@ Background sub-agent tasks are process-local. They keep running while the
 REPL/server process is alive; completed results become durable only when
 collected into the session transcript with `/tasks collect <id|all>`.
 
-Overlapping delegations to one sub-agent are safe as of 0.14: each invocation
+Overlapping delegations to one sub-agent are safe as of 0.13: each invocation
 runs on its own copy of the tool and its nested agent, so concurrent runs no
 longer share working memory. What remains your responsibility is whether that
 agent's **tools and LLM adapter** tolerate concurrent use — a tool holding a
