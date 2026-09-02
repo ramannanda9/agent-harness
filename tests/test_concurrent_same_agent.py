@@ -248,3 +248,153 @@ def test_a_clone_gets_its_own_steering_queue(llm):
 
     assert clone._steering.qsize() == 1
     assert agent._steering.qsize() == 0
+
+
+# ── The same hazard inside one agent's parallel batch ────────────────────────
+#
+# The orchestrator's per-task copies do not help here: this is a single agent
+# emitting two parallel actions that name the same tool, so both resolve
+# through one ``self._tools`` entry.
+
+
+class _InnerLLM(ScriptedLLM):
+    pass
+
+
+@pytest.fixture
+def delegation_setup():
+    """An outer agent that fans one specialist out across two subtasks."""
+    from tools.builtin.subagent import SubAgentTool
+
+    llm = ScriptedLLM()
+    inner_saw: list[str] = []
+
+    def inner_react(system, messages, kwargs):
+        user = [m for m in messages if m["role"] == "user"]
+        current = user[0]["content"] if user else "?"
+        inner_saw.append(current[:5])
+        if len(inner_saw) <= 2:
+            return {"thought": "work", "action": "slow", "args": {}}
+        return {
+            "thought": "done",
+            "action": "finish",
+            "answer": f"sub-{current[:5]}",
+            "confidence": 1.0,
+        }
+
+    outer_calls = {"n": 0}
+
+    def outer_react(system, messages, kwargs):
+        outer_calls["n"] += 1
+        if outer_calls["n"] == 1:
+            return {
+                "thought": "fan out to the same specialist twice",
+                "actions": [
+                    {"tool": "delegate_inner", "args": {"task": "AAAAA-first"}},
+                    {"tool": "delegate_inner", "args": {"task": "BBBBB-second"}},
+                ],
+            }
+        return {"thought": "done", "action": "finish", "answer": "outer ok", "confidence": 1.0}
+
+    llm.routes = {"you are inner": inner_react, "you are outer": outer_react}
+    memory = MemoryManager(
+        semantic_store=InMemorySemanticStore(),
+        episodic_store=InMemoryEpisodicStore(),
+        llm=llm,
+    )
+    inner = BaseAgent(
+        config=AgentConfig(
+            agent_id="inner",
+            role="r",
+            system_prompt="You are inner. ReAct.",
+            allowed_tools=["slow"],
+            max_steps=6,
+        ),
+        tools={"slow": SlowTool()},
+        memory=memory,
+        tracer=Tracer(),
+        guard=_guard(),
+        llm=llm,
+    )
+    outer = BaseAgent(
+        config=AgentConfig(
+            agent_id="outer",
+            role="r",
+            system_prompt="You are outer. ReAct.",
+            allowed_tools=["delegate_inner"],
+            max_steps=6,
+        ),
+        tools={"delegate_inner": SubAgentTool(inner)},
+        memory=memory,
+        tracer=Tracer(),
+        guard=_guard(),
+        llm=llm,
+    )
+    return outer, inner, inner_saw
+
+
+async def test_parallel_delegations_to_one_specialist_do_not_collide(delegation_setup):
+    """Two parallel actions naming the same delegating tool resolved to one
+    object, so both delegations drove the *same* nested agent: the second
+    overwrote the first's working memory and both returned the second's
+    answer."""
+    from harness.events import EventType
+
+    outer, _inner, _seen = delegation_setup
+
+    observations = []
+    async for event in outer.run_stream(task="do both", run_id="par-run"):
+        if event.type == EventType.OBSERVATION:
+            observations.append(str(event.payload["observation"]))
+
+    answers = {o for o in observations if "sub-" in o}
+    assert len(answers) == 2, f"the two delegations returned the same answer: {answers}"
+    assert any("sub-AAAAA" in a for a in answers)
+    assert any("sub-BBBBB" in a for a in answers)
+
+
+async def test_each_delegation_keeps_its_own_subtask(delegation_setup):
+    outer, _inner, inner_saw = delegation_setup
+
+    async for _ in outer.run_stream(task="do both", run_id="par-run"):
+        pass
+
+    assert sorted(inner_saw) == ["AAAAA", "AAAAA", "BBBBB", "BBBBB"], (
+        f"each delegation should think twice about its own subtask, saw {inner_saw}"
+    )
+
+
+async def test_the_registered_specialist_is_left_untouched(delegation_setup):
+    outer, inner, _seen = delegation_setup
+
+    async for _ in outer.run_stream(task="do both", run_id="par-run"):
+        pass
+
+    assert inner._task == ""
+    assert inner._working_memory is None
+
+
+def test_a_stateless_tool_is_not_copied_per_invocation(delegation_setup):
+    """Copying is opt-in. Most tools are stateless and some deliberately hold
+    a shared connection that must not be duplicated."""
+    outer, _inner, _seen = delegation_setup
+    shared = SlowTool()
+    outer._tools["slow"] = shared
+
+    assert outer._tool_for_invocation("slow") is shared
+
+
+def test_a_stateful_tool_is_copied_per_invocation(delegation_setup):
+    outer, _inner, _seen = delegation_setup
+
+    first = outer._tool_for_invocation("delegate_inner")
+    second = outer._tool_for_invocation("delegate_inner")
+
+    assert first is not second
+    assert first._agent is not second._agent
+
+
+def test_an_unknown_tool_resolves_to_none(delegation_setup):
+    outer, _inner, _seen = delegation_setup
+
+    assert outer._tool_for_invocation("nope") is None

@@ -410,16 +410,30 @@ async def test_parallel_mixed_streaming_and_plain_tools_runs():
 
 @pytest.mark.asyncio
 async def test_parent_guard_is_shared_with_subagent_on_delegate():
-    """The sub-agent's ``_guard`` should be reassigned to the parent's
-    guard when delegation starts — so ``check()`` enforces the run-level
-    cap and the bubbled TASK_DONE budget snapshot reflects real usage,
-    not the sub-agent's stale construction-time guard."""
+    """The sub-agent that actually runs must be on the parent's guard — so
+    ``check()`` enforces the run-level cap and the bubbled TASK_DONE budget
+    snapshot reflects real usage, not a stale construction-time guard.
+
+    Each delegation runs on its own copy of the tool and its nested agent,
+    so the guard is asserted on the copy that ran. The registered instance
+    is a template and is deliberately left alone: sharing it across
+    concurrent delegations is what let two of them overwrite each other's
+    working memory.
+    """
+    delegated: list = []
+
+    class SpyTool(SubAgentTool):
+        def clone_for_run(self):
+            clone = super().clone_for_run()
+            delegated.append(clone)
+            return clone
+
     sub_llm = _CannedLLM(
         [{"thought": "go", "action": "finish", "answer": "done", "confidence": 1.0}]
     )
     sub = _build_agent(agent_id="sub", llm=sub_llm)
     sub_local_guard = sub._guard  # captured before delegation
-    tool = SubAgentTool(sub, name="delegate_sub")
+    tool = SpyTool(sub, name="delegate_sub")
 
     parent_llm = _CannedLLM(
         [
@@ -432,10 +446,11 @@ async def test_parent_guard_is_shared_with_subagent_on_delegate():
     async for _ in parent.run_stream("go"):
         pass
 
-    # After the run, the sub-agent's _guard should now be the parent's
-    # guard, not its original local one.
-    assert sub._guard is parent._guard
-    assert sub._guard is not sub_local_guard
+    assert delegated, "the delegation should have run on its own copy"
+    assert delegated[0]._agent._guard is parent._guard
+    assert delegated[0]._agent._guard is not sub_local_guard
+    # The template keeps its own guard — nothing ran on it.
+    assert sub._guard is sub_local_guard
 
 
 # ── Lifecycle events ─────────────────────────────────────────────────────────

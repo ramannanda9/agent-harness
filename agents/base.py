@@ -872,13 +872,13 @@ class BaseAgent:
 
         for action in actions:
             action.attempts += 1
-            tool = self._tools.get(action.tool)
+            tool = self._tool_for_invocation(action.tool)
             if tool is not None and hasattr(tool, "execute_stream"):
                 self._prepare_delegation(tool)
                 streaming.append((action, _freeze_factory(tool, action.args)))
             else:
                 plain.append(action)
-                plain_tasks.append(self._execute_tool(action.tool, action.args))
+                plain_tasks.append(self._execute_tool(action.tool, action.args, tool=tool))
 
         if streaming:
             from harness.streaming import fan_in
@@ -908,6 +908,25 @@ class BaseAgent:
             action.observation = value
         for action in actions:
             action.status = ActionStatus.EXECUTED
+
+    def _tool_for_invocation(self, name: str) -> Any:
+        """The tool object this particular call should use.
+
+        Tools that carry per-invocation state advertise it with
+        ``clone_for_run`` and get a fresh copy per call. That matters most for
+        a batch: two parallel actions naming the same tool would otherwise
+        share one object, and for a delegating tool that means both
+        delegations drive the *same* nested agent — the second overwrites the
+        first's working memory mid-flight and both return the second's answer.
+
+        Everything else is returned as-is. Most tools are stateless, and some
+        deliberately hold a shared connection that must not be duplicated.
+        """
+        tool = self._tools.get(name)
+        if tool is None:
+            return None
+        clone = getattr(tool, "clone_for_run", None)
+        return clone() if callable(clone) else tool
 
     def _prepare_delegation(self, tool: Any) -> None:
         """Wire a sub-agent tool to this agent before it runs."""
@@ -1231,12 +1250,19 @@ class BaseAgent:
 
     # ── Tool Execution ────────────────────────────────────────────────────────
 
-    async def _execute_tool(self, name: str, args: dict) -> Any:
-        if name not in self._tools:
+    async def _execute_tool(self, name: str, args: dict, *, tool: Any = None) -> Any:
+        """Run one tool call.
+
+        ``tool`` lets the caller pass an instance already resolved for this
+        invocation (see :meth:`_tool_for_invocation`); without it the shared
+        registered instance is used, which is correct for stateless tools.
+        """
+        if tool is None:
+            tool = self._tools.get(name)
+        if tool is None:
             return (
                 f"Error: tool '{name}' not available. Available tools: {list(self._tools.keys())}"
             )
-        tool = self._tools[name]
 
         # Per-run memoization, gated by both agent opt-in AND tool consent.
         # Tools that have side effects or time-dependent output can veto
