@@ -52,6 +52,7 @@ harness/tool_policy.py      Persistent tool policy — user-scoped allow rules, 
 harness/console.py          ConsoleRenderer — centralised BusEvent formatting + render_budget helper
 harness/steering.py         Async steering — agent.steer(text), StdinRouter pub/sub, FileSteer, factory helpers
 harness/checkpoint.py       CheckpointStore + _ResumeHint + maybe_resume_key — pluggable run-state persistence (file + Redis); auto-resume built into dispatch_stream / run_stream
+harness/runstate.py         RunState / OrchestratorState — the explicit, serializable position of a run: step + phase, per-action and per-task status, budget, failure reason
 harness/otel.py             OTELHook — OpenTelemetry span exporter (opt-in)
 harness/executor_bridge.py  ExecutorBridge + ExecutorTool — controlled subprocess launcher with optional Docker sandboxing
 harness/oauth_browser.py    Localhost OAuth callback server + open_or_print_url — shared by MCP browser-OAuth and LLM login flows
@@ -1632,6 +1633,10 @@ agent-harness policy clear
 **Wall-time budget** is suspended while waiting for input — human think-time
 does not count against `max_wall_time_seconds`.
 
+**Gating does not depend on durability.** A tool listed in `hitl_tools` is
+always gated; with no checkpoint store configured you still get the prompt,
+you just don't get crash-resume.
+
 ### Step-level checkpointing
 
 Enable periodic crash-resume independent of HITL:
@@ -1654,16 +1659,42 @@ Each agent writes to its own key so orchestrated runs never overwrite each other
 | Path | Checkpoint key | Stored at |
 |---|---|---|
 | Single-agent (`run_agent`, `run_routed`) | `<run_id>:<agent_id>` | `~/.agent-harness/checkpoints/<run_id>:<agent_id>.json` |
-| Orchestrated (`run`, `run_stream`) | `<run_id>` (orchestrator) + `<run_id>:<agent_id>` (each agent) | one file per agent, one file for the orchestrator |
+| Orchestrated (`run`, `run_stream`) | `<run_id>` (orchestrator) + `<run_id>:<task_id>:<agent_id>` (each task) | one file per task, one file for the orchestrator |
 
-The orchestrator checkpoint stores the goal, the full plan, completed task
-results, and the replan count. It is updated after each parallel batch
-completes and deleted on clean `DONE`.
+Orchestrated agent keys carry the **task id** because a plan may name the same
+agent for two tasks; keyed only by agent id, both would write to one file and
+overwrite each other.
+
+The orchestrator checkpoint stores the goal, the *current* plan (replanning
+replaces it), a `TaskState` per planned task, and the replan count. Per-task
+status — `pending / running / done / failed / skipped` plus a durable attempt
+counter — is what lets a task interrupted mid-flight resume from its agent's
+own position rather than restarting. It is written at each task transition and
+deleted on clean `DONE`.
 
 ### Crash / Ctrl-C resume
 
-The checkpoint (step number + full `WorkingMemory`) is written before every
-HITL prompt and (if `checkpoint_every > 0`) at each periodic step.
+A checkpoint is a `RunState` (`harness/runstate.py`): where the run is (`step`
+plus a `think / approve / act / observe` phase), the actions of the current
+step with per-action status, the full `WorkingMemory`, the budget so far, and —
+if it failed — why. It is written before every HITL prompt and (if
+`checkpoint_every > 0`) at each periodic step.
+
+Resuming is not a separate code path: the loop loads the state and keeps
+advancing it, so a run that died partway through a batch of approvals comes
+back knowing which calls were already approved and which tools already ran.
+
+Recorded spending is restored, so a resumed run cannot start its budget over.
+The exception is a run that failed *because* of the budget — restoring the
+guard that just tripped would fail again at the same point, so the raised
+`GuardrailConfig` is allowed to take effect instead.
+
+> **Checkpoints from before 0.13 cannot be resumed.** They predate per-action
+> and per-task status, so there is no honest way to reconstruct where such a
+> run actually was; `runtime.resume()` raises `LegacyCheckpointError` rather
+> than guessing. Checkpoints are short-lived by design —
+> `FileCheckpointStore.purge_old` defaults to 7 days, `RedisCheckpointStore`
+> expires after 24h.
 
 **What the banner prints:**
 
