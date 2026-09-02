@@ -69,6 +69,7 @@ class EventType(str, Enum):
     CONTEXT = "context"
     MEMORY = "memory"
     HUMAN_GUIDANCE = "human_guidance"  # async steering injected at step boundary
+    RESUMED = "resumed"  # a run picked up from a checkpoint; payload: step, phase
     SUBAGENT_START = "subagent_start"  # SubAgentTool begins; payload: task, invocation_id
     SUBAGENT_DONE = "subagent_done"  # SubAgentTool finished; payload: success, steps, confidence
     TASK_DONE = "task_done"
@@ -148,6 +149,24 @@ class HumanGuidancePayload:
 
     def to_dict(self) -> dict[str, Any]:
         return {"step": self.step, "text": self.text}
+
+
+@dataclass(frozen=True)
+class ResumedPayload:
+    """Opens the event stream of a run continued from a checkpoint.
+
+    A resumed run starts mid-story: the events explaining how it reached this
+    step were emitted by a process that is gone. This says where it picked up,
+    so a reader is not left inferring it from a step counter that starts at
+    something other than zero.
+    """
+
+    step: int
+    phase: str
+    actions: list[str]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"step": self.step, "phase": self.phase, "actions": list(self.actions)}
 
 
 @dataclass(frozen=True)
@@ -345,6 +364,16 @@ class BusEvent:
             type=EventType.HUMAN_GUIDANCE,
             agent_id=agent_id,
             payload=HumanGuidancePayload(step=step, text=text).to_dict(),
+        )
+
+    @classmethod
+    def resumed(
+        cls, agent_id: str, *, step: int, phase: str, actions: list[str] | None = None
+    ) -> BusEvent:
+        return cls(
+            type=EventType.RESUMED,
+            agent_id=agent_id,
+            payload=ResumedPayload(step=step, phase=phase, actions=actions or []).to_dict(),
         )
 
     @classmethod

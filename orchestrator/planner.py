@@ -39,6 +39,7 @@ from typing import Any
 from harness.checkpoint import _ResumeHint
 from harness.events import BusEvent, EventType
 from harness.hitl import stdout_lock as _hitl_stdout_lock
+from harness.runstate import OrchestratorState, TaskState, TaskStatus
 from harness.utils import fire, parse_llm_json
 
 logger = logging.getLogger(__name__)
@@ -242,29 +243,43 @@ class Orchestrator:
 
         # ── 2. Execute ─────────────────────────────────────────────────────────
         self._set_agent_resume_keys()
-        await self._write_orch_checkpoint(goal, plan, {}, 0)
+        await self._write_orch_checkpoint(goal, plan, _initial_task_states(plan), 0)
         async with _ResumeHint(self._run_id, self._checkpoint_store, "Orchestration") as hint:
             async for event in self._execute_plan_stream(goal, plan, {}, 0):
                 if event.type == EventType.DONE:
                     hint.done = True
                 yield event
 
-    async def resume_stream(
-        self,
-        goal: str,
-        plan: Plan,
-        completed: dict[str, TaskResult],
-        replan_count: int,
-    ) -> AsyncGenerator[BusEvent, None]:
-        """Re-enter execution from a saved checkpoint, skipping completed tasks."""
-        logger.info("Orchestrator resume run_id=%s completed=%s", self._run_id, list(completed))
+    async def resume_stream(self, state: OrchestratorState) -> AsyncGenerator[BusEvent, None]:
+        """Re-enter execution from a saved checkpoint.
+
+        Which tasks still need running comes from their recorded status, not
+        from absence in a results map. Those differ: a task that failed and was
+        queued for retry has a result *and* still needs running, and the old
+        derivation skipped it.
+        """
+        goal = state.goal
+        plan = _plan_from_dict(state.plan)
+        completed = {tid: _task_result_from_dict(r) for tid, r in state.recorded_results().items()}
+        logger.info(
+            "Orchestrator resume run_id=%s outstanding=%s",
+            self._run_id,
+            [tid for tid, ts in state.tasks.items() if ts.status in _OUTSTANDING],
+        )
         self._tracer.start_run(self._run_id, goal)
 
-        yield BusEvent.plan("orchestrator", plan=_plan_to_dict(plan), resumed=True)
+        yield BusEvent.plan("orchestrator", plan=state.plan, resumed=True)
 
         self._set_agent_resume_keys()
         async with _ResumeHint(self._run_id, self._checkpoint_store, "Orchestration") as hint:
-            async for event in self._execute_plan_stream(goal, plan, completed, replan_count):
+            async for event in self._execute_plan_stream(
+                goal,
+                plan,
+                completed,
+                state.replan_count,
+                task_states=state.tasks,
+                aborted=state.aborted,
+            ):
                 if event.type == EventType.DONE:
                     hint.done = True
                 yield event
@@ -291,7 +306,7 @@ class Orchestrator:
         yield BusEvent.plan("orchestrator", plan=_plan_to_dict(plan), pre_built=True)
 
         self._set_agent_resume_keys()
-        await self._write_orch_checkpoint(goal, plan, {}, 0)
+        await self._write_orch_checkpoint(goal, plan, _initial_task_states(plan), 0)
         async with _ResumeHint(self._run_id, self._checkpoint_store, "Orchestration") as hint:
             async for event in self._execute_plan_stream(goal, plan, {}, 0):
                 if event.type == EventType.DONE:
@@ -309,12 +324,19 @@ class Orchestrator:
         plan: Plan,
         completed_init: dict[str, TaskResult],
         replan_count_init: int,
+        *,
+        task_states: dict[str, TaskState] | None = None,
+        aborted: bool = False,
     ) -> AsyncGenerator[BusEvent, None]:
         """Shared execution loop for both run_stream and resume_stream."""
         completed: dict[str, TaskResult] = dict(completed_init)
-        pending: list[Task] = [t for t in plan.tasks if t.id not in completed]
+        tasks: dict[str, TaskState] = dict(task_states or {})
+        for t in plan.tasks:
+            tasks.setdefault(t.id, TaskState(task_id=t.id, attempt=t._retry_count))
+        # Outstanding work is what status says, not what is missing from the
+        # results map — a task that failed and is queued for retry is in both.
+        pending: list[Task] = [t for t in plan.tasks if tasks[t.id].status in _OUTSTANDING]
         replan_count = replan_count_init
-        aborted = False
 
         while pending and not aborted:
             self._guard.check()
@@ -326,15 +348,36 @@ class Orchestrator:
                 )
                 break
 
+            # Tasks still marked RUNNING were interrupted by a previous
+            # process. Their agent's own checkpoint may still hold where it
+            # got to, in which case the task continues instead of restarting.
+            resume_states = await self._load_child_states(ready, tasks)
+
+            for t in ready:
+                tasks[t.id].status = TaskStatus.RUNNING
+                tasks[t.id].instruction = t.instruction
+                tasks[t.id].agent_ckp_id = self._child_ckp_id(t)
+            await self._write_orch_checkpoint(goal, plan, tasks, replan_count, aborted)
+
             batch_results: dict[str, TaskResult] = {}
-            async for event in self._run_batch(goal, ready, batch_results, completed):
+            async for event in self._run_batch(
+                goal, ready, batch_results, completed, resume_states=resume_states
+            ):
                 yield event
 
             for t in ready:
                 if t in pending:
                     pending.remove(t)
             completed.update(batch_results)
-            await self._write_orch_checkpoint(goal, plan, completed, replan_count)
+            for tid, result in batch_results.items():
+                tasks[tid].status = TaskStatus.DONE if result.success else TaskStatus.FAILED
+                tasks[tid].result = _task_result_to_dict(result)
+            # Persisted as DONE/FAILED *before* the on_failure decisions below,
+            # then again after each one. The previous code folded failures into
+            # a "completed" map and checkpointed once, before deciding whether
+            # to retry — so a crash in between left a record saying the task
+            # was finished and it was never retried.
+            await self._write_orch_checkpoint(goal, plan, tasks, replan_count, aborted)
 
             # Per-task replan / on_failure decisions
             for task in ready:
@@ -371,13 +414,21 @@ class Orchestrator:
                 if task.on_failure == OnFailure.ABORT:
                     logger.error("Task %s failed with on_failure=abort", task.id)
                     aborted = True
+                    # Recorded, so a crash before the checkpoint is deleted
+                    # cannot let a resume re-run the task that aborted the run.
+                    await self._write_orch_checkpoint(goal, plan, tasks, replan_count, aborted)
                     break
                 if task.on_failure == OnFailure.SKIP:
                     logger.info("Task %s skipped (on_failure=skip)", task.id)
+                    tasks[task.id].status = TaskStatus.SKIPPED
+                    await self._write_orch_checkpoint(goal, plan, tasks, replan_count, aborted)
                     continue
                 if task.on_failure == OnFailure.RETRY and task._retry_count < task.max_retries:
                     task._retry_count += 1
                     pending.insert(0, task)
+                    tasks[task.id].status = TaskStatus.PENDING
+                    tasks[task.id].attempt = task._retry_count
+                    await self._write_orch_checkpoint(goal, plan, tasks, replan_count, aborted)
                     logger.info("Retrying task %s (attempt %d)", task.id, task._retry_count)
                     continue
 
@@ -397,6 +448,11 @@ class Orchestrator:
                     continue
                 pending = list(new_plan.tasks)
                 replan_count += 1
+                # The checkpoint used to keep the *original* plan, so resuming
+                # after a replan rebuilt from a DAG the run had abandoned.
+                plan = new_plan
+                tasks = _reconcile_task_states(tasks, new_plan)
+                await self._write_orch_checkpoint(goal, plan, tasks, replan_count, aborted)
                 self._tracer.log(
                     "replan",
                     "orchestrator",
@@ -487,24 +543,75 @@ class Orchestrator:
 
     # ── Checkpoint helpers ────────────────────────────────────────────────────
 
+    def _child_ckp_id(self, task: Task) -> str:
+        """Checkpoint key of the agent running ``task``.
+
+        Task-scoped, because a plan may name the same agent for two tasks and
+        an agent-scoped key would have them overwrite each other.
+        """
+        return f"{self._run_id}:{task.id}:{task.agent_id}"
+
+    async def _load_child_states(
+        self, ready: list[Task], tasks: dict[str, TaskState]
+    ) -> dict[str, Any]:
+        """Load stored agent state for tasks that were interrupted mid-flight.
+
+        Only ``RUNNING`` tasks qualify: that status means a previous process
+        started the task and never recorded an outcome. Everything else either
+        has not begun or has already finished.
+
+        A missing or unreadable child checkpoint is not an error — the task
+        simply restarts, which is what happened for every interrupted task
+        before this existed.
+        """
+        from harness.runstate import RunState, load_state
+
+        if self._checkpoint_store is None:
+            return {}
+
+        states: dict[str, Any] = {}
+        for task in ready:
+            state = tasks.get(task.id)
+            if state is None or state.status is not TaskStatus.RUNNING:
+                continue
+            key = state.agent_ckp_id or self._child_ckp_id(task)
+            try:
+                stored = await self._checkpoint_store.read(key)
+                child = load_state(stored) if stored else None
+            except Exception as exc:  # noqa: BLE001 — restarting is always safe
+                logger.warning("Ignoring unreadable child checkpoint %s: %s", key, exc)
+                continue
+            if isinstance(child, RunState) and not child.is_terminal:
+                logger.info(
+                    "Resuming task %s from agent checkpoint %s (step %d, phase %s)",
+                    task.id,
+                    key,
+                    child.step,
+                    child.phase.value,
+                )
+                states[task.id] = child
+        return states
+
     async def _write_orch_checkpoint(
         self,
         goal: str,
         plan: Plan,
-        completed: dict[str, TaskResult],
+        tasks: dict[str, TaskState],
         replan_count: int,
+        aborted: bool = False,
     ) -> None:
         if self._checkpoint_store is None:
             return
         await self._checkpoint_store.write(
             self._run_id,
-            {
-                "run_id": self._run_id,
-                "goal": goal,
-                "plan": _plan_to_dict(plan),
-                "completed": {tid: _task_result_to_dict(r) for tid, r in completed.items()},
-                "replan_count": replan_count,
-            },
+            OrchestratorState(
+                run_id=self._run_id,
+                goal=goal,
+                plan=_plan_to_dict(plan),
+                tasks=dict(tasks),
+                replan_count=replan_count,
+                aborted=aborted,
+            ).to_dict(),
         )
 
     async def _delete_orch_checkpoint(self) -> None:
@@ -602,6 +709,7 @@ class Orchestrator:
         ready: list[Task],
         results_out: dict[str, TaskResult],
         completed_results: dict[str, TaskResult] | None = None,
+        resume_states: dict[str, Any] | None = None,
     ) -> AsyncGenerator[BusEvent, None]:
         """
         Run a batch of ready tasks in parallel, forwarding each agent's events
@@ -610,12 +718,22 @@ class Orchestrator:
 
         completed_results is used to inject upstream dependency outputs into
         each task's instruction so the agent has the context it needs.
+
+        resume_states maps task id to stored agent state for tasks that were
+        interrupted mid-flight; those continue from where their agent got to
+        rather than starting over.
         """
         bus: asyncio.Queue = asyncio.Queue()
         DRIVER_DONE = object()
 
         async def drive(task: Task) -> None:
-            agent = self._agents.get(task.agent_id)
+            registered = self._agents.get(task.agent_id)
+            # Each task drives its own copy. A plan may put two independent
+            # tasks on one agent, and BaseAgent holds a run's working memory
+            # and task on the instance — shared, the second run overwrites the
+            # first mid-flight and both return the second task's answer while
+            # reporting success.
+            agent = registered.clone_for_run(ckp_scope=task.id) if registered else None
             if agent is None:
                 await bus.put(
                     (
@@ -652,13 +770,21 @@ class Orchestrator:
                         f"--- Context from completed upstream tasks ---\n" + "\n\n".join(dep_parts)
                     )
 
+            # _set_agent_resume_keys ran against the registered instances, so
+            # carry the outer run id onto the copy this task actually drives.
+            agent._resume_key = registered._resume_key or self._run_id
+
+            resume_state = (resume_states or {}).get(task.id)
+            stream = (
+                agent._resume_stream(resume_state)
+                if resume_state is not None
+                else agent.run_stream(task=instruction, run_id=self._run_id)
+            )
+
             last_done: dict | None = None
             last_error: str | None = None
             try:
-                async for event in agent.run_stream(
-                    task=instruction,
-                    run_id=self._run_id,
-                ):
+                async for event in stream:
                     if event.type == EventType.TASK_DONE:
                         last_done = event.payload
                     elif event.type == EventType.ERROR:
@@ -866,6 +992,36 @@ def _detect_cycle(tasks: list[Task]) -> list[str] | None:
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 
+# Statuses that mean "this task still needs to run". Everything else is
+# terminal for the current attempt: a retry moves a task back to PENDING
+# rather than being represented as a fourth state.
+_OUTSTANDING = (TaskStatus.PENDING, TaskStatus.RUNNING)
+
+
+def _initial_task_states(plan: Plan) -> dict[str, TaskState]:
+    """A TaskState per planned task, all outstanding."""
+    return {t.id: TaskState(task_id=t.id, attempt=t._retry_count) for t in plan.tasks}
+
+
+def _reconcile_task_states(tasks: dict[str, TaskState], new_plan: Plan) -> dict[str, TaskState]:
+    """Carry task states across a replan.
+
+    A replanned DAG may drop task ids, reuse them with different
+    instructions, or introduce new ones. Carrying a status onto an id whose
+    instruction changed would claim work was done that nobody did, so a
+    reused id whose instruction differs is reset. Dropped ids fall away with
+    the plan that named them.
+    """
+    reconciled: dict[str, TaskState] = {}
+    for task in new_plan.tasks:
+        previous = tasks.get(task.id)
+        if previous is not None and previous.instruction in (None, task.instruction):
+            reconciled[task.id] = previous
+        else:
+            reconciled[task.id] = TaskState(task_id=task.id, attempt=task._retry_count)
+    return reconciled
+
+
 def _parse_plan(response: Any) -> Plan:
     data = parse_llm_json(response)
 
@@ -876,6 +1032,7 @@ def _parse_plan(response: Any) -> Plan:
             instruction=t["instruction"],
             depends_on=t.get("depends_on", []),
             on_failure=OnFailure(t.get("on_failure", "replan")),
+            max_retries=int(t.get("max_retries", 1)),
         )
         for i, t in enumerate(data.get("tasks", []))
         if t.get("agent_id") and t.get("instruction")
@@ -910,8 +1067,39 @@ def _task_result_from_dict(d: dict) -> TaskResult:
 
 
 def _plan_from_dict(d: dict) -> Plan:
-    """Restore a Plan from a checkpoint dict (inverse of _plan_to_dict)."""
-    return _parse_plan(d)
+    """Restore a Plan from a checkpoint dict (inverse of :func:`_plan_to_dict`).
+
+    Deliberately does *not* route through :func:`_parse_plan`. That function
+    decodes untrusted LLM output, so it is forgiving by design: it silently
+    drops tasks missing ``agent_id`` or ``instruction`` and re-derives absent
+    ids positionally. Applied to a checkpoint those are the wrong semantics —
+    a task quietly vanishing from a restored plan, or being renamed by its
+    index, corrupts a run rather than tolerating a sloppy model.
+
+    A checkpoint is our own output, so anything malformed here is a bug and
+    should say so.
+    """
+    tasks = []
+    for i, t in enumerate(d.get("tasks", [])):
+        missing = [k for k in ("id", "agent_id", "instruction") if not t.get(k)]
+        if missing:
+            raise ValueError(
+                f"Checkpointed plan task at index {i} is missing {', '.join(missing)}; "
+                "the checkpoint is corrupt and cannot be resumed."
+            )
+        task = Task(
+            id=t["id"],
+            agent_id=t["agent_id"],
+            instruction=t["instruction"],
+            depends_on=t.get("depends_on", []),
+            on_failure=OnFailure(t.get("on_failure", "replan")),
+            max_retries=int(t.get("max_retries", 1)),
+        )
+        # ``_retry_count`` is init=False, so it has to be set after construction.
+        # Without it a resumed run hands every task a fresh retry budget.
+        task._retry_count = int(t.get("retry_count", 0))
+        tasks.append(task)
+    return Plan(tasks=tasks, rationale=d.get("rationale", ""))
 
 
 def _plan_to_dict(plan: Plan) -> dict:
@@ -924,6 +1112,8 @@ def _plan_to_dict(plan: Plan) -> dict:
                 "instruction": t.instruction,
                 "depends_on": t.depends_on,
                 "on_failure": t.on_failure.value,
+                "max_retries": t.max_retries,
+                "retry_count": t._retry_count,
             }
             for t in plan.tasks
         ],

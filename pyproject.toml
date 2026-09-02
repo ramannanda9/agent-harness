@@ -78,6 +78,7 @@ files = [
     "harness/agent_tree.py",
     "harness/events.py",
     "harness/plan_mode.py",
+    "harness/runstate.py",
     "harness/session_memory.py",
 ]
 ignore_missing_imports = true

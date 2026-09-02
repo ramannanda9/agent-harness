@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import json
 import logging
 import os
@@ -35,11 +36,12 @@ import uuid
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Final
+from typing import Any
 
 from harness.checkpoint import _ResumeHint
 from harness.events import BusEvent, EventType
 from harness.llm.reasoning import ReasoningEffort, validate_reasoning_effort
+from harness.runstate import ActionState, ActionStatus, ErrorKind, Phase, RunState
 from harness.skills import Skill
 from harness.utils import fire
 from memory.manager import MemoryManager
@@ -47,9 +49,17 @@ from memory.working import WorkingMemory
 
 logger = logging.getLogger(__name__)
 
-# Sentinel returned by _run_tool_gated when human injects a correction.
-# Caller must `continue` the ReAct loop — WM is already updated.
-_HITL_CORRECTION: Final = object()
+
+def _assistant_message(response: dict) -> str:
+    """Serialize a model response for working memory.
+
+    One function so the string written to WorkingMemory and the string
+    persisted in a checkpoint are produced identically. ``default=str``
+    matches what the checkpoint stores use, so a response containing a
+    non-JSON-native value cannot serialize on one path and raise on the
+    other.
+    """
+    return json.dumps(response, default=str)
 
 
 def _freeze_factory(tool: Any, args: dict) -> Any:
@@ -199,7 +209,11 @@ class BaseAgent:
         self._working_memory: WorkingMemory | None = None
         self._task: str = ""
         self._last_think_error: str | None = None
-        self._ckp_id: str = ""  # f"{run_id}:{agent_id}" — unique per agent per run
+        self._ckp_id: str = ""  # checkpoint key — unique per agent per run
+        # Set by the orchestrator to the task id, so two tasks driven by the
+        # same agent_id in one run write to distinct checkpoint keys instead of
+        # overwriting each other.
+        self._ckp_scope: str | None = None
         # Async steering queue — items drained at the top of each ReAct
         # step (before checkpoint, before think). Created eagerly so
         # callers can steer() before run_stream starts.
@@ -226,6 +240,40 @@ class BaseAgent:
         self._subagent_depth: int = 0
 
     # ── Async steering ────────────────────────────────────────────────────────
+
+    def clone_for_run(self, *, ckp_scope: str | None = None) -> BaseAgent:
+        """A copy of this agent safe to drive as a separate, concurrent run.
+
+        ``BaseAgent`` keeps a run's working memory, task, checkpoint key,
+        steering queue and tool cache as instance attributes, and
+        ``run_stream`` assigns them on entry. Driving one instance from two
+        concurrent tasks therefore has the second run overwrite the first
+        mid-flight: both continue in the *same* working memory, and both
+        return the second task's answer while reporting success.
+
+        Configuration, tools, memory, tracer, guard and LLM client are shared
+        deliberately — they are either immutable or intentionally common to the
+        whole run (the guard especially, which enforces one budget across it).
+
+        Tools that carry per-invocation state say so by offering their own
+        ``clone_for_run``; everything else is shared, since most tools are
+        stateless and some deliberately hold a connection.
+        """
+        clone = copy.copy(self)
+        clone._working_memory = None
+        clone._task = ""
+        clone._last_think_error = None
+        clone._ckp_id = ""
+        clone._ckp_scope = ckp_scope
+        clone._resume_key = ""
+        clone._subagent_depth = self._subagent_depth
+        clone._steering = asyncio.Queue()
+        clone._tool_cache = {} if self.config.cache_tool_results else None
+        clone._tools = {
+            name: (tool.clone_for_run() if hasattr(tool, "clone_for_run") else tool)
+            for name, tool in self._tools.items()
+        }
+        return clone
 
     def steer(self, text: str) -> None:
         """Inject human guidance to be consumed at the next ReAct step boundary.
@@ -294,7 +342,7 @@ class BaseAgent:
             session-level summary survives.
         """
         run_id = run_id or str(uuid.uuid4())
-        self._ckp_id = f"{run_id}:{self.config.agent_id}"
+        self._ckp_id = self._checkpoint_key(run_id)
         if not self._resume_key:
             self._resume_key = self._ckp_id
         self._task = task
@@ -319,6 +367,13 @@ class BaseAgent:
             if self._steering_source_factory is not None
             else contextlib.nullcontext()
         )
+        state = RunState(
+            run_id=run_id,
+            agent_id=self.config.agent_id,
+            task=task,
+            memory=self._working_memory.to_dict(),
+        )
+
         async with source_cm:
             async with _ResumeHint(
                 self._resume_key,
@@ -326,7 +381,7 @@ class BaseAgent:
                 f"Agent {self.config.agent_id}",
                 check_key=self._ckp_id,
             ) as hint:
-                async for event in self._run_stream_internal(run_id):
+                async for event in self._run_stream_internal(state):
                     # ``parent_agent_id`` filtering: sub-agent events bubble up
                     # through this loop tagged with their invoker's id. A sub's
                     # TASK_DONE / ERROR is NOT terminal for the outer agent —
@@ -348,26 +403,71 @@ class BaseAgent:
                             hint.done = True
                     yield event
 
-    async def _resume_stream(
-        self,
-        run_id: str,
-        start_step: int,
-        pending: dict | None = None,
-    ) -> AsyncGenerator[BusEvent, None]:
+    async def _resume_stream(self, state: RunState) -> AsyncGenerator[BusEvent, None]:
         """
-        Re-enter the ReAct loop from a checkpoint.
+        Re-enter the ReAct loop from a stored :class:`RunState`.
 
-        If pending is set, the last step was interrupted mid-approval.
-        The approval prompt is shown again; once the human responds the
-        tool runs (or the correction is injected) before the loop continues.
+        The state carries everything needed to continue, so this rebuilds
+        working memory and the task itself rather than requiring the caller
+        to graft them on first — two callers used to do that identically and
+        could drift.
+
+        Actions still ``PENDING`` mean the run died at an approval prompt.
+        Each is re-prompted; once the human responds the tool runs (or the
+        correction is injected) before the loop continues.
         """
-        self._ckp_id = f"{run_id}:{self.config.agent_id}"
+        run_id = state.run_id
+        self._ckp_id = self._checkpoint_key(run_id)
         if not self._resume_key:
             self._resume_key = self._ckp_id
-        if pending:
-            async for event in self._replay_pending_step(run_id, pending):
-                yield event
-            start_step = pending["step"] + 1
+        self._task = state.task
+        if state.memory:
+            self._working_memory = WorkingMemory.from_dict(state.memory, llm=self._llm)
+        else:
+            # A state with no transcript still has a task, so rebuild the
+            # opening messages rather than driving with no working memory at
+            # all — that used to surface as an AttributeError deep in the
+            # think path, which says nothing about what was wrong.
+            self._working_memory = WorkingMemory(
+                llm=self._llm, max_tokens=self.config.working_memory_max_tokens
+            )
+            await self._working_memory.append(
+                "system", await self._build_system_prompt(state.task), pinned=True
+            )
+            await self._working_memory.append("user", state.task)
+
+        # A run that reached FAILED still has somewhere to go: max_steps and an
+        # unparseable response both leave working memory intact and are resumed
+        # by thinking again, typically against a raised limit.
+        if state.phase is Phase.FAILED and state.error_kind in (
+            ErrorKind.MAX_STEPS,
+            ErrorKind.UNPARSEABLE_THINK,
+        ):
+            state.phase = Phase.THINK
+            state.error = None
+            state.error_kind = None
+
+        # Spending already recorded counts against this run, so a resumed run
+        # cannot quietly start the budget over. The exception is a run that
+        # failed *because* of the budget: restoring it there would re-raise at
+        # the same point and make resume a no-op loop, so the operator's raised
+        # GuardrailConfig is allowed to take effect instead.
+        if state.budget and state.error_kind is not ErrorKind.BUDGET:
+            if hasattr(self._guard, "restore"):
+                self._guard.restore(state.budget)
+
+        yield BusEvent.resumed(
+            self.config.agent_id,
+            step=state.step,
+            phase=state.phase.value,
+            # Only actions still needing a decision or a run — an action
+            # already approved and executed is not what the run is waiting on.
+            actions=[
+                a.tool
+                for a in state.actions
+                if a.status in (ActionStatus.PENDING, ActionStatus.APPROVED)
+            ],
+        )
 
         source_cm = (
             self._steering_source_factory(self)
@@ -381,7 +481,7 @@ class BaseAgent:
                 f"Agent {self.config.agent_id}",
                 check_key=self._ckp_id,
             ) as hint:
-                async for event in self._run_stream_internal(run_id, start_step=start_step):
+                async for event in self._run_stream_internal(state):
                     # See ``run_stream`` for why both branches gate on
                     # ``not event.parent_agent_id`` (sub-agent terminals are
                     # not terminal for the outer) and why a top-level ERROR
@@ -395,16 +495,15 @@ class BaseAgent:
                             hint.done = True
                     yield event
 
-    async def _run_stream_internal(
-        self,
-        run_id: str,
-        start_step: int = 0,
-    ) -> AsyncGenerator[BusEvent, None]:
+    async def _run_stream_internal(self, state: RunState) -> AsyncGenerator[BusEvent, None]:
         try:
-            async for event in self._react_stream(run_id, start_step=start_step):
+            async for event in self._drive(state):
                 yield event
         except Exception as e:
             logger.exception("Agent %s stream crashed", self.config.agent_id)
+            state.phase = Phase.FAILED
+            state.error = str(e)
+            state.error_kind = ErrorKind.CRASH
             yield BusEvent.error_event(self.config.agent_id, error=str(e))
         finally:
             if self._working_memory is not None:
@@ -412,7 +511,7 @@ class BaseAgent:
                     "trajectory",
                     self.config.agent_id,
                     {
-                        "run_id": run_id,
+                        "run_id": state.run_id,
                         "messages": self._working_memory.get_messages(),
                         "summarization_count": self._working_memory.summarization_count,
                     },
@@ -483,341 +582,437 @@ class BaseAgent:
 
     # ── ReAct Loop (stream) ───────────────────────────────────────────────────
 
-    async def _write_step_checkpoint(self, run_id: str, step: int) -> None:
-        if self._checkpoint_store is None or not self._checkpoint_resume_enabled:
-            return
-        await self._checkpoint_store.write(
-            self._ckp_id,
-            {
-                "run_id": run_id,
-                "agent_id": self.config.agent_id,
-                "task": self._task,
-                "step": step,
-                "memory": self._working_memory.to_dict(),
-            },
-        )
+    def _checkpoint_key(self, run_id: str) -> str:
+        """Where this agent's state is stored for ``run_id``.
 
-    async def _react_stream(
-        self, run_id: str, start_step: int = 0
-    ) -> AsyncGenerator[BusEvent, None]:
-        for step in range(start_step, self.config.max_steps):
-            self._guard.check()
-            # Drain steering queue BEFORE the checkpoint write so any
-            # queued guidance is captured by the persisted WM.
-            async for guidance_event in self._drain_steering(step):
-                yield guidance_event
-            if (
-                self._checkpoint_store is not None
-                and self.config.checkpoint_every > 0
-                and step % self.config.checkpoint_every == 0
-            ):
-                await self._write_step_checkpoint(run_id, step)
+        Scoped by task when the orchestrator supplies one: a plan may name the
+        same agent for two different tasks, and without the scope both would
+        write to ``f"{run_id}:{agent_id}"`` and clobber each other.
+        """
+        if self._ckp_scope:
+            return f"{run_id}:{self._ckp_scope}:{self.config.agent_id}"
+        return f"{run_id}:{self.config.agent_id}"
 
-            # Think — yields TOKEN events when the LLM client supports streaming.
-            response = None
-            async for thought_event in self._think_stream():
-                if thought_event.type == EventType.TOKEN:
-                    yield thought_event
-                elif thought_event.type == EventType.THOUGHT:
-                    response = thought_event.payload.get("response")
-                    yield thought_event
-                else:
-                    yield thought_event
+    async def _drive(self, state: RunState) -> AsyncGenerator[BusEvent, None]:
+        """Advance a run until it reaches a terminal phase.
 
-            if response is None:
-                reason = self._last_think_error or "LLM returned unparseable response"
-                self._tracer.log(
-                    "task_result",
-                    self.config.agent_id,
-                    {"answer": "", "confidence": 0.0, "steps": step, "error": reason},
-                )
-                yield BusEvent.error_event(self.config.agent_id, error=reason)
-                return
+        Starting a run and resuming one are the same operation — build a fresh
+        state or load a stored one, then drive it. There is no separate resume
+        implementation to fall out of step with this one.
+        """
+        while not state.is_terminal:
+            async for event in self._advance(state):
+                yield event
 
-            self._tracer.log(
-                "thought",
-                self.config.agent_id,
-                {
-                    "step": step,
-                    "thought": response.get("thought", ""),
-                    "action": response.get("action"),
-                },
-            )
+    async def _advance(self, state: RunState) -> AsyncGenerator[BusEvent, None]:
+        """Run exactly one phase."""
+        handlers = {
+            Phase.THINK: self._phase_think,
+            Phase.APPROVE: self._phase_approve,
+            Phase.ACT: self._phase_act,
+            Phase.OBSERVE: self._phase_observe,
+        }
+        async for event in handlers[state.phase](state):
+            yield event
 
-            # Finish?
-            if response.get("action") == "finish":
-                await self._working_memory.append("assistant", json.dumps(response))
-                result = {
-                    "agent_id": self.config.agent_id,
-                    "answer": response.get("answer", ""),
-                    "confidence": (
-                        response.get("confidence", 1.0) if self.config.confidence_from_llm else 1.0
-                    ),
-                    "steps": step + 1,
-                    "metadata": {
-                        "summarizations": self._working_memory.summarization_count,
-                    },
-                }
-                # Attach the current budget snapshot so dispatch_stream
-                # consumers can read totals + per-call-site breakdown off
-                # the routed path's terminal event, same shape as the
-                # orchestrator's DONE event.
-                if self._guard is not None and hasattr(self._guard, "snapshot"):
-                    result["budget"] = self._guard.snapshot()
-                logger.info(
-                    "Agent %s completed: steps=%d confidence=%.2f summarizations=%d",
-                    self.config.agent_id,
-                    result["steps"],
-                    result["confidence"],
-                    self._working_memory.summarization_count,
-                )
-                self._tracer.log(
-                    "task_result",
-                    self.config.agent_id,
-                    {
-                        "answer": result["answer"],
-                        "confidence": result["confidence"],
-                        "steps": result["steps"],
-                        "error": "",
-                    },
-                )
-                yield BusEvent.task_done_agent(self.config.agent_id, result=result)
-                return
-
-            # Act — parallel or single
-            parallel_actions = response.get("actions")
-            if parallel_actions and isinstance(parallel_actions, list):
-                # Gate each gated tool sequentially before fanning out.
-                # Correction from any one tool aborts the whole batch.
-                approved: list[dict] = []
-                correction_injected = False
-                for act in parallel_actions:
-                    approval = await self._gate_tool(
-                        run_id, step, act.get("tool", ""), act.get("args", {}), response
-                    )
-                    if approval is None or approval.approved:
-                        approved.append(act)
-                    elif approval.correction:
-                        await self._inject_human_guidance(
-                            response, approval.correction, run_id, step
-                        )
-                        correction_injected = True
-                        break
-                    # else: rejected — drop from batch silently
-
-                if correction_injected:
-                    continue
-
-                parallel_actions = approved
-
-                # Emit ACTION events first so callers see what's being launched.
-                for act in parallel_actions:
-                    yield BusEvent.action(
-                        self.config.agent_id,
-                        step=step,
-                        tool=act.get("tool", ""),
-                        args=act.get("args", {}),
-                    )
-
-                # Fan out all approved tool calls concurrently. Mixed
-                # batches (some streaming sub-agent tools, some plain) are
-                # supported — the fan-in helper bubbles streaming events
-                # in arrival order while plain awaitables resolve in
-                # parallel under a single gather.
-                observations: list[Any] = [None] * len(parallel_actions)
-                streaming_indices: list[int] = []
-                streaming_factories: list[Any] = []
-                plain_indices: list[int] = []
-                plain_tasks: list[Any] = []
-
-                for i, act in enumerate(parallel_actions):
-                    t_name = act.get("tool", "")
-                    t_args = act.get("args", {})
-                    t_obj = self._tools.get(t_name)
-                    if t_obj is not None and hasattr(t_obj, "execute_stream"):
-                        # Recursion guard fires here for the parallel path.
-                        # Refused delegations land as their own observation
-                        # so the rest of the batch still runs.
-                        from tools.builtin.subagent import SubAgentTool
-
-                        if isinstance(t_obj, SubAgentTool):
-                            if self._subagent_depth + 1 > self.config.max_subagent_depth:
-                                observations[i] = (
-                                    f"Refused to delegate to {t_obj.name!r}: "
-                                    f"max sub-agent depth "
-                                    f"{self.config.max_subagent_depth} would be exceeded."
-                                )
-                                continue
-                            t_obj._agent._subagent_depth = self._subagent_depth + 1
-                            # Share the run-level guard — see the matching
-                            # comment in ``_run_streaming_tool_gated``.
-                            t_obj._agent._guard = self._guard
-                            # Tag bubbled events with the real invoking
-                            # parent so renderers can group / indent.
-                            t_obj._invoking_agent_id = self.config.agent_id
-                        streaming_indices.append(i)
-                        streaming_factories.append(_freeze_factory(t_obj, t_args))
-                    else:
-                        plain_indices.append(i)
-                        plain_tasks.append(self._execute_tool(t_name, t_args))
-
-                if streaming_factories:
-                    from harness.streaming import fan_in
-
-                    # ``asyncio.gather`` already schedules its argument
-                    # coroutines via ensure_future, so the plain tasks
-                    # start running immediately when this line executes —
-                    # no extra ``create_task`` wrapper needed (and modern
-                    # ``create_task`` rejects gather's Future return value
-                    # with TypeError).
-                    plain_future = asyncio.gather(*plain_tasks) if plain_tasks else None
-                    try:
-                        async for fan_idx, item in fan_in(streaming_factories):
-                            real_idx = streaming_indices[fan_idx]
-                            if isinstance(item, BusEvent):
-                                yield item
-                            else:
-                                observations[real_idx] = item
-                        plain_results = await plain_future if plain_future is not None else []
-                    except Exception:
-                        if plain_future is not None:
-                            plain_future.cancel()
-                        raise
-                    for slot, val in zip(plain_indices, plain_results, strict=False):
-                        observations[slot] = val
-                else:
-                    plain_results = await asyncio.gather(*plain_tasks)
-                    for slot, val in zip(plain_indices, plain_results, strict=False):
-                        observations[slot] = val
-                await self._commit_checkpoint(run_id, step)
-
-                combined: list[dict] = []
-                observation_events: list[BusEvent] = []
-                for i, (act, obs) in enumerate(zip(parallel_actions, observations, strict=False)):
-                    tool_name = act.get("tool", "")
-                    tool_args = act.get("args", {})
-                    is_img = _is_image_block(obs)
-                    obs_raw = "[image]" if is_img else str(obs)
-                    obs_display = obs_raw if is_img else obs_raw[:500]
-                    self._tracer.log(
-                        "action",
-                        self.config.agent_id,
-                        {
-                            "step": step,
-                            "tool": tool_name,
-                            "args": tool_args,
-                            "observation": obs_display,
-                        },
-                    )
-                    observation_events.append(
-                        BusEvent.observation(
-                            self.config.agent_id,
-                            step=step,
-                            tool=tool_name,
-                            observation=obs_raw,
-                        )
-                    )
-                    combined.append({"tool": tool_name, "result": obs_raw})
-                    if obs and not isinstance(obs, str) and not _is_image_block(obs):
-                        fire(
-                            self._memory.write_working_fact(
-                                run_id=run_id,
-                                agent_id=self.config.agent_id,
-                                key=f"step_{step}_{i}_{tool_name}",
-                                value=obs,
-                            )
-                        )
-
-                # Inject image observations as content blocks; text observations as a string.
-                image_blocks = [
-                    (act.get("tool", ""), obs)
-                    for act, obs in zip(parallel_actions, observations, strict=False)
-                    if _is_image_block(obs)
-                ]
-                await self._record_parallel_observations(response, combined, image_blocks)
-                for event in observation_events:
-                    yield event
-            else:
-                # Single action path.
-                tool_name = response.get("action", "")
-                tool_args = response.get("args", {})
-                yield BusEvent.action(
-                    self.config.agent_id, step=step, tool=tool_name, args=tool_args
-                )
-
-                tool_obj = self._tools.get(tool_name)
-                if tool_obj is not None and hasattr(tool_obj, "execute_stream"):
-                    # Streaming tool — bubble its events into the parent stream,
-                    # collect the terminal observation. HITL gate + recursion
-                    # guard are inside _run_streaming_tool_gated.
-                    correction_fired = False
-                    observation = None
-                    async for kind, value in self._run_streaming_tool_gated(
-                        run_id, step, tool_name, tool_args, response, tool_obj
-                    ):
-                        if kind == "event":
-                            yield value
-                        elif kind == "correction":
-                            correction_fired = True
-                        elif kind == "result":
-                            observation = value
-                    if correction_fired:
-                        continue
-                else:
-                    observation = await self._run_tool_gated(
-                        run_id, step, tool_name, tool_args, response
-                    )
-                    if observation is _HITL_CORRECTION:
-                        continue
-
-                await self._record_tool_observation(response, tool_name, observation)
-                is_img = _is_image_block(observation)
-                obs_raw = "[image]" if is_img else str(observation)
-                obs_display = obs_raw if is_img else obs_raw[:500]
-                self._tracer.log(
-                    "action",
-                    self.config.agent_id,
-                    {
-                        "step": step,
-                        "tool": tool_name,
-                        "args": tool_args,
-                        "observation": obs_display,
-                    },
-                )
-                yield BusEvent.observation(
-                    self.config.agent_id, step=step, tool=tool_name, observation=obs_raw
-                )
-
-                if (
-                    observation
-                    and not isinstance(observation, str)
-                    and not _is_image_block(observation)
-                ):
-                    fire(
-                        self._memory.write_working_fact(
-                            run_id=run_id,
-                            agent_id=self.config.agent_id,
-                            key=f"step_{step}_{tool_name}",
-                            value=observation,
-                        )
-                    )
-
-        # Max steps exhausted.
+    def _fail(self, state: RunState, error: str, kind: ErrorKind, *, steps: int | None = None):
+        """Move to FAILED and build the ERROR event describing why."""
+        state.phase = Phase.FAILED
+        state.error = error
+        state.error_kind = kind
         self._tracer.log(
             "task_result",
             self.config.agent_id,
             {
                 "answer": "",
                 "confidence": 0.0,
-                "steps": self.config.max_steps,
-                "error": f"Max steps ({self.config.max_steps}) reached",
+                "steps": steps if steps is not None else state.step,
+                "error": error,
             },
         )
-        yield BusEvent.error_event(
+        if steps is not None:
+            return BusEvent.error_event(self.config.agent_id, error=error, steps=steps)
+        return BusEvent.error_event(self.config.agent_id, error=error)
+
+    async def _persist(self, state: RunState) -> None:
+        if self._checkpoint_store is None or not self._checkpoint_resume_enabled:
+            return
+        state.memory = self._working_memory.to_dict()
+        state.budget = self._guard.snapshot() if hasattr(self._guard, "snapshot") else None
+        await self._checkpoint_store.write(self._ckp_id, state.to_dict())
+
+    # ── THINK ─────────────────────────────────────────────────────────────────
+
+    async def _phase_think(self, state: RunState) -> AsyncGenerator[BusEvent, None]:
+        if state.step >= self.config.max_steps:
+            yield self._fail(
+                state,
+                f"Max steps ({self.config.max_steps}) reached",
+                ErrorKind.MAX_STEPS,
+                steps=self.config.max_steps,
+            )
+            return
+
+        try:
+            self._guard.check()
+        except RuntimeError as e:
+            yield self._fail(state, str(e), ErrorKind.BUDGET)
+            return
+
+        # Drain steering before the checkpoint write so any queued guidance is
+        # captured by the persisted working memory.
+        async for guidance_event in self._drain_steering(state.step):
+            yield guidance_event
+
+        if self.config.checkpoint_every > 0 and state.step % self.config.checkpoint_every == 0:
+            await self._persist(state)
+
+        # Think — yields TOKEN events when the LLM client supports streaming.
+        response = None
+        async for thought_event in self._think_stream():
+            if thought_event.type == EventType.THOUGHT:
+                response = thought_event.payload.get("response")
+            yield thought_event
+
+        if response is None:
+            yield self._fail(
+                state,
+                self._last_think_error or "LLM returned unparseable response",
+                ErrorKind.UNPARSEABLE_THINK,
+            )
+            return
+
+        self._tracer.log(
+            "thought",
             self.config.agent_id,
-            error=f"Max steps ({self.config.max_steps}) reached",
-            steps=self.config.max_steps,
+            {
+                "step": state.step,
+                "thought": response.get("thought", ""),
+                "action": response.get("action"),
+            },
         )
+
+        if response.get("action") == "finish":
+            async for event in self._finish(state, response):
+                yield event
+            return
+
+        state.assistant_message = _assistant_message(response)
+        state.actions, state.parallel = self._actions_for(response)
+        state.phase = Phase.APPROVE
+
+    async def _finish(self, state: RunState, response: dict) -> AsyncGenerator[BusEvent, None]:
+        await self._working_memory.append("assistant", _assistant_message(response))
+        result = {
+            "agent_id": self.config.agent_id,
+            "answer": response.get("answer", ""),
+            "confidence": (
+                response.get("confidence", 1.0) if self.config.confidence_from_llm else 1.0
+            ),
+            "steps": state.step + 1,
+            "metadata": {"summarizations": self._working_memory.summarization_count},
+        }
+        # Attach the current budget snapshot so dispatch_stream consumers can
+        # read totals + per-call-site breakdown off the routed path's terminal
+        # event, same shape as the orchestrator's DONE event.
+        if self._guard is not None and hasattr(self._guard, "snapshot"):
+            result["budget"] = self._guard.snapshot()
+        logger.info(
+            "Agent %s completed: steps=%d confidence=%.2f summarizations=%d",
+            self.config.agent_id,
+            result["steps"],
+            result["confidence"],
+            self._working_memory.summarization_count,
+        )
+        self._tracer.log(
+            "task_result",
+            self.config.agent_id,
+            {
+                "answer": result["answer"],
+                "confidence": result["confidence"],
+                "steps": result["steps"],
+                "error": "",
+            },
+        )
+        state.result = result
+        state.phase = Phase.DONE
+        yield BusEvent.task_done_agent(self.config.agent_id, result=result)
+
+    def _actions_for(self, response: dict) -> tuple[list[ActionState], bool]:
+        """Turn one model response into the actions this step will run.
+
+        Single and parallel calls become the same list, so every later phase
+        has one shape to handle. ``args`` is deep-copied here: it used to alias
+        into the response dict that was also being persisted, so a tool that
+        mutated its own kwargs retroactively changed what the record said the
+        human had approved.
+
+        Delegations that would exceed the sub-agent depth limit are refused
+        *here*, before anyone is asked to approve them — there is no point
+        prompting a human for a call that cannot run.
+        """
+        raw = response.get("actions")
+        parallel = bool(raw) and isinstance(raw, list)
+        specs = (
+            [(a.get("tool", ""), a.get("args", {})) for a in raw]
+            if parallel
+            else [(response.get("action", ""), response.get("args", {}))]
+        )
+
+        actions: list[ActionState] = []
+        for tool_name, args in specs:
+            action = ActionState(tool=tool_name, args=copy.deepcopy(args or {}))
+            refusal = self._delegation_refusal(tool_name)
+            if refusal is not None:
+                action.status = ActionStatus.EXECUTED
+                action.observation = refusal
+            actions.append(action)
+        return actions, parallel
+
+    def _delegation_refusal(self, tool_name: str) -> str | None:
+        """Refusal text if delegating to this tool would exceed the depth cap."""
+        from tools.builtin.subagent import SubAgentTool
+
+        tool = self._tools.get(tool_name)
+        if not isinstance(tool, SubAgentTool):
+            return None
+        if self._subagent_depth + 1 <= self.config.max_subagent_depth:
+            return None
+        return (
+            f"Refused to delegate to {tool.name!r}: "
+            f"max sub-agent depth {self.config.max_subagent_depth} "
+            f"would be exceeded (current depth {self._subagent_depth})."
+        )
+
+    # ── APPROVE ───────────────────────────────────────────────────────────────
+
+    async def _phase_approve(self, state: RunState) -> AsyncGenerator[BusEvent, None]:
+        """Resolve the human gate for each action that still needs one.
+
+        Actions are resolved one at a time and the decision is recorded on the
+        state before the next prompt, so a run that dies partway through a
+        batch resumes with the earlier answers intact instead of asking again
+        or, worse, dropping them.
+        """
+        for action in state.actions:
+            if action.status is not ActionStatus.PENDING:
+                continue
+
+            yield BusEvent.action(
+                self.config.agent_id, step=state.step, tool=action.tool, args=action.args
+            )
+
+            approval = await self._gate_action(state, action)
+            if approval is not None and approval.correction:
+                # The human redirected instead of answering. Drop the batch,
+                # feed the correction back, and think again.
+                await self._inject_human_guidance(
+                    state.assistant_message or "{}", approval.correction
+                )
+                state.actions = []
+                state.assistant_message = None
+                state.parallel = False
+                state.step += 1
+                state.phase = Phase.THINK
+                # Persisted only once the state reflects the correction. Doing
+                # it inside the helper wrote the pre-correction step, leaving a
+                # checkpoint one step behind what the run had actually done.
+                await self._persist(state)
+                return
+
+            action.status = (
+                ActionStatus.APPROVED
+                if approval is None or approval.approved
+                else ActionStatus.REJECTED
+            )
+
+        state.phase = Phase.ACT
+
+    # ── ACT ───────────────────────────────────────────────────────────────────
+
+    async def _phase_act(self, state: RunState) -> AsyncGenerator[BusEvent, None]:
+        """Run every approved action.
+
+        A step is executed at most once per attempt but not exactly once: no
+        tool here carries an idempotency key, so an action approved and started
+        before a crash is re-run on resume. ``ActionState.attempts`` records
+        that so a crash loop is visible rather than silent.
+        """
+        for action in state.actions:
+            if action.status is ActionStatus.REJECTED:
+                action.observation = "Tool rejected by human: no reason given"
+                action.status = ActionStatus.EXECUTED
+
+        runnable = [a for a in state.actions if a.status is ActionStatus.APPROVED]
+        if not runnable:
+            state.phase = Phase.OBSERVE
+            return
+
+        gated = any(a.approval_id for a in state.actions)
+        if gated:
+            await self._persist(state)
+
+        async for event in self._execute_actions(runnable):
+            yield event
+
+        if gated:
+            await self._persist(state)
+        state.phase = Phase.OBSERVE
+
+    async def _execute_actions(self, actions: list[ActionState]) -> AsyncGenerator[BusEvent, None]:
+        """Execute actions concurrently, bubbling any streaming tool's events.
+
+        Mixed batches are supported: streaming tools push their events through
+        the fan-in helper in arrival order while plain awaitables resolve under
+        a single gather.
+        """
+        streaming: list[tuple[ActionState, Any]] = []
+        plain: list[ActionState] = []
+        plain_tasks: list[Any] = []
+
+        for action in actions:
+            action.attempts += 1
+            tool = self._tool_for_invocation(action.tool)
+            if tool is not None and hasattr(tool, "execute_stream"):
+                self._prepare_delegation(tool)
+                streaming.append((action, _freeze_factory(tool, action.args)))
+            else:
+                plain.append(action)
+                plain_tasks.append(self._execute_tool(action.tool, action.args, tool=tool))
+
+        if streaming:
+            from harness.streaming import fan_in
+
+            # ``asyncio.gather`` schedules its argument coroutines immediately,
+            # so the plain tasks start running on this line — no extra
+            # ``create_task`` wrapper needed (and modern ``create_task``
+            # rejects gather's Future return value with TypeError).
+            plain_future = asyncio.gather(*plain_tasks) if plain_tasks else None
+            try:
+                async for idx, item in fan_in([factory for _, factory in streaming]):
+                    if isinstance(item, BusEvent):
+                        yield item
+                    else:
+                        # Streaming tools yield exactly one non-BusEvent
+                        # terminal value — the observation the parent records.
+                        streaming[idx][0].observation = item
+                plain_results = await plain_future if plain_future is not None else []
+            except Exception:
+                if plain_future is not None:
+                    plain_future.cancel()
+                raise
+        else:
+            plain_results = await asyncio.gather(*plain_tasks) if plain_tasks else []
+
+        for action, value in zip(plain, plain_results, strict=False):
+            action.observation = value
+        for action in actions:
+            action.status = ActionStatus.EXECUTED
+
+    def _tool_for_invocation(self, name: str) -> Any:
+        """The tool object this particular call should use.
+
+        Tools that carry per-invocation state advertise it with
+        ``clone_for_run`` and get a fresh copy per call. That matters most for
+        a batch: two parallel actions naming the same tool would otherwise
+        share one object, and for a delegating tool that means both
+        delegations drive the *same* nested agent — the second overwrites the
+        first's working memory mid-flight and both return the second's answer.
+
+        Everything else is returned as-is. Most tools are stateless, and some
+        deliberately hold a shared connection that must not be duplicated.
+        """
+        tool = self._tools.get(name)
+        if tool is None:
+            return None
+        clone = getattr(tool, "clone_for_run", None)
+        return clone() if callable(clone) else tool
+
+    def _prepare_delegation(self, tool: Any) -> None:
+        """Wire a sub-agent tool to this agent before it runs."""
+        from tools.builtin.subagent import SubAgentTool
+
+        if not isinstance(tool, SubAgentTool):
+            return
+        tool._agent._subagent_depth = self._subagent_depth + 1
+        # Share the parent's guard so the sub-agent's check() enforces the
+        # run-level budget and its bubbled TASK_DONE snapshot reflects real
+        # token usage. Without this, sub-agents track an empty local guard
+        # while the LLM reports tokens to the runtime's guard.
+        tool._agent._guard = self._guard
+        # Tell the tool who's invoking so its bubbled events carry the actual
+        # parent's id in ``parent_agent_id``. Without this the tool defaults to
+        # its own sub-agent id, which makes ``agent_id == parent_agent_id`` for
+        # the immediate sub — useless to renderers that want indentation.
+        tool._invoking_agent_id = self.config.agent_id
+
+    # ── OBSERVE ───────────────────────────────────────────────────────────────
+
+    async def _phase_observe(self, state: RunState) -> AsyncGenerator[BusEvent, None]:
+        """Record what the tools returned, then advance to the next step."""
+        combined: list[dict] = []
+        image_blocks: list[tuple[str, Any]] = []
+        observation_events: list[BusEvent] = []
+
+        for i, action in enumerate(state.actions):
+            obs = action.observation
+            is_img = _is_image_block(obs)
+            obs_raw = "[image]" if is_img else str(obs)
+            obs_display = obs_raw if is_img else obs_raw[:500]
+            self._tracer.log(
+                "action",
+                self.config.agent_id,
+                {
+                    "step": state.step,
+                    "tool": action.tool,
+                    "args": action.args,
+                    "observation": obs_display,
+                },
+            )
+            observation_events.append(
+                BusEvent.observation(
+                    self.config.agent_id,
+                    step=state.step,
+                    tool=action.tool,
+                    observation=obs_raw if state.parallel else obs_display,
+                )
+            )
+            combined.append({"tool": action.tool, "result": obs_raw})
+            if is_img:
+                image_blocks.append((action.tool, obs))
+            if obs and not isinstance(obs, str) and not is_img:
+                key = (
+                    f"step_{state.step}_{i}_{action.tool}"
+                    if state.parallel
+                    else f"step_{state.step}_{action.tool}"
+                )
+                fire(
+                    self._memory.write_working_fact(
+                        run_id=state.run_id,
+                        agent_id=self.config.agent_id,
+                        key=key,
+                        value=obs,
+                    )
+                )
+
+        message = state.assistant_message or "{}"
+        if state.parallel:
+            await self._record_parallel_observations(message, combined, image_blocks)
+        elif state.actions:
+            action = state.actions[0]
+            await self._record_tool_observation(message, action.tool, action.observation)
+
+        gated = any(a.approval_id for a in state.actions)
+        state.step += 1
+        state.actions = []
+        state.assistant_message = None
+        state.parallel = False
+        state.phase = Phase.THINK
+        if gated:
+            await self._persist(state)
+
+        for event in observation_events:
+            yield event
 
     # ── Think ─────────────────────────────────────────────────────────────────
 
@@ -983,12 +1178,19 @@ class BaseAgent:
 
     async def _record_tool_observation(
         self,
-        response: dict,
+        assistant_message: str,
         tool_name: str,
         observation: Any,
     ) -> None:
-        """Record one ReAct action and its observation in working memory."""
-        await self._working_memory.append("assistant", json.dumps(response))
+        """Record one ReAct action and its observation in working memory.
+
+        Takes the already-serialized assistant message rather than the parsed
+        response dict, so the bytes written here are the same bytes a
+        checkpoint holds. Re-serializing a dict that has been through a JSON
+        round-trip can reorder keys, which changes the prompt prefix and
+        silently costs a provider-side cache hit on a resumed run.
+        """
+        await self._working_memory.append("assistant", assistant_message)
         if _is_image_block(observation):
             await self._working_memory.append(
                 "user",
@@ -1011,12 +1213,16 @@ class BaseAgent:
 
     async def _record_parallel_observations(
         self,
-        response: dict,
+        assistant_message: str,
         combined: list[dict],
         image_blocks: list[tuple[str, Any]],
     ) -> None:
-        """Record one parallel ReAct action batch and its observations."""
-        await self._working_memory.append("assistant", json.dumps(response))
+        """Record one parallel ReAct action batch and its observations.
+
+        See :meth:`_record_tool_observation` on why this takes the serialized
+        message rather than the response dict.
+        """
+        await self._working_memory.append("assistant", assistant_message)
         if image_blocks:
             content: list = [
                 {
@@ -1044,12 +1250,19 @@ class BaseAgent:
 
     # ── Tool Execution ────────────────────────────────────────────────────────
 
-    async def _execute_tool(self, name: str, args: dict) -> Any:
-        if name not in self._tools:
+    async def _execute_tool(self, name: str, args: dict, *, tool: Any = None) -> Any:
+        """Run one tool call.
+
+        ``tool`` lets the caller pass an instance already resolved for this
+        invocation (see :meth:`_tool_for_invocation`); without it the shared
+        registered instance is used, which is correct for stateless tools.
+        """
+        if tool is None:
+            tool = self._tools.get(name)
+        if tool is None:
             return (
                 f"Error: tool '{name}' not available. Available tools: {list(self._tools.keys())}"
             )
-        tool = self._tools[name]
 
         # Per-run memoization, gated by both agent opt-in AND tool consent.
         # Tools that have side effects or time-dependent output can veto
@@ -1087,254 +1300,60 @@ class BaseAgent:
             "metadata": {},
         }
 
-    async def _gate_tool(
-        self,
-        run_id: str,
-        step: int,
-        tool_name: str,
-        tool_args: dict,
-        llm_response: dict,
-    ):
+    async def _gate_action(self, state: RunState, action: ActionState):
         """
-        Run the HITL approval gate for one tool.
+        Run the HITL approval gate for one action.
 
-        Returns ApprovalResponse if the tool is gated, None if not.
-        Writes a crash-resumable checkpoint before blocking when checkpoint
-        resume is enabled.
+        Returns ApprovalResponse if the action is gated, None if not.
+
+        Durability is deliberately *not* a precondition for gating. This used
+        to skip the prompt entirely when no checkpoint store was configured,
+        which meant a tool the operator had explicitly listed in
+        ``hitl_tools`` ran unsupervised. An approval gate must fail closed:
+        with no store we still prompt, we just cannot offer crash-resume.
         """
-        if tool_name not in self.config.hitl_tools:
-            return None
-        if self._checkpoint_store is None and self._checkpoint_resume_enabled:
+        if action.tool not in self.config.hitl_tools:
             return None
 
         from harness.hitl import ApprovalRequest, is_allowed, request_approval
 
-        if is_allowed(tool_name, tool_args):
+        if is_allowed(action.tool, action.args):
             return None  # fast-path: human already allowed this tool/prefix
 
-        approval_id = str(uuid.uuid4())
-        if self._checkpoint_store is not None and self._checkpoint_resume_enabled:
-            await self._checkpoint_store.write(
-                self._ckp_id,
-                {
-                    "run_id": run_id,
-                    "agent_id": self.config.agent_id,
-                    "task": self._task,
-                    "step": step,
-                    "memory": self._working_memory.to_dict(),
-                    "pending": {
-                        "approval_id": approval_id,
-                        "tool": tool_name,
-                        "args": tool_args,
-                        "step": step,
-                        "llm_response": llm_response,
-                    },
-                },
-            )
+        action.approval_id = action.approval_id or str(uuid.uuid4())
+        # Persist the whole state — every action, with the decisions already
+        # made — *before* blocking on the human. A crash at this prompt used
+        # to resume knowing about only the last action gated, silently
+        # dropping the rest of the batch.
+        await self._persist(state)
+
         return await request_approval(
             ApprovalRequest(
-                approval_id=approval_id,
+                approval_id=action.approval_id,
                 run_id=self._resume_key,  # standalone: ckp_id; orchestrated: outer run_id
                 agent_id=self.config.agent_id,
-                tool=tool_name,
-                args=tool_args,
-                step=step,
+                tool=action.tool,
+                args=action.args,
+                step=state.step,
                 timestamp=datetime.now(timezone.utc).isoformat(),
                 resume_hint=self._hitl_resume_hint if not self._checkpoint_resume_enabled else None,
             ),
             self._guard,
         )
 
-    async def _run_tool_gated(
-        self,
-        run_id: str,
-        step: int,
-        tool_name: str,
-        tool_args: dict,
-        response: dict,
-    ) -> Any:
+    async def _inject_human_guidance(self, assistant_message: str, correction: str) -> None:
+        """Record a human correction in working memory.
+
+        The caller persists, once the rest of the state reflects the
+        correction — this used to write the checkpoint itself, at the step the
+        run was leaving rather than the one it was entering.
         """
-        Gate + execute a single tool.
-
-        Returns _HITL_CORRECTION sentinel if the human typed a correction
-        (WorkingMemory already updated; caller must `continue` the ReAct loop).
-        Otherwise returns the observation (str or image block).
-        """
-        approval = await self._gate_tool(run_id, step, tool_name, tool_args, response)
-        if approval is not None:
-            if approval.correction:
-                await self._inject_human_guidance(response, approval.correction, run_id, step)
-                return _HITL_CORRECTION
-            if not approval.approved:
-                await self._commit_checkpoint(run_id, step)
-                return f"Tool rejected by human: {approval.correction or 'no reason given'}"
-        obs = await self._execute_tool(tool_name, tool_args)
-        if approval is not None:
-            # HITL was involved — overwrite pending checkpoint with clean state.
-            # Non-HITL tools leave the step checkpoint intact for the next iteration.
-            await self._commit_checkpoint(run_id, step)
-        return obs
-
-    async def _run_streaming_tool_gated(
-        self,
-        run_id: str,
-        step: int,
-        tool_name: str,
-        tool_args: dict,
-        response: dict,
-        tool: Any,
-    ):
-        """Async-iterator variant of ``_run_tool_gated`` for tools that
-        implement ``execute_stream``.
-
-        Yields a sequence of ``("event", BusEvent)`` items as the underlying
-        streaming tool emits events, and ends with exactly one of:
-
-          ``("result", obs)``     — the observation the ReAct loop records
-          ``("correction", None)`` — HITL injected a correction; caller
-                                     must ``continue`` the loop. WM is
-                                     already updated.
-
-        Recursion guard fires here: if invoking the tool would push a
-        sub-agent past ``config.max_subagent_depth``, the tool is refused
-        and an error string surfaces as the observation instead.
-        """
-        from tools.builtin.subagent import SubAgentTool
-
-        # Recursion guard for sub-agent delegation specifically.
-        if isinstance(tool, SubAgentTool):
-            next_depth = self._subagent_depth + 1
-            if next_depth > self.config.max_subagent_depth:
-                yield (
-                    "result",
-                    (
-                        f"Refused to delegate to {tool.name!r}: "
-                        f"max sub-agent depth {self.config.max_subagent_depth} "
-                        f"would be exceeded (current depth {self._subagent_depth})."
-                    ),
-                )
-                return
-            tool._agent._subagent_depth = next_depth
-            # Share the parent's guard so the sub-agent's check() enforces
-            # the run-level budget and its bubbled TASK_DONE snapshot
-            # reflects real token usage. Without this, sub-agents track an
-            # empty local guard while the LLM reports tokens to the
-            # runtime's guard (the one ``_attach_budget`` actually wired).
-            tool._agent._guard = self._guard
-            # Tell the tool who's invoking so its bubbled events carry the
-            # actual parent's id in ``parent_agent_id``. Without this the
-            # tool defaults to its own sub-agent id, which makes
-            # ``agent_id == parent_agent_id`` for the immediate sub —
-            # technically a "nested" marker but useless to renderers that
-            # want indentation or grouping by real parent.
-            tool._invoking_agent_id = self.config.agent_id
-
-        approval = await self._gate_tool(run_id, step, tool_name, tool_args, response)
-        if approval is not None:
-            if approval.correction:
-                await self._inject_human_guidance(response, approval.correction, run_id, step)
-                yield ("correction", None)
-                return
-            if not approval.approved:
-                await self._commit_checkpoint(run_id, step)
-                yield (
-                    "result",
-                    f"Tool rejected by human: {approval.correction or 'no reason given'}",
-                )
-                return
-
-        observation: Any = None
-        try:
-            async for item in tool.execute_stream(**tool_args):
-                if isinstance(item, BusEvent):
-                    yield ("event", item)
-                else:
-                    # Streaming tools yield exactly one non-BusEvent terminal
-                    # value — the dict observation the parent records.
-                    observation = item
-        except Exception as e:  # noqa: BLE001 — surface to the loop, not crash
-            logger.error("Streaming tool %s failed: %s", tool_name, e)
-            observation = f"Tool error ({tool_name}): {e}"
-
-        if approval is not None:
-            await self._commit_checkpoint(run_id, step)
-        yield ("result", observation)
-
-    async def _inject_human_guidance(
-        self, response: dict, correction: str, run_id: str, step: int
-    ) -> None:
-        """Append human correction to WorkingMemory and commit a clean checkpoint."""
-        await self._working_memory.append("assistant", json.dumps(response))
+        await self._working_memory.append("assistant", assistant_message)
         await self._working_memory.append("user", f"Human guidance: {correction}")
-        await self._commit_checkpoint(run_id, step)
-
-    async def _commit_checkpoint(self, run_id: str, step: int) -> None:
-        """Overwrite checkpoint with current state (no pending field).
-
-        Called after HITL resolves or a tool completes so the stored state
-        always reflects reality — no stale 'pending' approval marker, and
-        the step position is preserved for crash-resume.
-        """
-        if self._checkpoint_store is None:
-            return
-        await self._checkpoint_store.write(
-            self._ckp_id,
-            {
-                "run_id": run_id,
-                "agent_id": self.config.agent_id,
-                "task": self._task,
-                "step": step,
-                "memory": self._working_memory.to_dict(),
-            },
-        )
 
     async def _clear_checkpoint(self, run_id: str) -> None:
         if self._checkpoint_store:
             await self._checkpoint_store.delete(self._ckp_id)
-
-    async def _replay_pending_step(
-        self,
-        run_id: str,
-        pending: dict,
-    ) -> AsyncGenerator[BusEvent, None]:
-        """Re-prompt approval for a step interrupted by a crash, then complete it."""
-        from harness.hitl import ApprovalRequest, is_allowed, request_approval
-
-        tool_name = pending["tool"]
-        tool_args = pending["args"]
-        step = pending["step"]
-        llm_response = pending["llm_response"]
-
-        approval = None
-        if not is_allowed(tool_name, tool_args):
-            approval = await request_approval(
-                ApprovalRequest(
-                    approval_id=pending["approval_id"],
-                    run_id=self._resume_key,  # standalone: ckp_id; orchestrated: outer run_id
-                    agent_id=self.config.agent_id,
-                    tool=tool_name,
-                    args=tool_args,
-                    step=step,
-                    timestamp=datetime.now(timezone.utc).isoformat(),
-                ),
-                self._guard,
-            )
-
-        if approval is not None and approval.correction:
-            await self._inject_human_guidance(llm_response, approval.correction, run_id, step)
-            return
-
-        observation = (
-            await self._execute_tool(tool_name, tool_args)
-            if approval is None or approval.approved
-            else f"Tool rejected by human: {approval.correction or 'no reason given'}"
-        )
-        await self._record_tool_observation(llm_response, tool_name, observation)
-        obs_display = "[image]" if _is_image_block(observation) else str(observation)[:500]
-        yield BusEvent.observation(
-            self.config.agent_id, step=step, tool=tool_name, observation=obs_display
-        )
-        await self._commit_checkpoint(run_id, step)
 
 
 # ── LLM call shaping (module-level for testability) ──────────────────────────
