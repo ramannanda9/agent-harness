@@ -1117,3 +1117,66 @@ async def test_agent_resume_key_is_outer_run_id_in_orchestrated_context(
     assert all(k == run_id for k in captured_resume_keys), (
         f"expected all resume keys == {run_id!r}, got {captured_resume_keys}"
     )
+
+
+# ── Plan codec round-trip ─────────────────────────────────────────────────────
+
+
+def test_plan_round_trip_preserves_retry_state():
+    """_plan_to_dict used to drop max_retries and the retry counter, so every
+    resume handed each task a fresh retry budget — a task on its last retry
+    came back with a full one."""
+    from orchestrator.planner import OnFailure, Plan, Task, _plan_from_dict, _plan_to_dict
+
+    task = Task(
+        id="t1",
+        agent_id="worker",
+        instruction="do the thing",
+        depends_on=["t0"],
+        on_failure=OnFailure.RETRY,
+        max_retries=3,
+    )
+    task._retry_count = 2
+    plan = Plan(tasks=[task], rationale="because")
+
+    restored = _plan_from_dict(_plan_to_dict(plan))
+
+    assert restored.rationale == "because"
+    (rt,) = restored.tasks
+    assert rt.id == "t1"
+    assert rt.agent_id == "worker"
+    assert rt.instruction == "do the thing"
+    assert rt.depends_on == ["t0"]
+    assert rt.on_failure is OnFailure.RETRY
+    assert rt.max_retries == 3
+    assert rt._retry_count == 2
+
+
+def test_plan_from_dict_rejects_a_corrupt_checkpoint():
+    """_plan_from_dict used to reuse the LLM-output parser, which silently
+    drops tasks missing agent_id or instruction. Tolerating a sloppy model is
+    right; silently losing a task from a restored plan is not."""
+    from orchestrator.planner import _plan_from_dict
+
+    with pytest.raises(ValueError, match="missing agent_id"):
+        _plan_from_dict({"tasks": [{"id": "t1", "instruction": "do it"}]})
+
+
+def test_plan_from_dict_does_not_rename_tasks_by_position():
+    """The LLM parser derives absent ids as f"t{i}". Applied to a checkpoint
+    that would rename tasks and orphan their dependency edges."""
+    from orchestrator.planner import _plan_from_dict
+
+    with pytest.raises(ValueError, match="missing id"):
+        _plan_from_dict({"tasks": [{"agent_id": "w", "instruction": "do it"}]})
+
+
+def test_planner_honours_max_retries_from_llm_output():
+    """The same field, on the path it was always missing from."""
+    from orchestrator.planner import _parse_plan
+
+    plan = _parse_plan(
+        {"tasks": [{"id": "t1", "agent_id": "w", "instruction": "go", "max_retries": 5}]}
+    )
+
+    assert plan.tasks[0].max_retries == 5

@@ -876,6 +876,7 @@ def _parse_plan(response: Any) -> Plan:
             instruction=t["instruction"],
             depends_on=t.get("depends_on", []),
             on_failure=OnFailure(t.get("on_failure", "replan")),
+            max_retries=int(t.get("max_retries", 1)),
         )
         for i, t in enumerate(data.get("tasks", []))
         if t.get("agent_id") and t.get("instruction")
@@ -910,8 +911,39 @@ def _task_result_from_dict(d: dict) -> TaskResult:
 
 
 def _plan_from_dict(d: dict) -> Plan:
-    """Restore a Plan from a checkpoint dict (inverse of _plan_to_dict)."""
-    return _parse_plan(d)
+    """Restore a Plan from a checkpoint dict (inverse of :func:`_plan_to_dict`).
+
+    Deliberately does *not* route through :func:`_parse_plan`. That function
+    decodes untrusted LLM output, so it is forgiving by design: it silently
+    drops tasks missing ``agent_id`` or ``instruction`` and re-derives absent
+    ids positionally. Applied to a checkpoint those are the wrong semantics —
+    a task quietly vanishing from a restored plan, or being renamed by its
+    index, corrupts a run rather than tolerating a sloppy model.
+
+    A checkpoint is our own output, so anything malformed here is a bug and
+    should say so.
+    """
+    tasks = []
+    for i, t in enumerate(d.get("tasks", [])):
+        missing = [k for k in ("id", "agent_id", "instruction") if not t.get(k)]
+        if missing:
+            raise ValueError(
+                f"Checkpointed plan task at index {i} is missing {', '.join(missing)}; "
+                "the checkpoint is corrupt and cannot be resumed."
+            )
+        task = Task(
+            id=t["id"],
+            agent_id=t["agent_id"],
+            instruction=t["instruction"],
+            depends_on=t.get("depends_on", []),
+            on_failure=OnFailure(t.get("on_failure", "replan")),
+            max_retries=int(t.get("max_retries", 1)),
+        )
+        # ``_retry_count`` is init=False, so it has to be set after construction.
+        # Without it a resumed run hands every task a fresh retry budget.
+        task._retry_count = int(t.get("retry_count", 0))
+        tasks.append(task)
+    return Plan(tasks=tasks, rationale=d.get("rationale", ""))
 
 
 def _plan_to_dict(plan: Plan) -> dict:
@@ -924,6 +956,8 @@ def _plan_to_dict(plan: Plan) -> dict:
                 "instruction": t.instruction,
                 "depends_on": t.depends_on,
                 "on_failure": t.on_failure.value,
+                "max_retries": t.max_retries,
+                "retry_count": t._retry_count,
             }
             for t in plan.tasks
         ],
