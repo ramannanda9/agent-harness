@@ -137,7 +137,7 @@ class _NeverFinishesLLM:
     Returning ``action="finish"`` ends the ReAct loop; any other action
     requires a tool to execute. We pick a tool that doesn't exist so the
     step yields an OBSERVATION (with an error), the loop continues, and
-    eventually ``_react_stream`` exhausts ``max_steps`` and emits a
+    eventually the ReAct loop exhausts ``max_steps`` and emits a
     top-level ERROR — the exact path the banner-suppression contract
     targets.
     """

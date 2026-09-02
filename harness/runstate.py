@@ -179,6 +179,11 @@ class RunState:
     needs the string, and keeping the string means a checkpoint round-trip
     cannot re-order keys or renormalize floats — which would change the prompt
     bytes and silently cost a prefix-cache hit on every resumed run.
+
+    ``parallel`` records whether the model asked for a batch of calls or a
+    single one. Both are held in ``actions``, but they are written into
+    working memory in different shapes, and a batch that happened to contain
+    one call must keep rendering as a batch.
     """
 
     run_id: str
@@ -189,6 +194,7 @@ class RunState:
     phase: Phase = Phase.THINK
     assistant_message: str | None = None  # serialized LLM response for this step
     actions: list[ActionState] = field(default_factory=list)
+    parallel: bool = False  # the model asked for a batch, not a single call
     budget: dict | None = None  # BudgetGuard.snapshot()
     result: dict | None = None
     error: str | None = None
@@ -212,6 +218,7 @@ class RunState:
             "memory": self.memory,
             "assistant_message": self.assistant_message,
             "actions": [a.to_dict() for a in self.actions],
+            "parallel": self.parallel,
             "budget": self.budget,
             "result": self.result,
             "error": self.error,
@@ -229,6 +236,7 @@ class RunState:
             phase=Phase(d.get("phase", Phase.THINK.value)),
             assistant_message=d.get("assistant_message"),
             actions=[ActionState.from_dict(a) for a in d.get("actions") or []],
+            parallel=d.get("parallel", False),
             budget=d.get("budget"),
             result=d.get("result"),
             error=d.get("error"),

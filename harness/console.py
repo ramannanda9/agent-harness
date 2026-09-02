@@ -303,6 +303,18 @@ class ConsoleRenderer:
                 file=self._out,
             )
 
+        elif t == EventType.RESUMED:
+            # A resumed run starts mid-story: everything that led to this step
+            # was printed by a process that is gone. Say where it picked up so
+            # the first event a reader sees is not an unexplained step number.
+            pending = p.get("actions") or []
+            waiting = f"  waiting on {', '.join(pending)}" if pending else ""
+            print(
+                f"{self._label(event)} ▶ resumed  "
+                f"step={p.get('step')}  phase={p.get('phase')}{waiting}",
+                file=self._out,
+            )
+
         elif t == EventType.SUBAGENT_START:
             indent = "  " if event.parent_agent_id else ""
             print(
