@@ -62,6 +62,19 @@ def _assistant_message(response: dict) -> str:
     return json.dumps(response, default=str)
 
 
+def _resume_factory(tool: Any, state: Any) -> Any:
+    """Zero-arg factory that continues a delegation from stored state.
+
+    Mirrors :func:`_freeze_factory` — the fan-in helper takes factories, not
+    iterators, so the captured value stays bound per driver.
+    """
+
+    def factory() -> Any:
+        return tool.resume_stream(state)
+
+    return factory
+
+
 def _freeze_factory(tool: Any, args: dict) -> Any:
     """Bind ``tool`` and ``args`` into a zero-arg factory the fan-in helper
     can call to spawn one driver per parallel streaming tool.
@@ -852,14 +865,16 @@ class BaseAgent:
         if gated:
             await self._persist(state)
 
-        async for event in self._execute_actions(runnable):
+        async for event in self._execute_actions(state, runnable):
             yield event
 
         if gated:
             await self._persist(state)
         state.phase = Phase.OBSERVE
 
-    async def _execute_actions(self, actions: list[ActionState]) -> AsyncGenerator[BusEvent, None]:
+    async def _execute_actions(
+        self, state: RunState, actions: list[ActionState]
+    ) -> AsyncGenerator[BusEvent, None]:
         """Execute actions concurrently, bubbling any streaming tool's events.
 
         Mixed batches are supported: streaming tools push their events through
@@ -875,7 +890,20 @@ class BaseAgent:
             tool = self._tool_for_invocation(action.tool)
             if tool is not None and hasattr(tool, "execute_stream"):
                 self._prepare_delegation(tool)
-                streaming.append((action, _freeze_factory(tool, action.args)))
+                # A delegation that started before a crash carries the id of
+                # its own run. If that run's state is still live, continue it
+                # rather than discarding however many steps it had done.
+                resume_state = None
+                if action.invocation_id and hasattr(tool, "load_resume_state"):
+                    resume_state = await tool.load_resume_state(action.invocation_id)
+                streaming.append(
+                    (
+                        action,
+                        _resume_factory(tool, resume_state)
+                        if resume_state is not None
+                        else _freeze_factory(tool, action.args),
+                    )
+                )
             else:
                 plain.append(action)
                 plain_tasks.append(self._execute_tool(action.tool, action.args, tool=tool))
@@ -891,6 +919,17 @@ class BaseAgent:
             try:
                 async for idx, item in fan_in([factory for _, factory in streaming]):
                     if isinstance(item, BusEvent):
+                        # A delegation's run id exists only inside the tool
+                        # until it rides out on this event. Recording it is
+                        # what makes the sub-agent's checkpoint addressable —
+                        # without it that state is written and then orphaned
+                        # under a key nobody can name.
+                        if item.type is EventType.SUBAGENT_START:
+                            captured = item.payload.get("invocation_id")
+                            started = streaming[idx][0]
+                            if captured and started.invocation_id != captured:
+                                started.invocation_id = captured
+                                await self._persist(state)
                         yield item
                     else:
                         # Streaming tools yield exactly one non-BusEvent

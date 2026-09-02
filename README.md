@@ -672,6 +672,15 @@ continuity flows through long-term memory (`MemoryManager.build_context(
 agent_id=…)`), not through WM carry-over — same model as the
 orchestrator's per-task agents.
 
+**Crash-resume.** A delegation mints its own `run_id`, which reaches the
+parent on the `subagent_start` event and is recorded on the action. If the
+process dies mid-delegation, resuming the parent continues the sub-agent from
+its own checkpoint instead of re-running it. Resuming is best-effort: with no
+checkpoint store, no stored state, or a pre-0.13 checkpoint, the delegation
+simply runs again. Execution is at-least-once either way — the step in flight
+when the checkpoint was written is replayed, which `ActionState.attempts`
+records.
+
 Parallel delegation works via the existing `actions: [...]` shape:
 
 ```json
@@ -828,9 +837,13 @@ The demo uses that utility for:
 
 Background sub-agent tasks are process-local. They keep running while the
 REPL/server process is alive; completed results become durable only when
-collected into the session transcript with `/tasks collect <id|all>`. Avoid
-launching overlapping work against the same sub-agent instance unless that
-agent's tools and LLM adapter are safe for concurrent use.
+collected into the session transcript with `/tasks collect <id|all>`.
+
+Overlapping delegations to one sub-agent are safe as of 0.14: each invocation
+runs on its own copy of the tool and its nested agent, so concurrent runs no
+longer share working memory. What remains your responsibility is whether that
+agent's **tools and LLM adapter** tolerate concurrent use — a tool holding a
+single connection or a non-reentrant client still needs its own guarding.
 
 When a `PersistentAgent` coordinator is wired with `SubAgentTool`s, it also
 gets LLM-visible background tools automatically:
