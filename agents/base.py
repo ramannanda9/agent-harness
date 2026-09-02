@@ -1101,10 +1101,14 @@ class BaseAgent:
         Returns ApprovalResponse if the tool is gated, None if not.
         Writes a crash-resumable checkpoint before blocking when checkpoint
         resume is enabled.
+
+        Durability is deliberately *not* a precondition for gating. This used
+        to skip the prompt entirely when no checkpoint store was configured,
+        which meant a tool the operator had explicitly listed in
+        ``hitl_tools`` ran unsupervised. An approval gate must fail closed:
+        with no store we still prompt, we just cannot offer crash-resume.
         """
         if tool_name not in self.config.hitl_tools:
-            return None
-        if self._checkpoint_store is None and self._checkpoint_resume_enabled:
             return None
 
         from harness.hitl import ApprovalRequest, is_allowed, request_approval
@@ -1274,8 +1278,14 @@ class BaseAgent:
         Called after HITL resolves or a tool completes so the stored state
         always reflects reality — no stale 'pending' approval marker, and
         the step position is preserved for crash-resume.
+
+        Honours ``_checkpoint_resume_enabled`` like the other two writers.
+        Without that check this wrote during PersistentAgent turns, which
+        opt out of crash-resume; the write only stayed invisible because
+        ``run_stream`` deletes the checkpoint on TASK_DONE, so a crash
+        mid-turn left an orphan behind.
         """
-        if self._checkpoint_store is None:
+        if self._checkpoint_store is None or not self._checkpoint_resume_enabled:
             return
         await self._checkpoint_store.write(
             self._ckp_id,
