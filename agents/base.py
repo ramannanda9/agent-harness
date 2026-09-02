@@ -559,50 +559,6 @@ class BaseAgent:
             return f"{run_id}:{self._ckp_scope}:{self.config.agent_id}"
         return f"{run_id}:{self.config.agent_id}"
 
-    def _state(
-        self,
-        run_id: str,
-        step: int,
-        *,
-        phase: Phase = Phase.THINK,
-        assistant_message: str | None = None,
-        actions: list[ActionState] | None = None,
-    ) -> RunState:
-        """Snapshot the agent's position as a :class:`RunState`.
-
-        One builder for every checkpoint writer, so the stored shape cannot
-        drift between the step write, the pre-approval write and the
-        post-tool write — which is how the previous format grew a ``pending``
-        key that only one of the three knew about.
-        """
-        return RunState(
-            run_id=run_id,
-            agent_id=self.config.agent_id,
-            task=self._task,
-            memory=self._working_memory.to_dict(),
-            step=step,
-            phase=phase,
-            assistant_message=assistant_message,
-            actions=actions or [],
-            budget=self._guard.snapshot() if hasattr(self._guard, "snapshot") else None,
-        )
-
-    async def _write_step_checkpoint(self, run_id: str, step: int) -> None:
-        if self._checkpoint_store is None or not self._checkpoint_resume_enabled:
-            return
-        await self._checkpoint_store.write(self._ckp_id, self._state(run_id, step).to_dict())
-
-    # ── ReAct state machine ───────────────────────────────────────────────────
-    #
-    # One ReAct step walks THINK → APPROVE → ACT → OBSERVE and back to THINK.
-    # Each phase performs its side effects, records them on the state, sets the
-    # next phase, persists, and only then yields the events describing what it
-    # did. That order matters: an async generator abandoned by its consumer has
-    # GeneratorExit raised at the yield, so anything awaited afterwards never
-    # runs. Persisting after yielding would leave a checkpoint claiming work is
-    # still pending when it has already happened, and the next resume would
-    # repeat its side effects.
-
     async def _drive(self, state: RunState) -> AsyncGenerator[BusEvent, None]:
         """Advance a run until it reaches a terminal phase.
 
@@ -817,16 +773,17 @@ class BaseAgent:
                 # The human redirected instead of answering. Drop the batch,
                 # feed the correction back, and think again.
                 await self._inject_human_guidance(
-                    state.assistant_message or "{}",
-                    approval.correction,
-                    state.run_id,
-                    state.step,
+                    state.assistant_message or "{}", approval.correction
                 )
                 state.actions = []
                 state.assistant_message = None
                 state.parallel = False
                 state.step += 1
                 state.phase = Phase.THINK
+                # Persisted only once the state reflects the correction. Doing
+                # it inside the helper wrote the pre-correction step, leaving a
+                # checkpoint one step behind what the run had actually done.
+                await self._persist(state)
                 return
 
             action.status = (
@@ -1324,30 +1281,15 @@ class BaseAgent:
             self._guard,
         )
 
-    async def _inject_human_guidance(
-        self, assistant_message: str, correction: str, run_id: str, step: int
-    ) -> None:
-        """Append human correction to WorkingMemory and commit a clean checkpoint."""
+    async def _inject_human_guidance(self, assistant_message: str, correction: str) -> None:
+        """Record a human correction in working memory.
+
+        The caller persists, once the rest of the state reflects the
+        correction — this used to write the checkpoint itself, at the step the
+        run was leaving rather than the one it was entering.
+        """
         await self._working_memory.append("assistant", assistant_message)
         await self._working_memory.append("user", f"Human guidance: {correction}")
-        await self._commit_checkpoint(run_id, step)
-
-    async def _commit_checkpoint(self, run_id: str, step: int) -> None:
-        """Overwrite checkpoint with current state (no pending field).
-
-        Called after HITL resolves or a tool completes so the stored state
-        always reflects reality — no stale 'pending' approval marker, and
-        the step position is preserved for crash-resume.
-
-        Honours ``_checkpoint_resume_enabled`` like the other two writers.
-        Without that check this wrote during PersistentAgent turns, which
-        opt out of crash-resume; the write only stayed invisible because
-        ``run_stream`` deletes the checkpoint on TASK_DONE, so a crash
-        mid-turn left an orphan behind.
-        """
-        if self._checkpoint_store is None or not self._checkpoint_resume_enabled:
-            return
-        await self._checkpoint_store.write(self._ckp_id, self._state(run_id, step).to_dict())
 
     async def _clear_checkpoint(self, run_id: str) -> None:
         if self._checkpoint_store:
