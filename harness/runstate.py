@@ -139,14 +139,14 @@ class ActionState:
     """
 
     tool: str
-    args: dict = field(default_factory=dict)
+    args: dict[str, Any] = field(default_factory=dict)
     status: ActionStatus = ActionStatus.PENDING
     observation: Any = None
     approval_id: str | None = None
     attempts: int = 0
     invocation_id: str | None = None
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "tool": self.tool,
             "args": self.args,
@@ -158,7 +158,7 @@ class ActionState:
         }
 
     @classmethod
-    def from_dict(cls, d: dict) -> ActionState:
+    def from_dict(cls, d: dict[str, Any]) -> ActionState:
         return cls(
             tool=d["tool"],
             args=d.get("args") or {},
@@ -189,14 +189,14 @@ class RunState:
     run_id: str
     agent_id: str
     task: str
-    memory: dict = field(default_factory=dict)  # WorkingMemory.to_dict()
+    memory: dict[str, Any] = field(default_factory=dict)  # WorkingMemory.to_dict()
     step: int = 0
     phase: Phase = Phase.THINK
     assistant_message: str | None = None  # serialized LLM response for this step
     actions: list[ActionState] = field(default_factory=list)
     parallel: bool = False  # the model asked for a batch, not a single call
-    budget: dict | None = None  # BudgetGuard.snapshot()
-    result: dict | None = None
+    budget: dict[str, Any] | None = None  # BudgetGuard.snapshot()
+    result: dict[str, Any] | None = None
     error: str | None = None
     error_kind: ErrorKind | None = None
     kind: str = "agent"
@@ -206,7 +206,7 @@ class RunState:
     def is_terminal(self) -> bool:
         return self.phase in TERMINAL_PHASES
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "kind": self.kind,
             "version": self.version,
@@ -226,7 +226,7 @@ class RunState:
         }
 
     @classmethod
-    def from_dict(cls, d: dict) -> RunState:
+    def from_dict(cls, d: dict[str, Any]) -> RunState:
         return cls(
             run_id=d["run_id"],
             agent_id=d["agent_id"],
@@ -280,11 +280,11 @@ class TaskState:
     task_id: str
     status: TaskStatus = TaskStatus.PENDING
     attempt: int = 0
-    result: dict | None = None  # TaskResult, as a dict
+    result: dict[str, Any] | None = None  # TaskResult, as a dict
     agent_ckp_id: str | None = None
     instruction: str | None = None
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "task_id": self.task_id,
             "status": self.status.value,
@@ -295,7 +295,7 @@ class TaskState:
         }
 
     @classmethod
-    def from_dict(cls, d: dict) -> TaskState:
+    def from_dict(cls, d: dict[str, Any]) -> TaskState:
         return cls(
             task_id=d["task_id"],
             status=TaskStatus(d.get("status", TaskStatus.PENDING.value)),
@@ -321,15 +321,15 @@ class OrchestratorState:
 
     run_id: str
     goal: str
-    plan: dict = field(default_factory=dict)  # Plan, as a dict
+    plan: dict[str, Any] = field(default_factory=dict)  # Plan, as a dict
     tasks: dict[str, TaskState] = field(default_factory=dict)
     replan_count: int = 0
     aborted: bool = False
-    budget: dict | None = None
+    budget: dict[str, Any] | None = None
     kind: str = "orchestrator"
     version: int = STATE_VERSION
 
-    def completed_results(self) -> dict[str, dict]:
+    def completed_results(self) -> dict[str, dict[str, Any]]:
         """Results of tasks that reached a terminal, successful state."""
         return {
             tid: ts.result
@@ -337,7 +337,7 @@ class OrchestratorState:
             if ts.status is TaskStatus.DONE and ts.result is not None
         }
 
-    def recorded_results(self) -> dict[str, dict]:
+    def recorded_results(self) -> dict[str, dict[str, Any]]:
         """Results of every task that produced one, successful or not.
 
         A failed task still carries a result, and the orchestrator uses the
@@ -347,7 +347,7 @@ class OrchestratorState:
         """
         return {tid: ts.result for tid, ts in self.tasks.items() if ts.result is not None}
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "kind": self.kind,
             "version": self.version,
@@ -361,7 +361,7 @@ class OrchestratorState:
         }
 
     @classmethod
-    def from_dict(cls, d: dict) -> OrchestratorState:
+    def from_dict(cls, d: dict[str, Any]) -> OrchestratorState:
         return cls(
             run_id=d["run_id"],
             goal=d["goal"],
@@ -383,7 +383,7 @@ class LegacyCheckpointError(ValueError):
     """
 
 
-def load_state(d: dict) -> RunState | OrchestratorState:
+def load_state(d: dict[str, Any]) -> RunState | OrchestratorState:
     """Decode a stored checkpoint into its state object.
 
     Dispatches on the ``kind`` discriminator rather than sniffing for keys.

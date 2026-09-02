@@ -426,7 +426,13 @@ class BaseAgent:
             self.config.agent_id,
             step=state.step,
             phase=state.phase.value,
-            actions=[a.tool for a in state.actions],
+            # Only actions still needing a decision or a run — an action
+            # already approved and executed is not what the run is waiting on.
+            actions=[
+                a.tool
+                for a in state.actions
+                if a.status in (ActionStatus.PENDING, ActionStatus.APPROVED)
+            ],
         )
 
         source_cm = (
