@@ -292,6 +292,34 @@ class BudgetGuard:
             "breakdown": self.breakdown,
         }
 
+    def restore(self, snapshot: dict[str, Any]) -> None:
+        """Adopt spending recorded by an earlier run of the same work.
+
+        The inverse of :meth:`snapshot`, for resuming a checkpointed run.
+        Without it a resumed run silently starts a fresh budget, so a task
+        that crashed after burning $4 of a $5 allowance resumes with the
+        whole $5 available again.
+
+        Elapsed time is restored by back-dating ``_start``; the interval the
+        process was dead is *not* counted, exactly as a ``suspend()`` window
+        is not counted. Wall-time budgets here bound how long the agent
+        works, not how long the wall clock ran.
+
+        Caller beware — restoring a budget onto a run that *failed because of
+        that budget* re-raises at the same point and makes resume a no-op
+        loop. Resume paths must skip the restore (or require a raised
+        ``GuardrailConfig``) when the run's recorded failure was the budget.
+        """
+        self._cost = float(snapshot.get("cost_usd", 0.0))
+        self._tokens_in = int(snapshot.get("tokens_in", 0))
+        self._tokens_out = int(snapshot.get("tokens_out", 0))
+        self._breakdown = {
+            source: dict(values) for source, values in (snapshot.get("breakdown") or {}).items()
+        }
+        self._start = time.time() - float(snapshot.get("elapsed_seconds", 0.0))
+        self._suspended_seconds = 0.0
+        self._suspend_at = None
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Registry
