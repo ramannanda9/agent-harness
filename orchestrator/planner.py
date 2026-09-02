@@ -348,13 +348,21 @@ class Orchestrator:
                 )
                 break
 
+            # Tasks still marked RUNNING were interrupted by a previous
+            # process. Their agent's own checkpoint may still hold where it
+            # got to, in which case the task continues instead of restarting.
+            resume_states = await self._load_child_states(ready, tasks)
+
             for t in ready:
                 tasks[t.id].status = TaskStatus.RUNNING
                 tasks[t.id].instruction = t.instruction
+                tasks[t.id].agent_ckp_id = self._child_ckp_id(t)
             await self._write_orch_checkpoint(goal, plan, tasks, replan_count, aborted)
 
             batch_results: dict[str, TaskResult] = {}
-            async for event in self._run_batch(goal, ready, batch_results, completed):
+            async for event in self._run_batch(
+                goal, ready, batch_results, completed, resume_states=resume_states
+            ):
                 yield event
 
             for t in ready:
@@ -535,6 +543,55 @@ class Orchestrator:
 
     # ── Checkpoint helpers ────────────────────────────────────────────────────
 
+    def _child_ckp_id(self, task: Task) -> str:
+        """Checkpoint key of the agent running ``task``.
+
+        Task-scoped, because a plan may name the same agent for two tasks and
+        an agent-scoped key would have them overwrite each other.
+        """
+        return f"{self._run_id}:{task.id}:{task.agent_id}"
+
+    async def _load_child_states(
+        self, ready: list[Task], tasks: dict[str, TaskState]
+    ) -> dict[str, Any]:
+        """Load stored agent state for tasks that were interrupted mid-flight.
+
+        Only ``RUNNING`` tasks qualify: that status means a previous process
+        started the task and never recorded an outcome. Everything else either
+        has not begun or has already finished.
+
+        A missing or unreadable child checkpoint is not an error — the task
+        simply restarts, which is what happened for every interrupted task
+        before this existed.
+        """
+        from harness.runstate import RunState, load_state
+
+        if self._checkpoint_store is None:
+            return {}
+
+        states: dict[str, Any] = {}
+        for task in ready:
+            state = tasks.get(task.id)
+            if state is None or state.status is not TaskStatus.RUNNING:
+                continue
+            key = state.agent_ckp_id or self._child_ckp_id(task)
+            try:
+                stored = await self._checkpoint_store.read(key)
+                child = load_state(stored) if stored else None
+            except Exception as exc:  # noqa: BLE001 — restarting is always safe
+                logger.warning("Ignoring unreadable child checkpoint %s: %s", key, exc)
+                continue
+            if isinstance(child, RunState) and not child.is_terminal:
+                logger.info(
+                    "Resuming task %s from agent checkpoint %s (step %d, phase %s)",
+                    task.id,
+                    key,
+                    child.step,
+                    child.phase.value,
+                )
+                states[task.id] = child
+        return states
+
     async def _write_orch_checkpoint(
         self,
         goal: str,
@@ -652,6 +709,7 @@ class Orchestrator:
         ready: list[Task],
         results_out: dict[str, TaskResult],
         completed_results: dict[str, TaskResult] | None = None,
+        resume_states: dict[str, Any] | None = None,
     ) -> AsyncGenerator[BusEvent, None]:
         """
         Run a batch of ready tasks in parallel, forwarding each agent's events
@@ -660,6 +718,10 @@ class Orchestrator:
 
         completed_results is used to inject upstream dependency outputs into
         each task's instruction so the agent has the context it needs.
+
+        resume_states maps task id to stored agent state for tasks that were
+        interrupted mid-flight; those continue from where their agent got to
+        rather than starting over.
         """
         bus: asyncio.Queue = asyncio.Queue()
         DRIVER_DONE = object()
@@ -702,13 +764,21 @@ class Orchestrator:
                         f"--- Context from completed upstream tasks ---\n" + "\n\n".join(dep_parts)
                     )
 
+            # Scope the agent's checkpoint key to this task, so a plan naming
+            # the same agent twice does not have both write to one key.
+            agent._ckp_scope = task.id
+
+            resume_state = (resume_states or {}).get(task.id)
+            stream = (
+                agent._resume_stream(resume_state)
+                if resume_state is not None
+                else agent.run_stream(task=instruction, run_id=self._run_id)
+            )
+
             last_done: dict | None = None
             last_error: str | None = None
             try:
-                async for event in agent.run_stream(
-                    task=instruction,
-                    run_id=self._run_id,
-                ):
+                async for event in stream:
                     if event.type == EventType.TASK_DONE:
                         last_done = event.payload
                     elif event.type == EventType.ERROR:

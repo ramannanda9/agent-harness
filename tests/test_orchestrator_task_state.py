@@ -182,3 +182,149 @@ async def test_replan_persists_the_new_plan_not_the_original(monkeypatch):
     for checkpoint in written:
         state = load_state(checkpoint)
         assert set(state.tasks) == {t["id"] for t in state.plan["tasks"]}
+
+
+# ── Nested resume: an interrupted task continues, not restarts ───────────────
+
+
+@pytest.mark.asyncio
+async def test_an_interrupted_task_resumes_its_agent_instead_of_restarting():
+    """Per-agent step-level resume existed but was unreachable from an
+    orchestration: the loop always called run_stream, so a task interrupted
+    mid-flight threw away its agent's progress and began again."""
+    from harness.events import EventType
+    from harness.runstate import RunState
+    from memory.working import WorkingMemory
+    from tests.conftest import ScriptedLLM
+    from tests.test_checkpoint_resume import (
+        InMemoryCheckpointStore,
+        _make_runtime,
+        _orch_routes,
+    )
+
+    llm = ScriptedLLM()
+    llm.routes = _orch_routes()
+    ckp_store = InMemoryCheckpointStore()
+    runtime, _ = _make_runtime(llm, ckp_store)
+
+    # A child agent that got several steps in before the process died.
+    wm = WorkingMemory(llm=llm, max_tokens=8000)
+    await wm.append("system", "You are analyst. ReAct format.", pinned=True)
+    await wm.append("user", "step 1")
+    await wm.append("assistant", '{"thought": "partway", "action": "noop"}')
+    child_key = "orch-run:t1:analyst"
+    ckp_store.data[child_key] = RunState(
+        run_id="orch-run",
+        agent_id="analyst",
+        task="step 1",
+        memory=wm.to_dict(),
+        step=5,
+    ).to_dict()
+
+    plan = {
+        "rationale": "linear plan",
+        "tasks": [
+            {
+                "id": "t1",
+                "agent_id": "analyst",
+                "instruction": "step 1",
+                "depends_on": [],
+                "on_failure": "skip",
+                "max_retries": 1,
+                "retry_count": 0,
+            },
+        ],
+    }
+    ckp_store.data["orch-run"] = OrchestratorState(
+        run_id="orch-run",
+        goal="test goal",
+        plan=plan,
+        tasks={
+            "t1": TaskState(
+                task_id="t1",
+                status=TaskStatus.RUNNING,  # started, never finished
+                instruction="step 1",
+                agent_ckp_id=child_key,
+            )
+        },
+    ).to_dict()
+
+    events = [e async for e in runtime.resume_stream("orch-run")]
+
+    resumed = [e for e in events if e.type == EventType.RESUMED]
+    assert resumed, "the interrupted task's agent should have been resumed"
+    assert resumed[0].payload["step"] == 5, "it should pick up where it stopped"
+
+
+@pytest.mark.asyncio
+async def test_a_task_that_never_started_is_not_resumed():
+    """Only RUNNING means 'interrupted'. A PENDING task has no progress to
+    continue from and must begin normally."""
+    from harness.events import EventType
+    from tests.conftest import ScriptedLLM
+    from tests.test_checkpoint_resume import (
+        InMemoryCheckpointStore,
+        _make_runtime,
+        _orch_routes,
+    )
+
+    llm = ScriptedLLM()
+    llm.routes = _orch_routes()
+    ckp_store = InMemoryCheckpointStore()
+    runtime, _ = _make_runtime(llm, ckp_store)
+
+    plan = {
+        "rationale": "linear plan",
+        "tasks": [
+            {
+                "id": "t1",
+                "agent_id": "analyst",
+                "instruction": "step 1",
+                "depends_on": [],
+                "on_failure": "skip",
+                "max_retries": 1,
+                "retry_count": 0,
+            },
+        ],
+    }
+    ckp_store.data["orch-run"] = OrchestratorState(
+        run_id="orch-run",
+        goal="test goal",
+        plan=plan,
+        tasks={"t1": TaskState(task_id="t1", status=TaskStatus.PENDING)},
+    ).to_dict()
+
+    events = [e async for e in runtime.resume_stream("orch-run")]
+
+    assert not [e for e in events if e.type == EventType.RESUMED]
+
+
+def test_child_checkpoint_keys_are_scoped_by_task():
+    """A plan may name the same agent for two tasks. Keyed only by agent id,
+    both would write to one checkpoint and overwrite each other."""
+    from agents.base import AgentConfig, BaseAgent
+    from harness.runtime import BudgetGuard, GuardrailConfig, Tracer
+    from memory.manager import MemoryManager
+    from memory.stores import InMemoryEpisodicStore, InMemorySemanticStore
+    from tests.conftest import ScriptedLLM
+
+    llm = ScriptedLLM()
+    agent = BaseAgent(
+        config=AgentConfig(agent_id="w", role="r", system_prompt="p", allowed_tools=[]),
+        tools={},
+        memory=MemoryManager(
+            semantic_store=InMemorySemanticStore(),
+            episodic_store=InMemoryEpisodicStore(),
+            llm=llm,
+        ),
+        tracer=Tracer(),
+        guard=BudgetGuard(GuardrailConfig()),
+        llm=llm,
+    )
+
+    assert agent._checkpoint_key("run-1") == "run-1:w"
+
+    agent._ckp_scope = "t1"
+    assert agent._checkpoint_key("run-1") == "run-1:t1:w"
+    agent._ckp_scope = "t2"
+    assert agent._checkpoint_key("run-1") == "run-1:t2:w"

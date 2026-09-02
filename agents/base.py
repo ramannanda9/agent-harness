@@ -209,7 +209,11 @@ class BaseAgent:
         self._working_memory: WorkingMemory | None = None
         self._task: str = ""
         self._last_think_error: str | None = None
-        self._ckp_id: str = ""  # f"{run_id}:{agent_id}" — unique per agent per run
+        self._ckp_id: str = ""  # checkpoint key — unique per agent per run
+        # Set by the orchestrator to the task id, so two tasks driven by the
+        # same agent_id in one run write to distinct checkpoint keys instead of
+        # overwriting each other.
+        self._ckp_scope: str | None = None
         # Async steering queue — items drained at the top of each ReAct
         # step (before checkpoint, before think). Created eagerly so
         # callers can steer() before run_stream starts.
@@ -304,7 +308,7 @@ class BaseAgent:
             session-level summary survives.
         """
         run_id = run_id or str(uuid.uuid4())
-        self._ckp_id = f"{run_id}:{self.config.agent_id}"
+        self._ckp_id = self._checkpoint_key(run_id)
         if not self._resume_key:
             self._resume_key = self._ckp_id
         self._task = task
@@ -379,7 +383,7 @@ class BaseAgent:
         correction is injected) before the loop continues.
         """
         run_id = state.run_id
-        self._ckp_id = f"{run_id}:{self.config.agent_id}"
+        self._ckp_id = self._checkpoint_key(run_id)
         if not self._resume_key:
             self._resume_key = self._ckp_id
         self._task = state.task
@@ -537,6 +541,17 @@ class BaseAgent:
         return "\n\n".join(parts)
 
     # ── ReAct Loop (stream) ───────────────────────────────────────────────────
+
+    def _checkpoint_key(self, run_id: str) -> str:
+        """Where this agent's state is stored for ``run_id``.
+
+        Scoped by task when the orchestrator supplies one: a plan may name the
+        same agent for two different tasks, and without the scope both would
+        write to ``f"{run_id}:{agent_id}"`` and clobber each other.
+        """
+        if self._ckp_scope:
+            return f"{run_id}:{self._ckp_scope}:{self.config.agent_id}"
+        return f"{run_id}:{self.config.agent_id}"
 
     def _state(
         self,
