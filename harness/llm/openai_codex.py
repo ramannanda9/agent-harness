@@ -28,7 +28,7 @@ class OpenAICodexLLM:
     def __init__(
         self,
         *,
-        model: str = "gpt-5.5",
+        model: str = "gpt-6.1-sol",
         auth_file: str | Path | None = None,
         credential_provider: AuthFileOAuthProvider | None = None,
         base_url: str = "https://chatgpt.com/backend-api",
@@ -66,8 +66,7 @@ class OpenAICodexLLM:
             provider="openai-codex",
             allowed=OPENAI_REASONING_EFFORTS,
         )
-        # Reuse OpenAI's table — Codex models share the gpt-5 / o-series
-        # lineage so the same context windows apply.
+        # Reuse the OpenAI context budget table for the configured model.
         from harness.llm.openai import (  # noqa: PLC0415
             _OPENAI_TOKEN_BUDGET_SAFETY,
             _lookup_openai_context_window,
