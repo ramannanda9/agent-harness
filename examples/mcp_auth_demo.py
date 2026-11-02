@@ -63,7 +63,7 @@ async def main() -> None:
         print("ERROR: set MCP_URL to a remote MCP server URL.", file=sys.stderr)
         sys.exit(2)
 
-    model = os.environ.get("OPENAI_MODEL", "gpt6-1-sol")
+    model = os.environ.get("OPENAI_MODEL", "gpt-6.1-sol")
     goal = os.environ.get("MCP_GOAL", DEFAULT_GOAL)
     mcp_url = os.environ["MCP_URL"]
     mcp_auth = _build_mcp_auth()

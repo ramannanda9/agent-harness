@@ -121,9 +121,19 @@ async def test_default_model_and_context(monkeypatch):
     llm = AnthropicLLM()
     await llm.complete(system=None, messages=[])
     assert messages.calls[0]["model"] == "claude-sonnet-5-5"
-    assert llm.context_window == 256_000
-    assert llm.input_token_budget == 256_000 - 512
+    assert llm.context_window == 1_000_000
+    assert llm.input_token_budget == 1_000_000 - 4096 - 512
     assert AnthropicLLM(context_window=64_000).context_window == 64_000
+
+
+@pytest.mark.parametrize(
+    ("context", "output", "expected"),
+    [(1_000_000, 128_000, 871_488), (8_000, 16_000, 1024)],
+)
+def test_input_budget_reserves_configured_output(monkeypatch, context, output, expected):
+    _build(monkeypatch)
+    llm = AnthropicLLM(context_window=context, max_tokens=output)
+    assert llm.input_token_budget == expected
 
 
 def test_system_blocks_with_caching():

@@ -243,7 +243,7 @@ Codex OAuth client id can be overridden with
 from harness.llm.openai_codex import OpenAICodexLLM
 
 llm = OpenAICodexLLM(
-    model="gpt6-1-sol",
+    model="gpt-6.1-sol",
     auth_file="~/.agent-harness/auth/auth.json",  # Pi-shaped openai-codex OAuth entry
 )
 runtime = AgentRuntime(..., llm=llm)
@@ -1055,16 +1055,19 @@ a string to `n` characters with a trailing `…`.
 
 `AgentConfig.working_memory_max_tokens` controls per-agent eviction. **Default
 is `None` — auto-derived from the LLM's context window at runtime** so the
-threshold adapts when you swap models (the 256K `gpt6-1-sol` default gets ~201K of WM
-headroom; the 256K `claude-sonnet-5-5` default gets ~204K; a tiny 8K fallback gets ~6K).
+threshold adapts when you swap models (the 1.05M `gpt-6.1-sol` default gets ~836K of WM
+headroom; the 1M `claude-sonnet-5-5` default gets ~796K; a tiny 8K fallback gets ~6K).
 Concretely the WM compacts at `0.8 × llm.input_token_budget`, leaving 20%
 headroom for system prompt, memory context, tool schemas, and tokeniser
 variance.
 
-OpenAI adapters default to `gpt6-1-sol`; Anthropic adapters default to
-`claude-sonnet-5-5`. Both default context budgets are 256,000 tokens. These
-are harness configuration defaults; provider availability is not verified.
-Explicit model and context overrides remain supported.
+OpenAI adapters default to `gpt-6.1-sol`; Anthropic adapters default to
+`claude-sonnet-5-5`. Their context windows use the documented model limits:
+[1,050,000 tokens for GPT-6.1 Sol](https://developers.openai.com/api/docs/models/gpt-6.1-sol)
+and [1,000,000 for Sonnet 5.5](https://platform.claude.com/docs/en/models/sonnet-5-5/overview).
+OpenAI documents a separate 500K default for its Codex and ChatGPT Work apps;
+the harness uses the model maximum. Input budgets reserve output capacity
+and safety slack. Explicit model and context overrides remain supported.
 
 Each shipped adapter (`OpenAILLM`, `AnthropicLLM`, `ClaudeCodeLLM`,
 `OpenAICodexLLM`) exposes `context_window` and `input_token_budget`

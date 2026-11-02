@@ -40,7 +40,7 @@ async def main() -> None:
         print("ERROR: set OPENAI_API_KEY before running this demo.", file=sys.stderr)
         sys.exit(2)
 
-    model = os.environ.get("OPENAI_MODEL", "gpt6-1-sol")
+    model = os.environ.get("OPENAI_MODEL", "gpt-6.1-sol")
     goal = os.environ.get("MCP_GOAL", DEFAULT_GOAL)
 
     # MCP server command — default to the filesystem server

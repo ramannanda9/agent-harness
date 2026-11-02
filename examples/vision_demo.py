@@ -13,7 +13,7 @@ What this demonstrates:
 
     OPENAI_API_KEY=sk-... python examples/vision_demo.py
 
-Requires a vision-capable model (gpt6-1-sol by default; override with OPENAI_MODEL).
+Requires a vision-capable model (gpt-6.1-sol by default; override with OPENAI_MODEL).
 
 Install:
     pip install -e ".[openai,http]"
@@ -41,7 +41,7 @@ from tools.builtin.http_fetch import HTTPFetch
 # ── Config ────────────────────────────────────────────────────────────────────
 
 # Override OPENAI_MODEL for your deployment's vision-capable model.
-MODEL = os.environ.get("OPENAI_MODEL", "gpt6-1-sol")
+MODEL = os.environ.get("OPENAI_MODEL", "gpt-6.1-sol")
 
 # Public domain test images — stable Wikipedia/httpbin URLs.
 # httpbin /image/jpeg → JPEG of a horse; /image/png → PNG badge.

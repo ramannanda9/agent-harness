@@ -14,6 +14,20 @@ from harness.llm.claude_code import (
 # ── Mock streaming HTTP client ────────────────────────────────────────────────
 
 
+def test_input_budget_reserves_configured_output():
+    for context, output, expected in (
+        (1_000_000, 128_000, 871_488),
+        (8_000, 16_000, 1024),
+    ):
+        llm = ClaudeCodeLLM(
+            credential_provider=_Creds(),
+            context_window=context,
+            max_tokens=output,
+            user_agent="test",
+        )
+        assert llm.input_token_budget == expected
+
+
 class _StreamResponse:
     def __init__(self, status_code: int, body: str = "") -> None:
         self.status_code = status_code
@@ -200,8 +214,8 @@ async def test_stream_complete_yields_deltas_incrementally(monkeypatch):
 
     assert chunks == ["he", "llo"]
     assert client.calls[0]["json"]["model"] == "claude-sonnet-5-5"
-    assert llm.context_window == 256_000
-    assert llm.input_token_budget == 256_000 - 512
+    assert llm.context_window == 1_000_000
+    assert llm.input_token_budget == 1_000_000 - 4096 - 512
     assert llm.last_usage == {
         "tokens_in": 5,
         "tokens_out": 6,

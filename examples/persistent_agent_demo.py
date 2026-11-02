@@ -184,7 +184,7 @@ def _build_llm(provider: str):
             sys.exit(2)
         from harness.llm.openai import OpenAILLM  # noqa: PLC0415
 
-        model = os.environ.get("OPENAI_MODEL", "gpt6-1-sol")
+        model = os.environ.get("OPENAI_MODEL", "gpt-6.1-sol")
         return OpenAILLM(model=model), f"openai:{model}"
 
     if provider == "openai-codex":
@@ -200,7 +200,7 @@ def _build_llm(provider: str):
                 file=sys.stderr,
             )
             sys.exit(2)
-        model = os.environ.get("OPENAI_CODEX_MODEL", "gpt6-1-sol")
+        model = os.environ.get("OPENAI_CODEX_MODEL", "gpt-6.1-sol")
         return OpenAICodexLLM(model=model, auth_file=auth_file), f"openai-codex:{model}"
 
     if provider == "claude-code":
@@ -352,8 +352,8 @@ async def main() -> None:
         persistent_config = PersistentAgentConfig(
             # Defaults are sensible — explicit here for visibility.
             # ``compact_at_context_fraction=0.5`` reads
-            # ``coordinator._llm.input_token_budget`` (~123K for
-            # gpt6-1-sol) so compaction fires only under real
+            # ``coordinator._llm.input_token_budget`` (~1.045M for
+            # gpt-6.1-sol) so compaction fires only under real
             # context pressure, not on arbitrary turn counts.
             # ``retain_context_fraction=0.15`` keeps the newest ~15%
             # of the model's input budget verbatim after compaction

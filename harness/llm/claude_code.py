@@ -102,9 +102,8 @@ class ClaudeCodeLLM:
 
     @property
     def input_token_budget(self) -> int:
-        """Tokens available for the prompt; Anthropic semantics — context is
-        input-only, output cap is separate."""
-        return max(1024, self._context_window - self._token_budget_safety)
+        """Prompt budget after reserving output capacity and safety slack."""
+        return max(1024, self._context_window - self._max_tokens - self._token_budget_safety)
 
     def set_budget(self, guard: Any) -> None:
         """Inject a BudgetGuard so token caps fire on subscription-auth runs.

@@ -64,12 +64,11 @@ logger = logging.getLogger(__name__)
 # per-model context limits. Maintain a small lookup; users running new
 # models pass ``context_window=N`` explicitly.
 #
-# Anthropic frames "context window" as input-only — output has its own
-# ``max_tokens`` ceiling, billed separately. So ``input_token_budget``
-# below is just the window minus a safety slack.
+# Context includes input and output; reserve ``max_tokens`` plus safety slack
+# when calculating the input budget.
 _ANTHROPIC_CONTEXT_WINDOWS: dict[str, int] = {
-    # Harness default budget; override for the configured deployment.
-    "claude-sonnet-5-5": 256_000,
+    # https://platform.claude.com/docs/en/models/sonnet-5-5/overview
+    "claude-sonnet-5-5": 1_000_000,
     "claude-sonnet-4-6": 200_000,
     "claude-sonnet-4": 200_000,
     "claude-opus-4": 200_000,
@@ -166,15 +165,13 @@ class AnthropicLLM:
 
     @property
     def context_window(self) -> int:
-        """Input-token context window for the configured model."""
+        """Total context window (input + output) for the configured model."""
         return self._context_window
 
     @property
     def input_token_budget(self) -> int:
-        """Tokens available for the prompt. Anthropic frames context as
-        input-only; ``max_tokens`` for output is enforced separately, so
-        no output-reserve subtraction is needed here."""
-        return max(1024, self._context_window - _ANTHROPIC_TOKEN_BUDGET_SAFETY)
+        """Prompt budget after reserving output capacity and safety slack."""
+        return max(1024, self._context_window - self._max_tokens - _ANTHROPIC_TOKEN_BUDGET_SAFETY)
 
     def set_budget(self, guard: Any) -> None:
         """Inject a BudgetGuard; AgentRuntime calls this at the start of each run."""

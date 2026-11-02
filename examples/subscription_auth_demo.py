@@ -260,7 +260,7 @@ def _check_auth(provider: str) -> None:
 def _build_llm(provider: str):
     if provider == "openai-codex":
         return OpenAICodexLLM(
-            model=os.environ.get("OPENAI_CODEX_MODEL", "gpt6-1-sol"),
+            model=os.environ.get("OPENAI_CODEX_MODEL", "gpt-6.1-sol"),
             auth_file=_auth_path(provider),
             base_url=os.environ.get(
                 "OPENAI_CODEX_BASE_URL",

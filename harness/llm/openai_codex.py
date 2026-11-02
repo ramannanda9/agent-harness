@@ -28,7 +28,7 @@ class OpenAICodexLLM:
     def __init__(
         self,
         *,
-        model: str = "gpt6-1-sol",
+        model: str = "gpt-6.1-sol",
         auth_file: str | Path | None = None,
         credential_provider: AuthFileOAuthProvider | None = None,
         base_url: str = "https://chatgpt.com/backend-api",

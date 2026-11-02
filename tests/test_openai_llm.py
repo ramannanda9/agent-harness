@@ -372,9 +372,9 @@ async def test_default_model_and_context(monkeypatch):
     raw.next_body = _fake_response("ok")
     llm = OpenAILLM()
     await llm.complete(system=None, messages=[])
-    assert raw.calls[0]["model"] == "gpt6-1-sol"
-    assert llm.context_window == 256_000
-    assert llm.input_token_budget == 256_000 - 4096 - 512
+    assert raw.calls[0]["model"] == "gpt-6.1-sol"
+    assert llm.context_window == 1_050_000
+    assert llm.input_token_budget == 1_050_000 - 4096 - 512
 
 
 def test_context_window_resolves_via_lookup_table(monkeypatch):

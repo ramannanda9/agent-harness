@@ -65,9 +65,10 @@ class _Creds:
 # ── Payload builder ───────────────────────────────────────────────────────────
 
 
-def test_codex_context_defaults_to_256k_and_reserves_output():
+def test_codex_context_defaults_to_model_limit_and_reserves_output():
     llm = OpenAICodexLLM(credential_provider=_Creds())
-    assert llm.context_window == 256_000
+    assert llm.context_window == 1_050_000
+    assert llm.input_token_budget == 1_050_000 - 4096 - 512
     for model in ("gpt-5.4-mini", "gpt-5.4", "gpt-5.5"):
         llm = OpenAICodexLLM(model=model, credential_provider=_Creds())
         assert llm.context_window == 256_000
@@ -133,7 +134,7 @@ async def test_stream_complete_yields_deltas_incrementally():
         chunks.append(delta)
 
     assert chunks == ["he", "llo"]
-    assert client.calls[0]["json"]["model"] == "gpt6-1-sol"
+    assert client.calls[0]["json"]["model"] == "gpt-6.1-sol"
     assert llm.last_usage["tokens_in"] == 3
     assert llm.last_usage["tokens_out"] == 4
     assert llm.last_usage["total_tokens"] == 7

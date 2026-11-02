@@ -21,7 +21,7 @@ Run:
 Optional env:
   REDIS_URL      default redis://localhost:6379/0
   LANCE_PATH     default ./lance_episodic
-  OPENAI_MODEL   default gpt6-1-sol
+  OPENAI_MODEL   default gpt-6.1-sol
 
 Note: this demo writes to Redis under the key prefix `agent-harness-demo:` and
 writes a Lance table at LANCE_PATH. Both persist after the script ends —
@@ -97,7 +97,7 @@ async def main() -> None:
 
     redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
     lance_path = os.environ.get("LANCE_PATH", "./lance_episodic")
-    model = os.environ.get("OPENAI_MODEL", "gpt6-1-sol")
+    model = os.environ.get("OPENAI_MODEL", "gpt-6.1-sol")
 
     redis_client = await _check_or_die_redis(redis_url)
     episodic, embedder_kind = _build_episodic(lance_path)
