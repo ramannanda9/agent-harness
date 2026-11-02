@@ -63,7 +63,7 @@ from tools.builtin.http_fetch import HTTPFetch
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.4-mini")
+MODEL = os.environ.get("OPENAI_MODEL", "gpt6-1-sol")
 PROJECT_DIR = Path(os.environ.get("PROJECT_DIR", Path(__file__).parent.parent)).resolve()
 PYPI_PACKAGE = os.environ.get("PYPI_PACKAGE", "react-agent-harness")
 

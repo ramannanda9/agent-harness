@@ -69,7 +69,8 @@ _GATEWAY_COST_HEADERS = (
 _SENTINEL: Any = object()
 
 
-# Known OpenAI model context windows (input + output combined). OpenAI's
+# Harness context budgets (input + output combined). The default model and
+# GPT-5 use 256K; callers can override this for their deployment. OpenAI's
 # ``/v1/models`` endpoint does NOT expose this — we maintain a table and
 # fall back conservatively for unknowns. Users running new models should
 # pass ``context_window=N`` to the constructor explicitly.
@@ -77,8 +78,9 @@ _SENTINEL: Any = object()
 # Keep entries ordered with the most-specific prefixes first so the prefix
 # match in ``_lookup`` resolves the right cell.
 _OPENAI_CONTEXT_WINDOWS: dict[str, int] = {
-    "gpt-5.4-mini": 128_000,
-    "gpt-5.4": 128_000,
+    "gpt6-1-sol": 256_000,
+    "gpt-5.4-mini": 256_000,
+    "gpt-5.4": 256_000,
     "gpt-5": 256_000,
     "gpt-4o-mini": 128_000,
     "gpt-4o": 128_000,
@@ -100,7 +102,7 @@ class OpenAILLM:
     def __init__(
         self,
         *,
-        model: str = "gpt-5.4-mini",
+        model: str = "gpt6-1-sol",
         api_key: str | None = None,  # falls back to OPENAI_API_KEY env
         base_url: str | None = None,  # set when routing through a gateway
         request_timeout_seconds: float = 60.0,

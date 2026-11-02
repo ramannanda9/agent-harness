@@ -243,7 +243,7 @@ Codex OAuth client id can be overridden with
 from harness.llm.openai_codex import OpenAICodexLLM
 
 llm = OpenAICodexLLM(
-    model="gpt-5.5",
+    model="gpt6-1-sol",
     auth_file="~/.agent-harness/auth/auth.json",  # Pi-shaped openai-codex OAuth entry
 )
 runtime = AgentRuntime(..., llm=llm)
@@ -367,7 +367,7 @@ selector.
 `ClaudeCodeLLM` reads a `claude-code` OAuth entry, refreshes it automatically
 when expired, and retries once after `401`/`403`. This mirrors Pi's Claude
 Pro/Max extension approach rather than shelling out to the Claude CLI. The
-default model is the current canonical Sonnet release ID, `claude-sonnet-4-6`;
+default model is `claude-sonnet-5-5`;
 set `CLAUDE_CODE_MODEL` or pass `model="claude-opus-4-7"` to choose another
 model.
 
@@ -1055,11 +1055,16 @@ a string to `n` characters with a trailing `…`.
 
 `AgentConfig.working_memory_max_tokens` controls per-agent eviction. **Default
 is `None` — auto-derived from the LLM's context window at runtime** so the
-threshold adapts when you swap models (a 128K `gpt-5.4-mini` gets ~99K of WM
-headroom; a 200K `claude-sonnet-4-6` gets ~159K; a tiny 8K fallback gets ~6K).
+threshold adapts when you swap models (the 256K `gpt6-1-sol` default gets ~201K of WM
+headroom; the 256K `claude-sonnet-5-5` default gets ~204K; a tiny 8K fallback gets ~6K).
 Concretely the WM compacts at `0.8 × llm.input_token_budget`, leaving 20%
 headroom for system prompt, memory context, tool schemas, and tokeniser
 variance.
+
+OpenAI adapters default to `gpt6-1-sol`; Anthropic adapters default to
+`claude-sonnet-5-5`. Both default context budgets are 256,000 tokens. These
+are harness configuration defaults; provider availability is not verified.
+Explicit model and context overrides remain supported.
 
 Each shipped adapter (`OpenAILLM`, `AnthropicLLM`, `ClaudeCodeLLM`,
 `OpenAICodexLLM`) exposes `context_window` and `input_token_budget`

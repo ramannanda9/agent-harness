@@ -260,7 +260,7 @@ def _check_auth(provider: str) -> None:
 def _build_llm(provider: str):
     if provider == "openai-codex":
         return OpenAICodexLLM(
-            model=os.environ.get("OPENAI_CODEX_MODEL", "gpt-5.5"),
+            model=os.environ.get("OPENAI_CODEX_MODEL", "gpt6-1-sol"),
             auth_file=_auth_path(provider),
             base_url=os.environ.get(
                 "OPENAI_CODEX_BASE_URL",
@@ -271,7 +271,7 @@ def _build_llm(provider: str):
 
     if provider == "claude-code":
         return ClaudeCodeLLM(
-            model=os.environ.get("CLAUDE_CODE_MODEL", "claude-sonnet-4-6"),
+            model=os.environ.get("CLAUDE_CODE_MODEL", "claude-sonnet-5-5"),
             auth_file=_auth_path(provider),
             base_url=os.environ.get("CLAUDE_CODE_BASE_URL", "https://api.anthropic.com"),
             request_timeout_seconds=float(os.environ.get("CLAUDE_CODE_TIMEOUT_SECONDS", "120")),

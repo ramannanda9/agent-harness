@@ -367,9 +367,25 @@ async def test_stream_complete_omits_response_format_when_not_requested(monkeypa
 # ── context_window / input_token_budget ──────────────────────────────────────
 
 
+async def test_default_model_and_context(monkeypatch):
+    _, raw = _build(monkeypatch)
+    raw.next_body = _fake_response("ok")
+    llm = OpenAILLM()
+    await llm.complete(system=None, messages=[])
+    assert raw.calls[0]["model"] == "gpt6-1-sol"
+    assert llm.context_window == 256_000
+    assert llm.input_token_budget == 256_000 - 4096 - 512
+
+
 def test_context_window_resolves_via_lookup_table(monkeypatch):
     llm, _ = _build(monkeypatch, model="gpt-4o-mini")
     assert llm.context_window == 128_000
+
+
+def test_gpt5_context_defaults_to_256k(monkeypatch):
+    for model in ("gpt-5.4-mini", "gpt-5.4", "gpt-5.4-2026-03-05", "gpt-5.5"):
+        llm, _ = _build(monkeypatch, model=model)
+        assert llm.context_window == 256_000
 
 
 def test_context_window_prefix_match_beats_short_prefix(monkeypatch):
@@ -395,9 +411,10 @@ def test_context_window_explicit_override_wins(monkeypatch):
 
 
 def test_input_token_budget_subtracts_output_reserve_and_safety(monkeypatch):
-    """gpt-5.4-mini (128K) minus 4096 output minus 512 safety = 123_392."""
+    """gpt-5.4-mini (256K) minus 4096 output minus 512 safety = 251_392."""
     llm, _ = _build(monkeypatch, model="gpt-5.4-mini")
-    assert llm.input_token_budget == 128_000 - 4096 - 512
+    assert llm.context_window == 256_000
+    assert llm.input_token_budget == 256_000 - 4096 - 512
 
 
 def test_input_token_budget_floor_protects_against_overreserve(monkeypatch):

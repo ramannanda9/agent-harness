@@ -68,6 +68,8 @@ logger = logging.getLogger(__name__)
 # ``max_tokens`` ceiling, billed separately. So ``input_token_budget``
 # below is just the window minus a safety slack.
 _ANTHROPIC_CONTEXT_WINDOWS: dict[str, int] = {
+    # Harness default budget; override for the configured deployment.
+    "claude-sonnet-5-5": 256_000,
     "claude-sonnet-4-6": 200_000,
     "claude-sonnet-4": 200_000,
     "claude-opus-4": 200_000,
@@ -126,7 +128,7 @@ class AnthropicLLM:
     def __init__(
         self,
         *,
-        model: str = "claude-sonnet-4-6",
+        model: str = "claude-sonnet-5-5",
         api_key: str | None = None,  # falls back to ANTHROPIC_API_KEY env
         # Generous default — matches OpenAILLM's max_completion_tokens=4096.
         # ReAct ``thought`` fields + finish answers were getting clipped at

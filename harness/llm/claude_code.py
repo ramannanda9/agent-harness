@@ -70,7 +70,7 @@ class ClaudeCodeLLM:
             model
             or os.environ.get("CLAUDE_CODE_MODEL")
             or os.environ.get("ANTHROPIC_MODEL")
-            or "claude-sonnet-4-6"
+            or "claude-sonnet-5-5"
         )
         self._base_url = base_url.rstrip("/")
         self._timeout = request_timeout_seconds

@@ -170,7 +170,9 @@ def test_cc_version_unknown_when_cli_absent_and_no_env(monkeypatch):
 # ── stream_complete: yields deltas, captures usage ───────────────────────────
 
 
-async def test_stream_complete_yields_deltas_incrementally():
+async def test_stream_complete_yields_deltas_incrementally(monkeypatch):
+    monkeypatch.delenv("CLAUDE_CODE_MODEL", raising=False)
+    monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
     body = _sse(
         [
             {"type": "message_start", "message": {"usage": {"input_tokens": 5}}},
@@ -184,7 +186,6 @@ async def test_stream_complete_yields_deltas_incrementally():
     )
     client = _Client([_StreamResponse(200, body)])
     llm = ClaudeCodeLLM(
-        model="claude-sonnet-4-6",
         credential_provider=_Creds(),
         base_url="https://api.anthropic.com",
         http_client=client,
@@ -198,6 +199,9 @@ async def test_stream_complete_yields_deltas_incrementally():
         chunks.append(delta)
 
     assert chunks == ["he", "llo"]
+    assert client.calls[0]["json"]["model"] == "claude-sonnet-5-5"
+    assert llm.context_window == 256_000
+    assert llm.input_token_budget == 256_000 - 512
     assert llm.last_usage == {
         "tokens_in": 5,
         "tokens_out": 6,
